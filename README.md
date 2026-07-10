@@ -65,7 +65,14 @@ end
 ```
 
 Script errors log a full traceback through the game's sink and never kill
-the tick. Build with `-Dlanguage=lua` (the default; the option exists so
-future languages slot in additively).
+the tick; a script that fails to load or whose `init()` throws is evicted —
+it receives no `update`/`deinit` until the next setup. Build with
+`-Dlanguage=lua` (the default; the option exists so future languages slot
+in additively).
+
+**Entity ids**: ids are u64 on the host and cross into Lua as the signed
+64-bit bitcast — lossless for math, comparisons, and every `labelle.*` /
+`raw_*` call. But embed entity ids in payloads via `labelle.u64str(id)`
+(the id becomes a JSON string) — plain `%d` would sign-flip bit-63 ids.
 
 Design: `RFC-LANGUAGE-PLUGINS.md` (labelle-engine#730) · epic: labelle-engine#237

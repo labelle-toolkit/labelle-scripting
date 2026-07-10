@@ -107,6 +107,65 @@ test "script errors are logged with tracebacks and never kill the tick" {
     try expect(mock.logsContain("broken:1"));
 }
 
+test "a chunk whose body errors is evicted before any hook fires" {
+    fresh();
+    scripting.registerScript("half_baked",
+        \\-- update/deinit land in the env BEFORE the body errors; without
+        \\-- eviction the registry would still dispatch to them.
+        \\function update(dt)
+        \\    labelle.log("half_baked update ran")
+        \\end
+        \\function deinit()
+        \\    labelle.log("half_baked deinit ran")
+        \\end
+        \\error("half_baked top-level boom")
+    );
+    scripting.registerScript("counter", @embedFile("lua/counter.lua"));
+    try scripting.Controller.setup(.{});
+
+    scripting.Controller.tick(.{}, 0.125);
+    scripting.Controller.deinit();
+
+    // The load failure itself was logged with its location...
+    try expect(mock.logsContain("half_baked:9"));
+    try expect(mock.logsContain("half_baked top-level boom"));
+    // ...and neither hook of the half-loaded script ever fired.
+    try expect(!mock.logsContain("half_baked update ran"));
+    try expect(!mock.logsContain("half_baked deinit ran"));
+    // The bystander ran init + update untouched by the eviction.
+    try expectComponent(1, "Counter", "{\"dt\":0.125,\"n\":1}");
+}
+
+test "a script whose init() errors is evicted from update and deinit" {
+    fresh();
+    scripting.registerScript("bad_init",
+        \\function init()
+        \\    error("bad_init boom")
+        \\end
+        \\function update(dt)
+        \\    labelle.log("bad_init update ran")
+        \\end
+        \\function deinit()
+        \\    labelle.log("bad_init deinit ran")
+        \\end
+    );
+    scripting.registerScript("counter", @embedFile("lua/counter.lua"));
+    try scripting.Controller.setup(.{});
+
+    scripting.Controller.tick(.{}, 0.125);
+    scripting.Controller.tick(.{}, 0.125);
+    scripting.Controller.deinit();
+
+    // The init failure carries its traceback plus one eviction line.
+    try expect(mock.logsContain("bad_init boom"));
+    try expect(mock.logsContain("script evicted"));
+    // The quarantined script received no further hooks...
+    try expect(!mock.logsContain("bad_init update ran"));
+    try expect(!mock.logsContain("bad_init deinit ran"));
+    // ...while the sibling initialized and advanced through both ticks.
+    try expectComponent(1, "Counter", "{\"dt\":0.125,\"n\":2}");
+}
+
 test "prelude json round-trips nested component tables" {
     fresh();
     scripting.registerScript("json_roundtrip", @embedFile("lua/json_roundtrip.lua"));
@@ -125,6 +184,39 @@ test "game.query iterates the mock world's matching ids" {
     // Entities 1..3 carry Marker (sum 6), only 2 also carries Extra, the
     // bare entity 4 never shows up, unknown names yield zero matches.
     try expectComponent(5, "QueryResult", "{\"both\":1,\"count\":3,\"none\":0,\"sum\":6}");
+}
+
+test "labelle.u64str renders bit-63 ids as unsigned decimals" {
+    fresh();
+    scripting.registerScript("u64str_check", @embedFile("lua/u64str_check.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Exact decimals for 0, 1, 2^62, 0x8000000000000001, 0xFFFFFFFFFFFFFFFF
+    // (sorted keys — see the script for which literal is which).
+    try expectComponent(1, "U64Str", "{\"all_ones\":\"18446744073709551615\"," ++
+        "\"high_one\":\"9223372036854775809\",\"one\":\"1\"," ++
+        "\"pow62\":\"4611686018427387904\",\"zero\":\"0\"}");
+}
+
+test "game.query round-trips bit-63 entity ids exactly" {
+    fresh();
+    // Force the next id past the signed-integer boundary: its unsigned
+    // decimal exceeds Lua's integer range, so any tonumber() leak in the
+    // query path would degrade it to a float addressing the wrong entity.
+    mock.setNextEntityId(0x8000000000000001);
+    scripting.registerScript("big_id_check", @embedFile("lua/big_id_check.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    const big_id: u64 = 0x8000000000000001;
+    // get/set through the QUERIED wrapper landed on the right entity
+    // (the script's own asserts would otherwise fail its init — evicting
+    // it and leaving these components unset)...
+    try expectComponent(big_id, "Marker", "{\"tag\":42}");
+    // ...and the id renders unsigned end to end.
+    try expectComponent(big_id, "BigId", "{\"idstr\":\"9223372036854775809\"}");
+    try expectEqual(@as(usize, 1), mock.aliveCount());
 }
 
 test "labelle.on dispatch fires with decoded payloads" {

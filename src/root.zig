@@ -21,7 +21,7 @@
 //! comptime switch below is what keeps unselected backends out of
 //! analysis entirely. Each backend directory (src/lua/, later src/js/, …)
 //! exposes the same tiny surface: `vm.Vm` (init/close/loadScript/
-//! callScriptHook/callLabelleFn) and `bindings.install`.
+//! callScriptHook/evictScript/callLabelleFn) and `bindings.install`.
 
 const std = @import("std");
 const build_options = @import("scripting_options");
@@ -101,8 +101,10 @@ pub const Controller = struct {
     /// Boot the scripting VM. Refuses a Script Runtime Contract version
     /// mismatch (fail loudly at boot, not as garbled JSON mid-game) and a
     /// broken prelude. Individual scripts that fail to load or whose
-    /// `init()` throws are logged and SKIPPED — one bad script must not
-    /// brick the game, and the rest keep running.
+    /// `init()` throws are logged and EVICTED — one bad script must not
+    /// brick the game, the rest keep running, and a half-initialized
+    /// script never receives `update`/`deinit` hooks (registrations
+    /// survive, so the next setup retries it).
     pub fn setup(game: anytype) !void {
         _ = game; // world access rides the C contract, not Zig types
         if (active_vm != null) deinit(); // defensive: re-setup = clean restart
@@ -122,10 +124,17 @@ pub const Controller = struct {
         // early script's init() can already touch entities/events involving
         // scripts registered after it.
         for (script_registry[0..script_count]) |s| {
+            // Load failures self-evict inside loadScript: a chunk body that
+            // errors is pulled back out of the hook registry.
             _ = vm.loadScript(s.name, s.source);
         }
         for (script_registry[0..script_count]) |s| {
-            vm.callScriptHook(s.name, "init", null);
+            if (!vm.callScriptHook(s.name, "init", null)) {
+                // init() raised: the script is half-initialized — evict it
+                // so update/deinit never run against broken state (the
+                // init-time counterpart of loadScript's self-eviction).
+                vm.evictScript(s.name);
+            }
         }
     }
 
@@ -143,7 +152,10 @@ pub const Controller = struct {
         contract.labelle_time_dt_stamp(dt);
         vm.callLabelleFn("dispatch_inbox");
         for (script_registry[0..script_count]) |s| {
-            vm.callScriptHook(s.name, "update", dt);
+            // Update errors are logged per-call and do NOT evict — unlike a
+            // failed init, the script's state is intact and the author gets
+            // a traceback every tick until it's fixed.
+            _ = vm.callScriptHook(s.name, "update", dt);
         }
     }
 
@@ -153,7 +165,7 @@ pub const Controller = struct {
     pub fn deinit() void {
         const vm = active_vm orelse return;
         for (script_registry[0..script_count]) |s| {
-            vm.callScriptHook(s.name, "deinit", null);
+            _ = vm.callScriptHook(s.name, "deinit", null);
         }
         vm.close();
         active_vm = null;

@@ -9,6 +9,14 @@
 -- raw shims stay reachable on purpose — when a script needs something the
 -- sugar doesn't cover (or the sugar has a bug), the contract is right
 -- there.
+--
+-- Entity-id rule: ids are u64 on the host but live in Lua as the SIGNED
+-- 64-bit bitcast (lua_pushinteger), so a bit-63 id looks negative. That is
+-- lossless for math, table keys and every raw_* call (both ends bitcast) —
+-- but embed entity ids in payloads via labelle.u64str(id): plain %d would
+-- sign-flip bit-63 ids. The generic json.encode deliberately does NOT
+-- special-case negative integers (they may be legitimate component values);
+-- only values KNOWN to be ids get the unsigned rendering.
 
 -- ── json ─────────────────────────────────────────────────────────────────
 -- Minimal pure-Lua JSON codec for component payloads (encoding v1):
@@ -280,6 +288,33 @@ end
 
 local game = {}
 
+-- Parse the host's query response ("[1,42,...]", ids as unsigned decimals)
+-- into an id array — the decode leg of the entity-id rule (see header).
+-- Deliberately NOT the generic json.decode: its number path tonumber()s a
+-- bit-63 id (> math.maxinteger) into an imprecise float and the wrappers
+-- would then address the wrong entity. Building each digit run with
+-- wrapping integer arithmetic (id * 10 + digit wraps mod 2^64 on Lua 5.4
+-- integers) lands exactly on the signed bitcast raw_entity_create returns.
+local function decode_id_array(s)
+  local ids = {}
+  local i, n = 1, #s
+  while i <= n do
+    local b = s:byte(i)
+    if b >= 48 and b <= 57 then -- digit run → one id
+      local id = 0
+      repeat
+        id = id * 10 + (b - 48)
+        i = i + 1
+        b = s:byte(i)
+      until b == nil or b < 48 or b > 57
+      ids[#ids + 1] = id
+    else -- brackets, commas, whitespace
+      i = i + 1
+    end
+  end
+  return ids
+end
+
 --- Iterate entities carrying ALL the named components:
 ---   for e in game.query("CloudDrift", "Position") do ... end
 --- Yields Entity wrappers over the contract's id-JSON snapshot, so spawning
@@ -290,7 +325,7 @@ function game.query(...)
     names[i] = (select(i, ...))
   end
   local out = labelle.raw_query(json.encode(names))
-  local ids = out ~= "" and json.decode(out) or {}
+  local ids = out ~= "" and decode_id_array(out) or {}
   local i = 0
   return function()
     i = i + 1
@@ -301,6 +336,30 @@ function game.query(...)
 end
 
 -- ── labelle sugar ────────────────────────────────────────────────────────
+
+-- Decimal string of a Lua integer REINTERPRETED as unsigned 64-bit — the
+-- encode leg of the entity-id rule (see header). Non-negative values (q==0
+-- territory included: u < 10 can only reach this with bit 63 clear) are
+-- plain %d; for negative v, Lua 5.4 semantics do the heavy lifting: >> is
+-- a LOGICAL shift, so (v >> 1) // 5 is floor(u/10) — now non-negative and
+-- %d-safe — and wrapping integer arithmetic makes v - q*10 the true last
+-- digit 0..9.
+local function u64tostr(v)
+  if v >= 0 then return string.format("%d", v) end
+  local q = (v >> 1) // 5
+  local r = v - q * 10
+  return string.format("%d%d", q, r)
+end
+
+--- Render an entity id as its unsigned decimal string. Use this to embed
+--- ids in JSON payloads ({ owner = labelle.u64str(e.id) }); `e.id` itself
+--- stays a plain integer for Lua-side math and raw_* calls.
+function labelle.u64str(id)
+  if math.type(id) ~= "integer" then
+    error("labelle.u64str: expected an entity id (integer)", 2)
+  end
+  return u64tostr(id)
+end
 
 --- Log through the game's sink (stringifies for convenience).
 function labelle.log(msg)

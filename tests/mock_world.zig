@@ -335,6 +335,12 @@ export fn labelle_time_dt_stamp(dt: f32) void {
 
 // ── host-side test helpers (not part of the contract) ───────────────────
 
+/// Force the id the next `labelle_entity_create` hands out — how tests
+/// mint bit-63 u64 ids without burning through 2^63 creates first.
+pub fn setNextEntityId(id: u64) void {
+    world.next_id = id;
+}
+
 /// Emit toward scripts: queued into the inbox only when subscribed — the
 /// engine analog of GameEvents dispatch fanning out to script subscribers.
 pub fn hostEmit(name: []const u8, json: []const u8) void {

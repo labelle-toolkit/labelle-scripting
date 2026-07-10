@@ -12,7 +12,11 @@
 //! `protectedCall`, a pcall with a traceback message handler. A script that
 //! throws gets its full stack trace logged through `labelle_log` and the
 //! error is swallowed — a broken behavior script must NEVER kill the game
-//! tick; the other scripts (and the game) keep running.
+//! tick; the other scripts (and the game) keep running. Failure at the two
+//! boot points is stricter: a chunk body that errors (loadScript) or an
+//! `init()` that errors (evictScript, driven by the Controller) removes the
+//! script's env from the registry entirely, so a half-initialized script
+//! never receives `update`/`deinit` hooks.
 //!
 //! Script isolation: each registered script chunk runs under its own `_ENV`
 //! table whose metatable falls back to the real globals. Scripts therefore
@@ -66,6 +70,7 @@ pub const c = struct {
     pub extern fn lua_type(L: ?*State, idx: c_int) c_int;
 
     // Pushing values.
+    pub extern fn lua_pushnil(L: ?*State) void;
     pub extern fn lua_createtable(L: ?*State, narr: c_int, nrec: c_int) void;
     pub extern fn lua_pushcclosure(L: ?*State, f: CFn, n: c_int) void;
     pub extern fn lua_pushlstring(L: ?*State, s: [*]const u8, len: usize) [*]const u8;
@@ -242,7 +247,42 @@ pub const Vm = struct {
             // corrupting the stack.
             c.lua_settop(L, -2);
         }
-        return self.protectedCall(0, 0, name); // runs the chunk body
+        if (!self.protectedCall(0, 0, name)) { // runs the chunk body
+            // The body failed AFTER its env went into the registry, and
+            // whatever it managed to define before erroring (an `update`,
+            // say) must not receive hooks on a half-initialized script.
+            // protectedCall already logged the traceback; just pull the
+            // env back out.
+            self.removeScriptEnv(name);
+            return false;
+        }
+        return true;
+    }
+
+    /// Pull `name`'s env out of `__labelle_scripts`, making the script
+    /// invisible to `callScriptHook` (hooks rawget the env by name and
+    /// silently skip missing entries). No-op when the registry — or the
+    /// entry — is missing.
+    fn removeScriptEnv(self: Vm, name: []const u8) void {
+        const L = self.L;
+        _ = c.lua_getglobal(L, SCRIPTS_REGISTRY); // [registry]
+        if (c.lua_type(L, -1) != c.LUA_TTABLE) {
+            c.lua_settop(L, -2);
+            return;
+        }
+        _ = c.lua_pushlstring(L, name.ptr, name.len); // [registry, name]
+        c.lua_pushnil(L); // [registry, name, nil]
+        c.lua_settable(L, -3); // [registry] — plain table, cannot raise
+        c.lua_settop(L, -2); // []
+    }
+
+    /// Quarantine a script whose `init()` failed: remove its env so the
+    /// `update`/`deinit` loops skip it — a half-initialized script must not
+    /// keep receiving hooks — and log the eviction once (the init traceback
+    /// alone would not explain why the script went silent afterwards).
+    pub fn evictScript(self: Vm, name: []const u8) void {
+        self.removeScriptEnv(name);
+        logError(name, "init() failed — script evicted; update/deinit will not run");
     }
 
     /// Call `hook` ("init"/"update"/"deinit") of the script registered as
@@ -250,33 +290,36 @@ pub const Vm = struct {
     /// rawget on the script's OWN env — the `__index = _G` fallback must
     /// not leak another script's hook in (script B without update() would
     /// otherwise run whatever `update` _G happens to see). Missing hooks
-    /// are simply skipped: all three are optional.
-    pub fn callScriptHook(self: Vm, script_name: []const u8, hook: []const u8, dt: ?f32) void {
+    /// are simply skipped: all three are optional. Returns false only when
+    /// the hook RAN and raised (missing script/hook is not a failure) —
+    /// how the Controller detects a failed `init()` to evict.
+    pub fn callScriptHook(self: Vm, script_name: []const u8, hook: []const u8, dt: ?f32) bool {
         const L = self.L;
         _ = c.lua_getglobal(L, SCRIPTS_REGISTRY); // [registry]
         if (c.lua_type(L, -1) != c.LUA_TTABLE) {
             c.lua_settop(L, -2);
-            return;
+            return true;
         }
         _ = c.lua_pushlstring(L, script_name.ptr, script_name.len); // [registry, name]
         _ = c.lua_rawget(L, -2); // [registry, env]
         if (c.lua_type(L, -1) != c.LUA_TTABLE) {
             c.lua_settop(L, -3);
-            return;
+            return true;
         }
         _ = c.lua_pushlstring(L, hook.ptr, hook.len); // [registry, env, hookname]
         _ = c.lua_rawget(L, -2); // [registry, env, fn?]
         if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
             c.lua_settop(L, -4);
-            return;
+            return true;
         }
         var nargs: c_int = 0;
         if (dt) |v| {
             c.lua_pushnumber(L, v);
             nargs = 1;
         }
-        _ = self.protectedCall(nargs, 0, script_name);
+        const ok = self.protectedCall(nargs, 0, script_name);
         c.lua_settop(L, -3); // pop env + registry
+        return ok;
     }
 
     /// Call a prelude function `labelle.<name>` with no arguments — how the
