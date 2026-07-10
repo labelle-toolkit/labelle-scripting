@@ -1,0 +1,5 @@
+.{
+    .name = "scripting",
+    .manifest_version = 1,
+    .convention_dirs = .{},
+}
