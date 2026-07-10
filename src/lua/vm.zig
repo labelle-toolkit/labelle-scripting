@@ -26,6 +26,17 @@
 //! instead of colliding last-writer-wins in `_G`. The prelude keeps the
 //! env registry in the global `__labelle_scripts` (name → env), which is
 //! how `callScriptHook` finds each script's functions.
+//!
+//! Current-script tracking: around EVERY entry from the VM into script
+//! code — the chunk body in `loadScript`, each hook in `callScriptHook` —
+//! the global `__labelle_current_script` is set to the script's name and
+//! cleared (nil) after. It is the VM-truth answer to "whose code is
+//! running", which the prelude's `labelle.on` reads to record handler
+//! ownership (and `dispatch_inbox` re-stamps around each handler call).
+//! Ownership canNOT be derived from the registering caller's `_ENV`
+//! upvalue instead: a script-local helper that closes over an alias of
+//! `labelle.on` touches no globals, carries no `_ENV`, and would walk to
+//! owner nil — exempting its handlers from the eviction purge.
 
 const std = @import("std");
 const contract = @import("../contract.zig");
@@ -107,6 +118,12 @@ pub const c = struct {
 /// Global name of the prelude-owned env registry: `__labelle_scripts[name]`
 /// is the private `_ENV` table of the script registered under `name`.
 const SCRIPTS_REGISTRY: [*:0]const u8 = "__labelle_scripts";
+
+/// Global holding the name of the script whose code the VM is currently
+/// executing (nil between entries) — see the module doc's current-script
+/// tracking section. Written by `setCurrentScript` around every VM→script
+/// entry; read by the prelude's `labelle.on` for handler ownership.
+const CURRENT_SCRIPT_GLOBAL: [*:0]const u8 = "__labelle_current_script";
 
 /// Longest accepted script name for the "@<name>" chunkname buffer. Chunk
 /// names beyond this are truncated — error locations just lose their tail.
@@ -230,13 +247,6 @@ pub const Vm = struct {
         c.lua_setfield(L, -2, "__index"); // [chunk, env, meta]
         _ = c.lua_setmetatable(L, -2); // [chunk, env]
 
-        // env.__labelle_script_name = name — the ownership stamp. The
-        // prelude's `labelle.on` reads it through the registering
-        // caller's _ENV to record which script owns each handler, which
-        // is what lets eviction purge exactly that script's handlers.
-        _ = c.lua_pushlstring(L, name.ptr, name.len); // [chunk, env, name]
-        c.lua_setfield(L, -2, "__labelle_script_name"); // [chunk, env]
-
         // __labelle_scripts[name] = env. The registry is a plain prelude
         // table; if the prelude never ran we must bail BEFORE lua_settable,
         // which would raise (and longjmp through this Zig frame).
@@ -258,7 +268,12 @@ pub const Vm = struct {
             // corrupting the stack.
             c.lua_settop(L, -2);
         }
-        if (!self.protectedCall(0, 0, name)) { // runs the chunk body
+        // The chunk body is a VM→script entry: stamp the current script
+        // so `labelle.on` at chunk scope attributes its handlers here.
+        self.setCurrentScript(name);
+        const body_ok = self.protectedCall(0, 0, name); // runs the chunk body
+        self.setCurrentScript(null);
+        if (!body_ok) {
             // The body failed AFTER its env went into the registry, and
             // whatever it managed to define before erroring (an `update`,
             // say) must not receive hooks on a half-initialized script.
@@ -271,6 +286,21 @@ pub const Vm = struct {
             return false;
         }
         return true;
+    }
+
+    /// Stamp (or clear, with null) the `__labelle_current_script` global —
+    /// the VM-truth "whose code is running" marker every VM→script entry
+    /// sets and clears (see the module doc). A plain global write: script
+    /// envs only SHADOW globals (their writes land in the private env), so
+    /// scripts can't clobber it by accident.
+    fn setCurrentScript(self: Vm, name: ?[]const u8) void {
+        const L = self.L;
+        if (name) |n| {
+            _ = c.lua_pushlstring(L, n.ptr, n.len);
+        } else {
+            c.lua_pushnil(L);
+        }
+        c.lua_setglobal(L, CURRENT_SCRIPT_GLOBAL);
     }
 
     /// Pull `name`'s env out of `__labelle_scripts`, making the script
@@ -349,7 +379,12 @@ pub const Vm = struct {
             c.lua_pushnumber(L, v);
             nargs = 1;
         }
+        // Hooks are VM→script entries: stamp the current script so a
+        // `labelle.on` inside init()/update() attributes its handlers to
+        // this script (aliases and local helpers included).
+        self.setCurrentScript(script_name);
         const ok = self.protectedCall(nargs, 0, script_name);
+        self.setCurrentScript(null);
         c.lua_settop(L, -3); // pop env + registry
         return ok;
     }

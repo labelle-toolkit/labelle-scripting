@@ -16,12 +16,15 @@
 //!   - entity ids are u64, 0 = failure sentinel;
 //!   - i32 returns: 0 = ok, -1 = failure (except `labelle_component_has`,
 //!     a 1/0 boolean);
-//!   - out-parameter functions return bytes written, 0 = absent/unknown/
-//!     doesn't fit — size buffers generously, there is no two-call sizing.
-//!     The ONE exception is `labelle_query` (the contract's only
-//!     unbounded-cardinality op): it returns the bytes the COMPLETE
-//!     result requires, snprintf-style, so callers detect truncation
-//!     (required > cap) and retry right-sized;
+//!   - out-parameter sizing: `labelle_component_get` and `labelle_query`
+//!     return the bytes the COMPLETE result requires, snprintf-style
+//!     (required > cap = truncation, retry right-sized; NULL/cap-0 out =
+//!     pure sizing probe; 0 keeps its absent/unknown/malformed sentinel).
+//!     They differ under a too-small cap: the query writes a still-valid
+//!     truncated id prefix, the get writes ALL-OR-NOTHING (a truncated
+//!     JSON object prefix is useless). `labelle_event_poll` alone returns
+//!     bytes WRITTEN — a real poll consumes its entry — and pairs with a
+//!     NULL/cap-0 probe returning the NEXT entry's size, no consume;
 //!   - main-thread only, valid during the plugin's tick;
 //!   - before the host binds its game every call is a safe no-op.
 
@@ -65,13 +68,16 @@ pub extern fn labelle_component_set(
     json_len: usize,
 ) i32;
 
-/// Serialize the component to JSON into `out`. Returns bytes written;
-/// 0 = absent / unknown name / dead entity / doesn't fit.
+/// Serialize the component to JSON into `out`. Returns the bytes the
+/// COMPLETE JSON requires (snprintf-style, like the query); 0 = absent /
+/// unknown name / dead entity. ALL-OR-NOTHING write: `out` is filled only
+/// when required <= out_cap — on overflow nothing is written, retry with a
+/// required-sized buffer. NULL/cap-0 out is a pure sizing probe.
 pub extern fn labelle_component_get(
     id: u64,
     name: [*]const u8,
     name_len: usize,
-    out: [*]u8,
+    out: ?[*]u8,
     out_cap: usize,
 ) usize;
 
@@ -95,7 +101,7 @@ pub extern fn labelle_component_remove(id: u64, name: [*]const u8, name_len: usi
 pub extern fn labelle_query(
     names_json: [*]const u8,
     names_json_len: usize,
-    out: [*]u8,
+    out: ?[*]u8,
     out_cap: usize,
 ) usize;
 
@@ -115,10 +121,12 @@ pub extern fn labelle_event_emit(
 /// queue for `labelle_event_poll` from the next frame on.
 pub extern fn labelle_event_subscribe(name: [*]const u8, name_len: usize) void;
 
-/// Drain one pending "<name> <json>" entry (FIFO). Returns bytes written,
-/// 0 = inbox empty. The entry is consumed even when truncated — size `out`
-/// generously and drain in a `while (poll() > 0)` loop once per tick.
-pub extern fn labelle_event_poll(out: [*]u8, out_cap: usize) usize;
+/// Drain one pending "<name> <json>" entry (FIFO). Returns bytes WRITTEN,
+/// 0 = inbox empty; a real read consumes the entry even when truncated.
+/// NULL/cap-0 `out` is the paired no-consume SIZING PROBE: it returns the
+/// NEXT entry's full size (0 = empty) and reads nothing — probe, size the
+/// buffer, then poll. Drain in a `while (poll() > 0)` loop once per tick.
+pub extern fn labelle_event_poll(out: ?[*]u8, out_cap: usize) usize;
 
 // ── Scene / log / time ───────────────────────────────────────────────────
 

@@ -86,6 +86,14 @@ pub fn registeredScriptCount() usize {
     return script_count;
 }
 
+/// Test seam: monotonic count of the language backend's scratch-buffer
+/// (re)allocations. The scratch is grow-only, so a settled workload —
+/// however many polls/gets — must stop bumping this; tests assert on
+/// deltas across traffic, not absolute values.
+pub fn scratchGrowthCount() usize {
+    return Backend.bindings.scratch_growth_count;
+}
+
 /// Drop every registration. A test/tooling seam: production games register
 /// once per process and never unregister (sources are static anyway).
 pub fn clearScripts() void {

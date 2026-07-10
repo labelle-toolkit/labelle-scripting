@@ -337,6 +337,98 @@ test "eviction purges the dead scripts' handlers; siblings keep firing" {
     try expect(!mock.logsContain("body_boom handler ran"));
 }
 
+test "ownership survives labelle.on aliasing through script-local helpers" {
+    fresh();
+    // The registering call site is a LOCAL helper closing over an alias
+    // of labelle.on: it touches no globals, so it carries NO _ENV
+    // upvalue — a caller-_ENV walk finds no script env behind the call
+    // and would record owner = nil, exempting the handler from the
+    // eviction purge. Ownership must come from the VM's current-script
+    // tracking instead: init() runs with the script stamped current, so
+    // the handler is owned by "aliased" and dies with it.
+    scripting.registerScript("aliased",
+        \\local on = labelle.on
+        \\local function sub(n, f) on(n, f) end
+        \\function init()
+        \\    sub("ping", function(ev)
+        \\        labelle.log("aliased handler ran")
+        \\    end)
+        \\    error("aliased init boom")
+        \\end
+    );
+    scripting.registerScript("survivor",
+        \\local state
+        \\labelle.on("ping", function(ev)
+        \\    local s = state:get("Pings")
+        \\    s.n = s.n + 1
+        \\    state:set("Pings", s)
+        \\end)
+        \\function init()
+        \\    state = Entity.new()
+        \\    state:set("Pings", { n = 0 })
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    mock.hostEmit("ping", "{}");
+    scripting.Controller.tick(.{}, 0.016);
+
+    // The eviction was logged, the sibling's handler fired…
+    try expect(mock.logsContain("aliased init boom"));
+    try expect(mock.logsContain("script evicted"));
+    try expectComponent(1, "Pings", "{\"n\":1}");
+    // …and the aliased-registration handler was purged with its owner.
+    try expect(!mock.logsContain("aliased handler ran"));
+}
+
+test "a throwing handler is isolated: fan-out and drain continue, error logged once" {
+    fresh();
+    scripting.registerScript("isolated",
+        \\local state
+        \\labelle.on("ping", function(ev)
+        \\    error("first handler boom")
+        \\end)
+        \\labelle.on("ping", function(ev)
+        \\    local s = state:get("Flow")
+        \\    s.pings = s.pings + 1
+        \\    state:set("Flow", s)
+        \\end)
+        \\labelle.on("pong", function(ev)
+        \\    local s = state:get("Flow")
+        \\    s.pongs = s.pongs + 1
+        \\    state:set("Flow", s)
+        \\end)
+        \\function init()
+        \\    state = Entity.new()
+        \\    state:set("Flow", { pings = 0, pongs = 0 })
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Two events, one tick: the FIRST ping handler throws — the second
+    // must still fire (fan-out survives) and the drain must continue on
+    // to pong (the queue survives), all within the same dispatch.
+    mock.hostEmit("ping", "{}");
+    mock.hostEmit("pong", "{}");
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "Flow", "{\"pings\":1,\"pongs\":1}");
+
+    // The failure was logged exactly once, attributed (event + owner)
+    // and carrying the traceback the xpcall message handler captured.
+    try expectEqual(@as(usize, 1), mock.logCount("first handler boom"));
+    try expect(mock.logsContain("event 'ping' handler (owner 'isolated')"));
+    try expect(mock.logsContain("stack traceback:"));
+
+    // The throwing handler was NOT purged (errors evict scripts, not
+    // handlers): next tick it throws — and is isolated — again.
+    mock.hostEmit("ping", "{}");
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "Flow", "{\"pings\":2,\"pongs\":1}");
+    try expectEqual(@as(usize, 2), mock.logCount("first handler boom"));
+}
+
 test "event payloads carry u64 ids bit-exact through json.decode" {
     fresh();
     // Bit-63 id: its unsigned decimal exceeds math.maxinteger, so a
@@ -355,6 +447,68 @@ test "event payloads carry u64 ids bit-exact through json.decode" {
     // (the script's own asserts pin integer-ness and bit-equality).
     const big_id: u64 = 0x8000000000000001;
     try expectComponent(big_id, "Owned", "{\"seen\":true,\"tag\":42}");
+}
+
+test "components larger than the initial scratch round-trip via e:get" {
+    fresh();
+    // {"blob":"xxx…"} is ~5 KiB — past the shim's 4 KiB initial scratch,
+    // so raw_component_get sees required > cap (all-or-nothing: nothing
+    // written yet), grows the scratch once and retries. A failed assert
+    // evicts the script and BigOk never lands.
+    scripting.registerScript("big_component",
+        \\function init()
+        \\    local e = Entity.new()
+        \\    local blob = string.rep("x", 5000)
+        \\    assert(e:set("Big", { blob = blob }), "set refused")
+        \\    local back = e:get("Big")
+        \\    assert(back ~= nil, "get returned nil")
+        \\    assert(#back.blob == 5000, "blob truncated: " .. #back.blob)
+        \\    assert(back.blob == blob, "blob corrupted")
+        \\    e:set("BigOk", { len = #back.blob })
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expectComponent(1, "BigOk", "{\"len\":5000}");
+}
+
+test "event payloads larger than the initial scratch deliver intact; scratch settles" {
+    fresh();
+    scripting.registerScript("big_events",
+        \\local state
+        \\labelle.on("blob__event", function(ev)
+        \\    local s = state:get("Blob") or { count = 0 }
+        \\    assert(type(ev.data) == "string", "payload missing")
+        \\    assert(#ev.data == 5000, "payload truncated: " .. tostring(#ev.data))
+        \\    assert(ev.data == string.rep("y", 5000), "payload corrupted")
+        \\    state:set("Blob", { count = s.count + 1, len = #ev.data })
+        \\end)
+        \\function init()
+        \\    state = Entity.new()
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // ~5 KiB payload: the poll probe reports it, the scratch grows once
+    // right-sized, the real read consumes the entry whole. A truncation
+    // or corruption trips the handler's asserts (isolated + logged) and
+    // the count below stalls.
+    const payload = "{\"data\":\"" ++ ("y" ** 5000) ++ "\"}";
+    mock.hostEmit("blob__event", payload);
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "Blob", "{\"count\":1,\"len\":5000}");
+
+    // 99 more deliveries: the grow-only scratch is REUSED — the growth
+    // counter must not move again (no per-event reallocation).
+    const settled = scripting.scratchGrowthCount();
+    for (0..99) |_| {
+        mock.hostEmit("blob__event", payload);
+        scripting.Controller.tick(.{}, 0.016);
+    }
+    try expectEqual(settled, scripting.scratchGrowthCount());
+    try expectComponent(1, "Blob", "{\"count\":100,\"len\":5000}");
 }
 
 test "controller lifecycle: prefab/scene/remove, deinit hooks, re-setup" {

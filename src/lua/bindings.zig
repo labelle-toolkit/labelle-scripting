@@ -12,13 +12,23 @@
 //!      doing it through the C API would triple the shim count for zero
 //!      gain.
 //!
-//! Buffer sizing: component_get and event_poll have no two-call sizing on
-//! purpose (script payloads are small; they return bytes written,
-//! component_get reports 0 when it doesn't fit) — the caps below are
-//! "generous" per the contract's guidance. The query is the contract's
-//! one snprintf-style op (its cardinality is unbounded): the return is
-//! the size the COMPLETE result requires, so the shim tries the fixed
-//! buffer first and grows-and-retries once when required > cap —
+//! Buffer sizing: component_get and event_poll share ONE module-lifetime
+//! scratch buffer (a userdata anchored in the Lua registry so the GC
+//! keeps it alive; `scratch` below caches its pointer). It is GROW-ONLY —
+//! the clearRetainingCapacity spirit: sized to the largest payload seen,
+//! reused forever after, so steady-state traffic allocates nothing.
+//!   - get sizes by the contract itself: component_get returns the bytes
+//!     the COMPLETE JSON requires and writes all-or-nothing, so the shim
+//!     calls once, and on required > cap grows and retries exactly once.
+//!   - poll must NOT be allowed to truncate (a truncated poll CONSUMES
+//!     the entry), so the shim probes first — a NULL/cap-0 poll returns
+//!     the next entry's size without consuming — grows if needed, then
+//!     reads. Two contract calls per event; at game-logic event rates
+//!     that is noise, and it is the simplest scheme that can never drop
+//!     a byte.
+//! The query keeps its own transient path: it returns required-size with
+//! a valid truncated prefix, so the shim tries a fixed buffer first and
+//! grow-and-retries once via a call-scoped userdata when required > cap —
 //! `game.query` always yields ALL matching ids, never a silent prefix.
 
 const contract = @import("../contract.zig");
@@ -26,12 +36,46 @@ const vm_mod = @import("vm.zig");
 const c = vm_mod.c;
 const Vm = vm_mod.Vm;
 
-/// Serialized-component and polled-event capacity. Components are a
-/// handful of fields; 4 KiB gives an order of magnitude of headroom.
-const JSON_BUF_CAP = 4096;
 /// Query results: at ~7 bytes per id this holds >1000 matches, far past
 /// any per-tick script query in practice.
 const QUERY_BUF_CAP = 8192;
+
+/// Starting capacity of the shared get/poll scratch. Components are a
+/// handful of fields; 4 KiB gives an order of magnitude of headroom, so
+/// most games never grow it at all.
+const SCRATCH_INITIAL_CAP = 4096;
+
+/// Registry key anchoring the scratch userdata (the GC root; the pointer
+/// below is just a cache of it).
+const SCRATCH_REGISTRY_KEY: [*:0]const u8 = "__labelle_scratch";
+
+/// The shared get/poll scratch: pointer + capacity of the registry-anchored
+/// userdata. Module state mirrors the VM singleton (one VM per process);
+/// `install` resets it because the block dies with its lua_State.
+var scratch: struct { ptr: ?[*]u8, cap: usize } = .{ .ptr = null, .cap = 0 };
+
+/// Monotonic count of scratch (re)allocations — a test seam proving the
+/// buffer settles: steady-state polling of even the largest payload must
+/// stop bumping this. Never reset (deltas are what tests assert).
+pub var scratch_growth_count: usize = 0;
+
+/// Return scratch with room for `needed` bytes, (re)allocating grow-only:
+/// a new userdata replaces the registry anchor (the old block becomes
+/// garbage) only when the current one is too small. lua_newuserdatauv
+/// raises on OOM like any shim error — our frames hold no defers, so the
+/// longjmp is safe.
+fn ensureScratch(L: ?*c.State, needed: usize) [*]u8 {
+    if (scratch.ptr) |p| {
+        if (scratch.cap >= needed) return p;
+    }
+    const cap = @max(needed, SCRATCH_INITIAL_CAP);
+    const block: [*]u8 = @ptrCast(c.lua_newuserdatauv(L, cap, 0) orelse
+        argError(L, "labelle: scratch allocation failed"));
+    c.lua_setfield(L, c.LUA_REGISTRYINDEX, SCRATCH_REGISTRY_KEY);
+    scratch = .{ .ptr = block, .cap = cap };
+    scratch_growth_count += 1;
+    return block;
+}
 
 const prelude_source = @embedFile("prelude.lua");
 
@@ -41,6 +85,9 @@ const prelude_source = @embedFile("prelude.lua");
 /// unlike a game script, a broken prelude means NO script can work.
 pub fn install(vm: Vm) error{PreludeFailed}!void {
     const L = vm.L;
+    // The previous VM's scratch died with its lua_State; drop the stale
+    // cache so the first get/poll in THIS VM re-anchors a fresh block.
+    scratch = .{ .ptr = null, .cap = 0 };
     c.lua_createtable(L, 0, @intCast(shims.len));
     inline for (shims) |shim| {
         c.lua_pushcclosure(L, shim.func, 0);
@@ -149,9 +196,21 @@ fn rawComponentSet(L: ?*c.State) callconv(.c) c_int {
 fn rawComponentGet(L: ?*c.State) callconv(.c) c_int {
     const id = checkId(L, 1);
     const name = checkString(L, 2, "component name");
-    var buf: [JSON_BUF_CAP]u8 = undefined;
-    const n = contract.labelle_component_get(id, name.ptr, name.len, &buf, buf.len);
-    _ = c.lua_pushlstring(L, &buf, n); // "" = absent (prelude maps to nil)
+    // component_get returns the size the COMPLETE JSON requires and
+    // writes all-or-nothing, so one call answers "did it fit" and "how
+    // big" at once: on required > cap the buffer holds nothing yet —
+    // grow the scratch and retry exactly once (nothing can mutate the
+    // world between the calls: same tick, same thread).
+    var buf = ensureScratch(L, SCRATCH_INITIAL_CAP);
+    var n = contract.labelle_component_get(id, name.ptr, name.len, buf, scratch.cap);
+    if (n > scratch.cap) {
+        buf = ensureScratch(L, n);
+        n = contract.labelle_component_get(id, name.ptr, name.len, buf, scratch.cap);
+        // Belt: a retry that STILL doesn't fit is impossible (see
+        // above); degrade to "absent" rather than push garbage.
+        if (n > scratch.cap) n = 0;
+    }
+    _ = c.lua_pushlstring(L, buf, n); // "" = absent (prelude maps to nil)
     return 1;
 }
 
@@ -215,9 +274,20 @@ fn rawEventSubscribe(L: ?*c.State) callconv(.c) c_int {
 }
 
 fn rawEventPoll(L: ?*c.State) callconv(.c) c_int {
-    var buf: [JSON_BUF_CAP]u8 = undefined;
-    const n = contract.labelle_event_poll(&buf, buf.len);
-    _ = c.lua_pushlstring(L, &buf, n); // "" = inbox empty (the drain-loop sentinel)
+    // A truncated poll CONSUMES the entry, so never risk one: probe
+    // first (NULL/cap-0 returns the NEXT entry's size, no consume),
+    // grow the scratch if needed, then do the real read. Two contract
+    // calls per event — noise at game-logic event rates, and the
+    // simplest scheme that can never drop a byte (see the module doc).
+    const next_len = contract.labelle_event_poll(null, 0);
+    if (next_len == 0) { // inbox empty — the drain-loop sentinel
+        const empty: []const u8 = "";
+        _ = c.lua_pushlstring(L, empty.ptr, 0);
+        return 1;
+    }
+    const buf = ensureScratch(L, next_len);
+    const n = contract.labelle_event_poll(buf, scratch.cap);
+    _ = c.lua_pushlstring(L, buf, @min(n, scratch.cap));
     return 1;
 }
 

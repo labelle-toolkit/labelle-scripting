@@ -28,9 +28,14 @@
 -- arrayness without re-tagging.
 --
 -- Handler ownership: labelle.on records WHICH script registered each
--- handler (via the _ENV stamp vm.zig plants in every script env); when a
--- script is evicted its handlers are purged through
--- __labelle_purge_handlers, so nothing keeps firing into dead state.
+-- handler by reading __labelle_current_script — the global vm.zig stamps
+-- around every VM→script entry (chunk body, init/update/deinit), the
+-- VM-truth "whose code is running". NOT derived from the caller's _ENV:
+-- a script-local helper closing over an alias of labelle.on carries no
+-- _ENV upvalue, so an upvalue walk would yield owner nil and exempt the
+-- handler from purges. When a script is evicted its handlers are purged
+-- through __labelle_purge_handlers, so nothing keeps firing into dead
+-- state.
 
 -- ── json ─────────────────────────────────────────────────────────────────
 -- Minimal pure-Lua JSON codec for component payloads (encoding v1):
@@ -459,37 +464,24 @@ end
 local handlers = {}
 
 -- Captured at install time so a script replacing the `debug` global can't
--- break handler attribution — the same paranoia vm.zig applies by calling
--- luaL_traceback instead of debug.traceback.
-local debug_getinfo, debug_getupvalue = debug.getinfo, debug.getupvalue
+-- break handler error reporting — the same paranoia vm.zig applies by
+-- calling luaL_traceback instead of debug.traceback.
+local debug_traceback = debug.traceback
 
--- The script that owns the code CALLING into the prelude: walk the
--- caller's _ENV upvalue (any function that touches globals carries one —
--- and a labelle.on caller referenced at least `labelle`) and read the
--- name vm.zig stamped into each script env at load. Level 3 = whoever
--- called labelle.on (1 = here, 2 = labelle.on). nil — and thus exemption
--- from every purge — when there is no stamped script env behind the
--- call: the prelude itself, host-run anonymous chunks.
-local function caller_script_name()
-  local info = debug_getinfo(3, "f")
-  if not info or not info.func then return nil end
-  local i = 1
-  while true do
-    local n, v = debug_getupvalue(info.func, i)
-    if n == nil then return nil end
-    if n == "_ENV" then
-      if type(v) == "table" then return rawget(v, "__labelle_script_name") end
-      return nil
-    end
-    i = i + 1
-  end
+-- xpcall message handler for handler dispatch: capture the traceback
+-- BEFORE the stack unwinds (the vm.zig msghTraceback pattern — after the
+-- unwind the frames are gone). Level 2 skips this handler's own frame.
+local function handler_msgh(err)
+  return debug_traceback(tostring(err), 2)
 end
 
 --- Subscribe `fn` to a game event by name. The payload arrives as a
 --- decoded table ({} for empty payloads). Multiple handlers per name fan
---- out in registration order. The registering SCRIPT owns the handler:
---- when a script is evicted (chunk body or init() failure), its handlers
---- are purged with it and never fire again.
+--- out in registration order. The registering SCRIPT owns the handler —
+--- __labelle_current_script, the VM's stamp of whose code is running
+--- (nil for prelude/host-run code, which no purge ever matches): when a
+--- script is evicted (chunk body or init() failure), its handlers are
+--- purged with it and never fire again.
 function labelle.on(name, fn)
   labelle.raw_event_subscribe(name)
   local hs = handlers[name]
@@ -497,15 +489,19 @@ function labelle.on(name, fn)
     hs = {}
     handlers[name] = hs
   end
-  hs[#hs + 1] = { fn = fn, owner = caller_script_name() }
+  hs[#hs + 1] = { fn = fn, owner = __labelle_current_script }
 end
 
 --- Drain the event inbox, dispatching each entry to its handlers. The
 --- Controller calls this once at tick start, BEFORE script updates, so
 --- handlers observe last frame's events before this frame's logic runs.
---- A handler that throws aborts this drain (the Zig side logs the trace
---- and the tick survives); undrained events stay queued for next tick.
---- Only SURVIVING handlers run — an evicted script's were purged.
+--- Handlers are ISOLATED: each runs under its own xpcall, a throwing
+--- handler is logged (event, owner, traceback) and the fan-out AND the
+--- drain continue — one broken handler must not starve its siblings or
+--- leave the rest of the inbox queued. Each handler runs with
+--- __labelle_current_script set to its owner (and restored after), so a
+--- handler that registers handlers attributes them correctly. Only
+--- SURVIVING handlers run — an evicted script's were purged.
 function labelle.dispatch_inbox()
   while true do
     local entry = labelle.raw_event_poll()
@@ -515,7 +511,15 @@ function labelle.dispatch_inbox()
     if hs then
       local tbl = (payload ~= nil and payload ~= "") and json.decode(payload) or {}
       for i = 1, #hs do
-        hs[i].fn(tbl)
+        local h = hs[i]
+        local saved = __labelle_current_script
+        __labelle_current_script = h.owner
+        local ok, err = xpcall(h.fn, handler_msgh, tbl)
+        __labelle_current_script = saved
+        if not ok then
+          labelle.raw_log(string.format("[lua] event '%s' handler (owner '%s') failed: %s",
+            name, tostring(h.owner), tostring(err)))
+        end
       end
     end
   end

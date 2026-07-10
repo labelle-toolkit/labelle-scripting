@@ -13,12 +13,21 @@
 //!
 //! POC-style shortcuts (fine for a mock, wrong for an engine): fixed-size
 //! arrays, JSON stored as opaque strings (only `query` inspects names),
-//! single script inbox, main-thread only.
+//! single script inbox, main-thread only. Because payloads stay opaque,
+//! the real host's PARSE-side validation is deliberately not mirrored:
+//! component_set/event_emit here accept bytes the engine refuses with -1
+//! (malformed JSON, trailing garbage after the document, non-empty
+//! payloads on void events). The Lua plugin only ever sends json.encode
+//! output or "", so no test depends on that leniency; the engine's own
+//! script_contract tests pin the strict behavior.
 
 const std = @import("std");
 
 const NAME_CAP = 48;
-const JSON_CAP = 512;
+// Big enough that a component (and event payload) can exceed the Lua
+// shim's 4 KiB initial scratch — the grow-only scratch tests need the
+// mock to store and serve >4096-byte JSON intact.
+const JSON_CAP = 8192;
 const EVENT_CAP = NAME_CAP + JSON_CAP;
 const LOG_CAP = 2048; // must hold a full Lua traceback line
 // Big enough that a query over 20-digit ids can outgrow the Lua shim's
@@ -99,11 +108,18 @@ const World = struct {
     }
 };
 
-pub var world: World = .{};
+/// Deliberately `undefined` so the multi-megabyte component store lands
+/// in .bss instead of being embedded in the test binary as .data; every
+/// test calls `reset()` (via the shared `fresh()`) before touching the
+/// mock, which is what makes the state defined.
+pub var world: World = undefined;
 
 /// Fresh world between tests — global state demands explicit resets.
+/// Zero everything, then restore the one non-zero default (ids start
+/// at 1 — 0 is the contract's failure sentinel).
 pub fn reset() void {
-    world = .{};
+    @memset(std.mem.asBytes(&world), 0);
+    world.next_id = 1;
 }
 
 // ── contract exports: version ────────────────────────────────────────────
@@ -196,16 +212,22 @@ export fn labelle_component_get(
     id: u64,
     name: [*]const u8,
     name_len: usize,
-    out: [*]u8,
+    out: ?[*]u8,
     out_cap: usize,
 ) usize {
     const e = world.find(id) orelse return 0;
     const n = name[0..@min(name_len, NAME_CAP)];
     for (e.comps[0..e.comp_count]) |*comp| {
         if (std.mem.eql(u8, comp.nameSlice(), n)) {
-            if (comp.json_len > out_cap) return 0; // "doesn't fit" convention
-            @memcpy(out[0..comp.json_len], comp.jsonSlice());
-            return comp.json_len;
+            // Contract v1 required-size sizing: RETURN the bytes the
+            // complete JSON needs; WRITE all-or-nothing (only when it
+            // fits — a truncated JSON object prefix is useless).
+            // NULL/cap-0 out is the pure sizing probe.
+            const required = comp.json_len;
+            if (out) |buf| {
+                if (required <= out_cap) @memcpy(buf[0..required], comp.jsonSlice());
+            }
+            return required;
         }
     }
     return 0;
@@ -235,7 +257,7 @@ export fn labelle_component_remove(id: u64, name: [*]const u8, name_len: usize) 
 export fn labelle_query(
     names_json: [*]const u8,
     names_json_len: usize,
-    out: [*]u8,
+    out: ?[*]u8,
     out_cap: usize,
 ) usize {
     const input = names_json[0..names_json_len];
@@ -251,14 +273,14 @@ export fn labelle_query(
         n += 1;
     }
     if (n == 0) return 0;
-    // Contract v1 snprintf-style sizing (the query is the contract's one
-    // required-size op): RETURN the bytes the complete result needs;
-    // WRITE only up to `out_cap`, truncated at the last whole id with
-    // the closing `]` reserved so the written prefix stays valid JSON.
-    const buf = out[0..out_cap];
+    // Contract v1 snprintf-style sizing: RETURN the bytes the complete
+    // result needs; WRITE only up to `out_cap`, truncated at the last
+    // whole id with the closing `]` reserved so the written prefix stays
+    // valid JSON. NULL out (the pure sizing probe) writes nothing.
+    const buf: []u8 = if (out) |p| p[0..out_cap] else &.{};
     var cur: usize = 0;
     var required: usize = 2; // "[]" — the brackets, matches or not
-    var writing = out_cap >= 2;
+    var writing = buf.len >= 2;
     if (writing) {
         buf[0] = '[';
         cur = 1;
@@ -285,7 +307,7 @@ export fn labelle_query(
         }
         first = false;
     }
-    if (out_cap >= 2) buf[cur] = ']';
+    if (buf.len >= 2) buf[cur] = ']';
     return required;
 }
 
@@ -319,13 +341,18 @@ export fn labelle_event_subscribe(name: [*]const u8, name_len: usize) void {
     world.sub_count += 1;
 }
 
-export fn labelle_event_poll(out: [*]u8, out_cap: usize) usize {
+export fn labelle_event_poll(out: ?[*]u8, out_cap: usize) usize {
     if (world.inbox_count == 0) return 0;
     const ev = &world.inbox[world.inbox_head];
+    // Contract v1 probe pairing: NULL/cap-0 returns the NEXT entry's
+    // size and consumes NOTHING — the sizing leg of the poll loop. Only
+    // a real read (below) consumes, truncation included.
+    const buf = out orelse return ev.len;
+    if (out_cap == 0) return ev.len;
     world.inbox_head = (world.inbox_head + 1) % MAX_EVENTS;
     world.inbox_count -= 1;
     const len = @min(ev.len, out_cap);
-    @memcpy(out[0..len], ev.buf[0..len]);
+    @memcpy(buf[0..len], ev.buf[0..len]);
     return len;
 }
 
@@ -419,6 +446,16 @@ pub fn logsContain(needle: []const u8) bool {
         if (std.mem.indexOf(u8, l.buf[0..l.len], needle) != null) return true;
     }
     return false;
+}
+
+/// How many labelle_log lines contain `needle` — "logged exactly once"
+/// assertions (per-handler dispatch errors) go through this.
+pub fn logCount(needle: []const u8) usize {
+    var n: usize = 0;
+    for (world.logs[0..world.log_count]) |*l| {
+        if (std.mem.indexOf(u8, l.buf[0..l.len], needle) != null) n += 1;
+    }
+    return n;
 }
 
 pub fn sceneName() []const u8 {
