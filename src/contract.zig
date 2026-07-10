@@ -17,7 +17,11 @@
 //!   - i32 returns: 0 = ok, -1 = failure (except `labelle_component_has`,
 //!     a 1/0 boolean);
 //!   - out-parameter functions return bytes written, 0 = absent/unknown/
-//!     doesn't fit — size buffers generously, there is no two-call sizing;
+//!     doesn't fit — size buffers generously, there is no two-call sizing.
+//!     The ONE exception is `labelle_query` (the contract's only
+//!     unbounded-cardinality op): it returns the bytes the COMPLETE
+//!     result requires, snprintf-style, so callers detect truncation
+//!     (required > cap) and retry right-sized;
 //!   - main-thread only, valid during the plugin's tick;
 //!   - before the host binds its game every call is a safe no-op.
 
@@ -81,10 +85,13 @@ pub extern fn labelle_component_remove(id: u64, name: [*]const u8, name_len: usi
 // ── Queries ──────────────────────────────────────────────────────────────
 
 /// `names_json` is a JSON array of component names; the host writes the
-/// matching entity ids as a JSON array into `out`. Returns bytes written,
-/// 0 = malformed input / not bound; unknown names yield "[]". Snapshot
-/// semantics: mutating entities while walking the result is safe; on
-/// overflow the list truncates at the last whole id and stays valid JSON.
+/// matching entity ids as a JSON array into `out`. Returns the bytes the
+/// COMPLETE result requires (snprintf-style — the contract's one sizing
+/// exception; required > out_cap means the write truncated at the last
+/// whole id but stayed valid JSON: retry with a required-sized buffer),
+/// 0 = malformed input / not bound; unknown names yield "[]" (required
+/// 2). Snapshot semantics: mutating entities while walking the result
+/// is safe.
 pub extern fn labelle_query(
     names_json: [*]const u8,
     names_json_len: usize,

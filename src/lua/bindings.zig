@@ -12,10 +12,14 @@
 //!      doing it through the C API would triple the shim count for zero
 //!      gain.
 //!
-//! Buffer sizing: the contract has no two-call sizing on purpose (script
-//! payloads are small); the caps below are "generous" per its guidance.
-//! Truncation is defined behavior on the contract side (component_get
-//! reports 0 when it doesn't fit, query truncates at the last whole id).
+//! Buffer sizing: component_get and event_poll have no two-call sizing on
+//! purpose (script payloads are small; they return bytes written,
+//! component_get reports 0 when it doesn't fit) — the caps below are
+//! "generous" per the contract's guidance. The query is the contract's
+//! one snprintf-style op (its cardinality is unbounded): the return is
+//! the size the COMPLETE result requires, so the shim tries the fixed
+//! buffer first and grows-and-retries once when required > cap —
+//! `game.query` always yields ALL matching ids, never a silent prefix.
 
 const contract = @import("../contract.zig");
 const vm_mod = @import("vm.zig");
@@ -172,8 +176,26 @@ fn rawComponentRemove(L: ?*c.State) callconv(.c) c_int {
 fn rawQuery(L: ?*c.State) callconv(.c) c_int {
     const names_json = checkString(L, 1, "component-names json array");
     var buf: [QUERY_BUF_CAP]u8 = undefined;
-    const n = contract.labelle_query(names_json.ptr, names_json.len, &buf, buf.len);
-    _ = c.lua_pushlstring(L, &buf, n); // "" = malformed/unbound; "[]" = no match
+    // The query is the contract's one snprintf-style op: the return is
+    // the size the COMPLETE result requires, however much fit the cap.
+    const required = contract.labelle_query(names_json.ptr, names_json.len, &buf, buf.len);
+    if (required <= buf.len) {
+        _ = c.lua_pushlstring(L, &buf, required); // "" = malformed/unbound; "[]" = no match
+        return 1;
+    }
+    // The id list outgrew the fixed buffer: retry ONCE, right-sized.
+    // lua_newuserdatauv is the cleanest allocation inside a shim — a
+    // GC-owned block with no allocator plumbing and no free path (it
+    // sits below the result string and dies with the call frame; on
+    // OOM it raises like any argError). Nothing can mutate the world
+    // between the two calls — same tick, same thread, scripts are the
+    // only actor — so the retry cannot come back bigger; the @min is
+    // pure belt against reading past the block if that invariant ever
+    // broke.
+    const block: [*]u8 = @ptrCast(c.lua_newuserdatauv(L, required, 0) orelse
+        argError(L, "labelle: query retry allocation failed"));
+    const n = contract.labelle_query(names_json.ptr, names_json.len, block, required);
+    _ = c.lua_pushlstring(L, block, @min(n, required));
     return 1;
 }
 

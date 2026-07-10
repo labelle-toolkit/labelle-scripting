@@ -175,6 +175,21 @@ test "prelude json round-trips nested component tables" {
     try expectComponent(1, "RoundTrip", "{\"ok\":true}");
 }
 
+test "labelle.array: explicit empty arrays encode as [] and round-trip" {
+    fresh();
+    scripting.registerScript("array_marker", @embedFile("lua/array_marker.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Encoder-level properties assert inside the script (a failure
+    // evicts it and the components below never appear); the Zig side
+    // pins the byte-exact JSON after each hop — set with an explicit
+    // empty array, then get→set untouched (decode re-tags the array,
+    // so [] survives the round trip instead of collapsing to {}).
+    try expectComponent(1, "Path", "{\"waypoints\":[]}");
+    try expectComponent(1, "PathAgain", "{\"waypoints\":[]}");
+}
+
 test "game.query iterates the mock world's matching ids" {
     fresh();
     scripting.registerScript("query_check", @embedFile("lua/query_check.lua"));
@@ -219,6 +234,33 @@ test "game.query round-trips bit-63 entity ids exactly" {
     try expectEqual(@as(usize, 1), mock.aliveCount());
 }
 
+test "game.query grows past the fixed shim buffer and yields ALL ids" {
+    fresh();
+    // 420 entities with 20-digit ids ≈ 8.8 KB of id JSON — past the
+    // shim's 8 KiB QUERY_BUF_CAP, so raw_query must see required > cap
+    // and retry right-sized. The base id leaves headroom for all 421
+    // creates below u64 max.
+    const base: u64 = std.math.maxInt(u64) - 1000;
+    mock.setNextEntityId(base);
+    scripting.registerScript("big_query_check", @embedFile("lua/big_query_check.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Guard the premise first: the complete result really does exceed
+    // the shim's fixed 8192-byte buffer (bindings.zig QUERY_BUF_CAP) —
+    // probed through the same contract sizing the shim uses.
+    const names = "[\"Marker\"]";
+    var dummy: [1]u8 = undefined;
+    const required = scripting.contract.labelle_query(names.ptr, names.len, &dummy, 0);
+    try expect(required > 8192);
+
+    // The script's own asserts police the id set (each created id seen
+    // exactly once — any silent prefix evicts it and BigQuery never
+    // appears); the Zig side pins the count.
+    try expectComponent(base + 420, "BigQuery", "{\"count\":420}");
+    try expectEqual(@as(usize, 421), mock.aliveCount());
+}
+
 test "labelle.on dispatch fires with decoded payloads" {
     fresh();
     scripting.registerScript("event_payload", @embedFile("lua/event_payload.lua"));
@@ -237,6 +279,82 @@ test "labelle.on dispatch fires with decoded payloads" {
     mock.hostEmit("unrelated_event", "{\"x\":1}");
     scripting.Controller.tick(.{}, 0.016);
     try expectComponent(1, "Seen", "{\"amount\":7,\"count\":2,\"fanout\":2,\"nested_ok\":true}");
+}
+
+test "eviction purges the dead scripts' handlers; siblings keep firing" {
+    fresh();
+    // Chunk-scope handler + failing init(): the init-fail eviction path
+    // must take the handler with the script.
+    scripting.registerScript("doomed",
+        \\labelle.on("ping", function(ev)
+        \\    labelle.log("doomed handler ran")
+        \\end)
+        \\function init()
+        \\    error("doomed init boom")
+        \\end
+    );
+    // Chunk-scope handler + failing chunk BODY: the load-fail eviction
+    // path (the handler registered BEFORE the body erred).
+    scripting.registerScript("body_boom",
+        \\labelle.on("ping", function(ev)
+        \\    labelle.log("body_boom handler ran")
+        \\end)
+        \\error("body_boom top-level")
+    );
+    scripting.registerScript("survivor",
+        \\local state
+        \\labelle.on("ping", function(ev)
+        \\    local s = state:get("Pings")
+        \\    s.n = s.n + 1
+        \\    state:set("Pings", s)
+        \\end)
+        \\function init()
+        \\    state = Entity.new()
+        \\    state:set("Pings", { n = 0 })
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    mock.hostEmit("ping", "{}");
+    scripting.Controller.tick(.{}, 0.016);
+
+    // Both evictions logged...
+    try expect(mock.logsContain("doomed init boom"));
+    try expect(mock.logsContain("script evicted"));
+    try expect(mock.logsContain("body_boom top-level"));
+    // ...the sibling's handler saw the event (so dispatch DID run)...
+    try expectComponent(1, "Pings", "{\"n\":1}");
+    // ...while neither evicted script's chunk-scope handler fired.
+    try expect(!mock.logsContain("doomed handler ran"));
+    try expect(!mock.logsContain("body_boom handler ran"));
+
+    // Later events keep flowing to the survivor only.
+    mock.hostEmit("ping", "{}");
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "Pings", "{\"n\":2}");
+    try expect(!mock.logsContain("doomed handler ran"));
+    try expect(!mock.logsContain("body_boom handler ran"));
+}
+
+test "event payloads carry u64 ids bit-exact through json.decode" {
+    fresh();
+    // Bit-63 id: its unsigned decimal exceeds math.maxinteger, so a
+    // tonumber() in the payload number path would degrade it to an
+    // imprecise float and the handler's writes would miss the entity.
+    mock.setNextEntityId(0x8000000000000001);
+    scripting.registerScript("payload_id_check", @embedFile("lua/payload_id_check.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    mock.hostEmit("owner__ping", "{\"owner\":9223372036854775809}");
+    scripting.Controller.tick(.{}, 0.016);
+
+    // The handler wrapped the PAYLOAD id and wrote through it — the
+    // component landing on the real u64-addressed entity is the proof
+    // (the script's own asserts pin integer-ness and bit-equality).
+    const big_id: u64 = 0x8000000000000001;
+    try expectComponent(big_id, "Owned", "{\"seen\":true,\"tag\":42}");
 }
 
 test "controller lifecycle: prefab/scene/remove, deinit hooks, re-setup" {

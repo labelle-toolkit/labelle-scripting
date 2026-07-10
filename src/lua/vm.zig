@@ -77,6 +77,10 @@ pub const c = struct {
     pub extern fn lua_pushinteger(L: ?*State, n: i64) void;
     pub extern fn lua_pushnumber(L: ?*State, n: f64) void;
     pub extern fn lua_pushboolean(L: ?*State, b: c_int) void;
+    /// GC-owned scratch memory (raises on OOM — the standard C-closure
+    /// longjmp, safe in defer-free shim frames). The block lives on the
+    /// stack; the frame's end releases it to the collector.
+    pub extern fn lua_newuserdatauv(L: ?*State, sz: usize, nuvalue: c_int) ?*anyopaque;
 
     // Table and global access.
     pub extern fn lua_getglobal(L: ?*State, name: [*:0]const u8) c_int;
@@ -226,6 +230,13 @@ pub const Vm = struct {
         c.lua_setfield(L, -2, "__index"); // [chunk, env, meta]
         _ = c.lua_setmetatable(L, -2); // [chunk, env]
 
+        // env.__labelle_script_name = name — the ownership stamp. The
+        // prelude's `labelle.on` reads it through the registering
+        // caller's _ENV to record which script owns each handler, which
+        // is what lets eviction purge exactly that script's handlers.
+        _ = c.lua_pushlstring(L, name.ptr, name.len); // [chunk, env, name]
+        c.lua_setfield(L, -2, "__labelle_script_name"); // [chunk, env]
+
         // __labelle_scripts[name] = env. The registry is a plain prelude
         // table; if the prelude never ran we must bail BEFORE lua_settable,
         // which would raise (and longjmp through this Zig frame).
@@ -251,9 +262,12 @@ pub const Vm = struct {
             // The body failed AFTER its env went into the registry, and
             // whatever it managed to define before erroring (an `update`,
             // say) must not receive hooks on a half-initialized script.
-            // protectedCall already logged the traceback; just pull the
-            // env back out.
+            // protectedCall already logged the traceback; pull the env
+            // back out — and purge any handlers the body registered
+            // before erroring (a chunk-scope `labelle.on` above the
+            // failing line already landed in the prelude's table).
             self.removeScriptEnv(name);
+            self.purgeScriptHandlers(name);
             return false;
         }
         return true;
@@ -278,11 +292,29 @@ pub const Vm = struct {
 
     /// Quarantine a script whose `init()` failed: remove its env so the
     /// `update`/`deinit` loops skip it — a half-initialized script must not
-    /// keep receiving hooks — and log the eviction once (the init traceback
-    /// alone would not explain why the script went silent afterwards).
+    /// keep receiving hooks — purge its `labelle.on` handlers (chunk-scope
+    /// subscriptions would otherwise keep firing into the broken state),
+    /// and log the eviction once (the init traceback alone would not
+    /// explain why the script went silent afterwards).
     pub fn evictScript(self: Vm, name: []const u8) void {
         self.removeScriptEnv(name);
+        self.purgeScriptHandlers(name);
         logError(name, "init() failed — script evicted; update/deinit will not run");
+    }
+
+    /// Drop every event handler `name` registered through `labelle.on` —
+    /// the prelude-side half of eviction, via its `__labelle_purge_handlers`
+    /// hook. Missing hook (prelude never installed) is a silent no-op; a
+    /// raising purge is logged like any script error by protectedCall.
+    fn purgeScriptHandlers(self: Vm, name: []const u8) void {
+        const L = self.L;
+        _ = c.lua_getglobal(L, "__labelle_purge_handlers"); // [fn?]
+        if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
+            c.lua_settop(L, -2);
+            return;
+        }
+        _ = c.lua_pushlstring(L, name.ptr, name.len); // [fn, name]
+        _ = self.protectedCall(1, 0, name);
     }
 
     /// Call `hook` ("init"/"update"/"deinit") of the script registered as

@@ -21,7 +21,10 @@ const NAME_CAP = 48;
 const JSON_CAP = 512;
 const EVENT_CAP = NAME_CAP + JSON_CAP;
 const LOG_CAP = 2048; // must hold a full Lua traceback line
-const MAX_ENTITIES = 64;
+// Big enough that a query over 20-digit ids can outgrow the Lua shim's
+// fixed QUERY_BUF_CAP (8 KiB ÷ 21 bytes/id ≈ 390) — the grow-and-retry
+// test needs the mock to actually overflow it.
+const MAX_ENTITIES = 512;
 const MAX_COMPONENTS = 8;
 const MAX_EVENTS = 64;
 const MAX_SUBS = 16;
@@ -248,20 +251,42 @@ export fn labelle_query(
         n += 1;
     }
     if (n == 0) return 0;
-    var w = std.Io.Writer.fixed(out[0..out_cap]);
-    w.writeByte('[') catch return 0;
+    // Contract v1 snprintf-style sizing (the query is the contract's one
+    // required-size op): RETURN the bytes the complete result needs;
+    // WRITE only up to `out_cap`, truncated at the last whole id with
+    // the closing `]` reserved so the written prefix stays valid JSON.
+    const buf = out[0..out_cap];
+    var cur: usize = 0;
+    var required: usize = 2; // "[]" — the brackets, matches or not
+    var writing = out_cap >= 2;
+    if (writing) {
+        buf[0] = '[';
+        cur = 1;
+    }
     var first = true;
     outer: for (world.entities[0..world.entity_count]) |*e| {
         if (!e.alive) continue;
         for (names[0..n]) |nm| {
             if (!entityHas(e, nm)) continue :outer;
         }
-        if (!first) w.writeByte(',') catch break;
-        w.print("{d}", .{e.id}) catch break;
+        var tmp: [21]u8 = undefined; // u64 max = 20 digits, +1 comma
+        var w = std.Io.Writer.fixed(&tmp);
+        if (!first) w.writeByte(',') catch unreachable;
+        w.print("{d}", .{e.id}) catch unreachable;
+        const frag = w.buffered();
+        required += frag.len;
+        // Reserve one byte for `]`; a fragment that doesn't fit flips to
+        // pure counting (rollback-at-last-whole-id semantics).
+        if (writing and cur + frag.len <= buf.len - 1) {
+            @memcpy(buf[cur..][0..frag.len], frag);
+            cur += frag.len;
+        } else {
+            writing = false;
+        }
         first = false;
     }
-    w.writeByte(']') catch return 0;
-    return w.buffered().len;
+    if (out_cap >= 2) buf[cur] = ']';
+    return required;
 }
 
 // ── contract exports: events ─────────────────────────────────────────────

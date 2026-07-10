@@ -16,7 +16,21 @@
 -- but embed entity ids in payloads via labelle.u64str(id): plain %d would
 -- sign-flip bit-63 ids. The generic json.encode deliberately does NOT
 -- special-case negative integers (they may be legitimate component values);
--- only values KNOWN to be ids get the unsigned rendering.
+-- only values KNOWN to be ids get the unsigned rendering. The DECODE leg
+-- needs no such opt-in: integer-looking payload tokens parse with wrapping
+-- 64-bit arithmetic (see decode_number), so a u64 id arriving in an event
+-- payload lands bit-exact on the same signed bitcast the raw shims use.
+--
+-- Array rule: an untagged empty Lua table is ambiguous and encodes as the
+-- JSON object "{}" (the contract's "all defaults"). Wrap array-typed
+-- values in labelle.array(t) to force array form — empty included — and
+-- json.decode tags every array it produces, so get→set round-trips keep
+-- arrayness without re-tagging.
+--
+-- Handler ownership: labelle.on records WHICH script registered each
+-- handler (via the _ENV stamp vm.zig plants in every script env); when a
+-- script is evicted its handlers are purged through
+-- __labelle_purge_handlers, so nothing keeps firing into dead state.
 
 -- ── json ─────────────────────────────────────────────────────────────────
 -- Minimal pure-Lua JSON codec for component payloads (encoding v1):
@@ -42,9 +56,16 @@ local function encode_string(s)
   return '"' .. s:gsub('[%c"\\]', escape_char) .. '"'
 end
 
--- A table encodes as an array iff its keys are exactly 1..#t. Empty tables
--- encode as {} — the contract reads "{}" as "all defaults", which is the
--- right meaning for an empty component payload.
+-- Marker metatable for EXPLICIT arrays (labelle.array): a tagged table
+-- encodes in array form even when empty — an untagged empty table is
+-- ambiguous in Lua and stays the JSON object "{}" — and json.decode tags
+-- every array it produces so decoded arrays re-encode as arrays.
+local ARRAY_MT = {}
+
+-- A table encodes as an array iff it carries the labelle.array tag OR its
+-- keys are exactly 1..#t. Untagged empty tables encode as {} — the
+-- contract reads "{}" as "all defaults", which is the right meaning for
+-- an empty component payload; pass labelle.array({}) to mean "[]".
 local function is_array(t)
   local n = 0
   for k in pairs(t) do
@@ -57,11 +78,15 @@ end
 local encode_value -- forward declaration (encode_table recurses through it)
 
 local function encode_table(t, out)
-  if next(t) == nil then
+  local tagged = getmetatable(t) == ARRAY_MT
+  if not tagged and next(t) == nil then
     out[#out + 1] = "{}"
     return
   end
-  if is_array(t) then
+  if tagged or is_array(t) then
+    -- Array form encodes the SEQUENCE 1..#t. The tag is an explicit
+    -- override for the mixed edge cases too: a tagged table with stray
+    -- non-sequence keys still emits as an array, the strays dropped.
     out[#out + 1] = "["
     for i = 1, #t do
       if i > 1 then out[#out + 1] = "," end
@@ -161,10 +186,29 @@ local function decode_string(s, i) -- i sits on the opening quote
   end
 end
 
+-- Integer-looking tokens (all digits, optional leading '-'; no '.', 'e'
+-- or 'E') build with WRAPPING integer arithmetic: acc*10+digit wraps mod
+-- 2^64 on Lua 5.4 integers, so a token ≥ 2^63 (a bit-63 entity id in an
+-- event payload, say) lands exactly on the SIGNED BITCAST the raw shims
+-- use for ids — tonumber() would round it through a float and a wrapper
+-- built from it would address the wrong entity. The wrapping is the
+-- documented semantics for out-of-range integers (tokens beyond 20
+-- digits keep wrapping mod 2^64 rather than saturating). True float
+-- tokens (fractions, exponents) keep tonumber.
 local function decode_number(s, i)
   local j = i
   while j <= #s and s:sub(j, j):match("[-+.eE%d]") do j = j + 1 end
-  local n = tonumber(s:sub(i, j - 1))
+  local tok = s:sub(i, j - 1)
+  local digits = tok:match("^%-?(%d+)$")
+  if digits then
+    local acc = 0
+    for k = 1, #digits do
+      acc = acc * 10 + (digits:byte(k) - 48)
+    end
+    if tok:byte(1) == 45 then acc = -acc end -- '-': wrapping negate
+    return acc, j
+  end
+  local n = tonumber(tok)
   if n == nil then decode_error(s, i, "bad number") end
   return n, j
 end
@@ -199,7 +243,9 @@ decode_value = function(s, i)
       end
     end
   elseif ch == "[" then
-    local arr = {}
+    -- Tagged at birth: a decoded array re-encodes as an array (empty
+    -- included), so get→modify→set round-trips preserve arrayness.
+    local arr = setmetatable({}, ARRAY_MT)
     i = skip_ws(s, i + 1)
     if s:sub(i, i) == "]" then return arr, i + 1 end
     while true do
@@ -361,6 +407,18 @@ function labelle.u64str(id)
   return u64tostr(id)
 end
 
+--- Tag `t` (or a fresh table when nil) as an EXPLICIT array for
+--- json.encode: it emits in array form even when empty — an untagged {}
+--- would encode as the JSON object "{}" and a slice-typed component
+--- field would refuse it. The tag also forces array interpretation for
+--- mixed tables (the sequence 1..#t encodes; stray keys are dropped).
+--- json.decode tags the arrays it produces with the same marker, so a
+--- get→modify→set round-trip needs no re-tagging:
+---   e:set("Path", { waypoints = labelle.array({}) })
+function labelle.array(t)
+  return setmetatable(t or {}, ARRAY_MT)
+end
+
 --- Log through the game's sink (stringifies for convenience).
 function labelle.log(msg)
   labelle.raw_log(tostring(msg))
@@ -395,12 +453,43 @@ end
 -- Receive side. The contract is subscribe + poll-drain (one FIFO inbox for
 -- the whole VM); callback dispatch is prelude sugar over that drain, shared
 -- by every script — which is exactly why `handlers` lives here and not in
--- any script's env.
+-- any script's env. Entries are { fn = handler, owner = script name }:
+-- ownership is what lets eviction pull a dead script's handlers back out
+-- again (__labelle_purge_handlers below).
 local handlers = {}
+
+-- Captured at install time so a script replacing the `debug` global can't
+-- break handler attribution — the same paranoia vm.zig applies by calling
+-- luaL_traceback instead of debug.traceback.
+local debug_getinfo, debug_getupvalue = debug.getinfo, debug.getupvalue
+
+-- The script that owns the code CALLING into the prelude: walk the
+-- caller's _ENV upvalue (any function that touches globals carries one —
+-- and a labelle.on caller referenced at least `labelle`) and read the
+-- name vm.zig stamped into each script env at load. Level 3 = whoever
+-- called labelle.on (1 = here, 2 = labelle.on). nil — and thus exemption
+-- from every purge — when there is no stamped script env behind the
+-- call: the prelude itself, host-run anonymous chunks.
+local function caller_script_name()
+  local info = debug_getinfo(3, "f")
+  if not info or not info.func then return nil end
+  local i = 1
+  while true do
+    local n, v = debug_getupvalue(info.func, i)
+    if n == nil then return nil end
+    if n == "_ENV" then
+      if type(v) == "table" then return rawget(v, "__labelle_script_name") end
+      return nil
+    end
+    i = i + 1
+  end
+end
 
 --- Subscribe `fn` to a game event by name. The payload arrives as a
 --- decoded table ({} for empty payloads). Multiple handlers per name fan
---- out in registration order.
+--- out in registration order. The registering SCRIPT owns the handler:
+--- when a script is evicted (chunk body or init() failure), its handlers
+--- are purged with it and never fire again.
 function labelle.on(name, fn)
   labelle.raw_event_subscribe(name)
   local hs = handlers[name]
@@ -408,7 +497,7 @@ function labelle.on(name, fn)
     hs = {}
     handlers[name] = hs
   end
-  hs[#hs + 1] = fn
+  hs[#hs + 1] = { fn = fn, owner = caller_script_name() }
 end
 
 --- Drain the event inbox, dispatching each entry to its handlers. The
@@ -416,6 +505,7 @@ end
 --- handlers observe last frame's events before this frame's logic runs.
 --- A handler that throws aborts this drain (the Zig side logs the trace
 --- and the tick survives); undrained events stay queued for next tick.
+--- Only SURVIVING handlers run — an evicted script's were purged.
 function labelle.dispatch_inbox()
   while true do
     local entry = labelle.raw_event_poll()
@@ -425,9 +515,23 @@ function labelle.dispatch_inbox()
     if hs then
       local tbl = (payload ~= nil and payload ~= "") and json.decode(payload) or {}
       for i = 1, #hs do
-        hs[i](tbl)
+        hs[i].fn(tbl)
       end
     end
+  end
+end
+
+-- Eviction hook — vm.zig calls this (load-fail and init-fail paths) with
+-- the dead script's name: drop every handler that script registered, so
+-- a chunk-scope labelle.on can't keep firing into evicted state.
+-- Owner-less handlers (owner == nil) never match a purge.
+function _G.__labelle_purge_handlers(name)
+  if name == nil then return end
+  for ev, hs in pairs(handlers) do
+    for i = #hs, 1, -1 do
+      if hs[i].owner == name then table.remove(hs, i) end
+    end
+    if #hs == 0 then handlers[ev] = nil end
   end
 end
 

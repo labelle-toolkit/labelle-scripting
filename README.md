@@ -74,5 +74,16 @@ in additively).
 64-bit bitcast — lossless for math, comparisons, and every `labelle.*` /
 `raw_*` call. But embed entity ids in payloads via `labelle.u64str(id)`
 (the id becomes a JSON string) — plain `%d` would sign-flip bit-63 ids.
+The decode direction needs no opt-in: `json.decode` parses integer
+tokens with wrapping 64-bit arithmetic, so a u64 id arriving in an event
+payload lands bit-exact and `Entity.wrap(ev.owner)` addresses the right
+entity.
+
+**Arrays**: an empty Lua table is ambiguous and encodes as the JSON
+object `{}` (the contract's "all defaults"). Wrap array-typed component
+fields in `labelle.array(t)` to force array form even when empty —
+`{ waypoints = labelle.array({}) }` encodes as `{"waypoints":[]}` — and
+`json.decode` tags the arrays it returns, so `get`→modify→`set`
+round-trips preserve arrayness without re-tagging.
 
 Design: `RFC-LANGUAGE-PLUGINS.md` (labelle-engine#730) · epic: labelle-engine#237
