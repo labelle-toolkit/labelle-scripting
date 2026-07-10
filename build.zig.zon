@@ -1,0 +1,23 @@
+.{
+    .name = .labelle_scripting,
+    .version = "0.1.0",
+    .fingerprint = 0x3b1730f0865454a4,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Upstream Lua 5.4 source, compiled into the module when
+        // `-Dlanguage=lua` (the default). Lazy so games on a future
+        // different language never download it (build.zig gates the
+        // b.lazyDependency call on the language option).
+        .lua = .{
+            .url = "https://www.lua.org/ftp/lua-5.4.8.tar.gz",
+            .hash = "N-V-__8AAKEzFAAA695b9LXBhUSVK5MAV_VKSm1mEj3Acbze",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "plugin.labelle",
+        "src",
+    },
+}
