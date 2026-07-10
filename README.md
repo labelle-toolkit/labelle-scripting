@@ -6,7 +6,7 @@ Script [labelle](https://github.com/labelle-toolkit) games in **Lua, TypeScript,
 // project.labelle
 .plugins = .{
     .{ .name = "scripting", .repo = "github.com/labelle-toolkit/labelle-scripting",
-       .version = "…", .language = "lua" },
+       .version = "…", .params = .{ .language = "lua" } },
 },
 ```
 
