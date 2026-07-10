@@ -1,2 +1,5 @@
 .zig-cache/
 zig-out/
+# Zig 0.16 extracts package deps here (recreated from build.zig.zon
+# hashes); the vendored Lua tree does not belong in the repo.
+zig-pkg/

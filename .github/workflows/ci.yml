@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The lua dep is lazy — `zig build test` fetches it on demand
+      # (network needed once; hash-pinned in build.zig.zon).
+      - name: Run tests
+        run: zig build test
+
+      - name: Formatting
+        run: zig fmt --check build.zig src tests
