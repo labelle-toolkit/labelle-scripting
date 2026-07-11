@@ -68,105 +68,20 @@
                 },
             },
         },
-        // Crystal (labelle-engine#741, second native language): TWO
-        // chained steps — the schema's steps run in order — because
-        // crystal has no `--no-main`: `crystal build --cross-compile`
-        // emits an object still carrying a `main` that would collide
-        // with the game's, so a localization pass demotes every symbol
-        // except the labelle_cr_* entries (the #734 POC's recipe). The
-        // localization tool differs per OS (ld64's -exported_symbols_list
-        // on macOS, binutils objcopy --keep-global-symbols on linux —
-        // same semantics, underscore-mangled vs plain symbol lists), so
-        // the second step carries a per-OS `.os` allowlist and the
-        // assembler emits exactly one of the pair for the generate's
-        // target OS. `.link = .object` (not .static_lib): the terminal
-        // artifact IS a single relocatable object — archiving it would
-        // add an `ar` step and a per-OS naming scheme for zero benefit;
-        // addObjectFile takes it as-is.
-        //
-        // {crystal_target} = the target triple crystal spells the zig
-        // target as (aarch64-apple-darwin / x86_64-linux-gnu / …);
-        // .library_paths' {crystal_env:CRYSTAL_LIBRARY_PATH} = `crystal
-        // env CRYSTAL_LIBRARY_PATH`, resolved at generate — where
-        // crystal's own link line points (brew's /opt/homebrew/lib, the
-        // official linux tarball's bundled lib/crystal/). The value is a
-        // COLON-SEPARATED list (single-dir installs are its one-entry
-        // degenerate): the splice must split on ':' and emit ONE library
-        // path per non-empty entry — tools/crystal_lib_paths.zig is the
-        // reference implementation this repo's own wiring uses, pinned
-        // by the shared suite's multi-entry fixtures. Both placeholders
-        // are new splice vocabulary specified for the #741 crystal
-        // follow-up; this repo's build.zig test wiring implements the
-        // identical recipe natively for the suite. Desktop-first, like
-        // rust.
-        .{
-            .language = "crystal",
-            .steps = .{
-                .{
-                    .name = "crystal-scripts",
-                    // No .artifact: intermediate step — the object it
-                    // emits still carries crystal's `main`. --release for
-                    // consumer builds (cargo parity: crystal's default is
-                    // "not fully optimized"; the repo's own tests build
-                    // debug for compile speed, consumers get release).
-                    //
-                    // v1 LIMITATION (documented, not solved here): game
-                    // scripts using OPTIONAL stdlib native deps (OpenSSL,
-                    // YAML, Compress/zlib …) need system libs this fixed
-                    // list cannot predict — such games fail at final link
-                    // with unresolved symbols naming the lib. The follow-up
-                    // is generate-time capture of crystal's printed link
-                    // line (the assembler-row spec's {crystal_env:…} class
-                    // of mechanism); until then, scripts stick to the core
-                    // set (Regex included — pcre2 ships below).
-                    .command = .{ "crystal", "build", "--release", "--cross-compile", "--target", "{crystal_target}", "{package}/native-crystal/src/main.cr", "-o", "{cache}/labelle_crystal_scripts" },
-                    .platforms = .{"desktop"},
-                },
-                .{
-                    .name = "localize-main",
-                    .os = .{"macos"},
-                    .command = .{ "ld", "-r", "{cache}/labelle_crystal_scripts.o", "-o", "{cache}/labelle_crystal_scripts_lib.o", "-exported_symbols_list", "{package}/native-crystal/exported_symbols_macos.txt" },
-                    .artifact = "{cache}/labelle_crystal_scripts_lib.o",
-                    .link = .object,
-                    .platforms = .{"desktop"},
-                    // The crystal runtime's system libraries, exactly
-                    // what `crystal build`'s printed link line carries:
-                    // bdw-gc always; pcre2 because game scripts may use
-                    // Regex; iconv (String encodings) is macOS-only —
-                    // glibc builds it in. No libevent: crystal 1.15+'s
-                    // event loop is kqueue/epoll-native.
-                    .system_libs = .{
-                        .macos = .{ "gc", "iconv", "pcre2-8" },
-                    },
-                    .library_paths = .{"{crystal_env:CRYSTAL_LIBRARY_PATH}"},
-                },
-                .{
-                    .name = "localize-main",
-                    .os = .{"linux"},
-                    .command = .{ "objcopy", "--keep-global-symbols={package}/native-crystal/exported_symbols_linux.txt", "{cache}/labelle_crystal_scripts.o", "{cache}/labelle_crystal_scripts_lib.o" },
-                    .artifact = "{cache}/labelle_crystal_scripts_lib.o",
-                    .link = .object,
-                    .platforms = .{"desktop"},
-                    // gcc_s is the UNWINDER: crystal's begin/rescue/raise
-                    // (the glue's whole containment story) needs _Unwind_*
-                    // at final link. On linux-gnu crystal's own toolchain
-                    // links through the gcc driver, which appends -lgcc_s
-                    // implicitly — the object's unwind references are
-                    // libgcc's, so gcc_s is the matching spelling under
-                    // zig's driverless link (and the rust precedent: the
-                    // rust entry above links it for panic=unwind, green on
-                    // this repo's ubuntu lane). NOT "unwind": llvm-libunwind
-                    // is no system lib on stock runners, and mixing
-                    // unwinders against a gcc-toolchain object is the risk,
-                    // not the fix. CI's ubuntu lane is the functional
-                    // arbiter — the raise-containment tests actually unwind
-                    // there, so a wrong choice fails tests, not just links.
-                    .system_libs = .{
-                        .linux = .{ "gc", "pcre2-8", "gcc_s", "pthread", "dl", "rt", "m" },
-                    },
-                    .library_paths = .{"{crystal_env:CRYSTAL_LIBRARY_PATH}"},
-                },
-            },
-        },
+        // Crystal (labelle-engine#741, second native language): the
+        // entry is SPECIFIED but deliberately NOT declared yet. Its
+        // two-step recipe (crystal build --cross-compile emitting a
+        // main-carrying object, then a per-OS main-localization pass —
+        // ld64 -exported_symbols_list / objcopy --keep-global-symbols,
+        // `.link = .object`) needs step-schema features the released
+        // assembler (v0.84.0) REJECTS with a hard parse error for every
+        // consumer — strict validation covers non-selected entries too:
+        // per-step .os allowlists, artifact-less intermediates,
+        // {crystal_target}, .library_paths + {crystal_env:…}. The entry
+        // therefore ships TOGETHER with the assembler's crystal splice
+        // row (whose spec — PR #19's ASSEMBLER-FOLLOW-UP — carries the
+        // canonical entry text, plus the forward-compat requirement that
+        // non-selected entries tolerate unknown step keys so future
+        // languages can't re-break released assemblers).
     },
 }
