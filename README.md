@@ -16,7 +16,7 @@ Every language binds the engine's **Script Runtime Contract** (`labelle-engine/c
 
 | sub-module | status |
 |---|---|
-| `lua` (Lua 5.4) | ✅ bootstrap done (#738) — vendored Lua 5.4.8, contract-bound, tested against a mock host |
+| `lua` (Lua 5.4) | ✅ bootstrap done (#738) + per-frame allocation utilities (#2) — vendored Lua 5.4.8, contract-bound, tested against a mock host |
 | `ruby` (mruby 3.4) | ✅ done (labelle-engine#742) — vendored mruby, controllers + Component.ref + FrameArray, tested against the same mock host |
 | `typescript` (QuickJS) | planned |
 | `rust` / `crystal` | planned (needs assembler build hooks) |
@@ -85,6 +85,69 @@ fields in `labelle.array(t)` to force array form even when empty —
 `{ waypoints = labelle.array({}) }` encodes as `{"waypoints":[]}` — and
 `json.decode` tags the arrays it returns, so `get`→modify→`set`
 round-trips preserve arrayness without re-tagging.
+
+**Per-frame allocation** (RFC revs 14–15): the component boundary is the
+real per-frame allocator — script-local temporaries are noise next to a
+fresh table per `e:get` times a thousand entities times sixty frames.
+The prelude ships the Zig `clearRetainingCapacity` idiom for both
+halves of a hot loop:
+
+```lua
+local Hot = labelle.component("Hot", { level = 1.0, count = 0 })
+local h, fa                     -- construct once, in init() (chunk scope
+                                -- also runs in declare mode)
+function init()
+  h = {}                        -- caller-owned component buffer
+  fa = FrameArray.new(1024)     -- preallocated per-frame scratch list
+end
+
+function update(dt)
+  fa:clear()                    -- size back to 0; storage survives
+  for e in game.query(Hot) do fa:push(e) end
+  for i = 1, fa:size() do
+    local e = fa:get(i)
+    e:get(Hot, h)               -- REFILLS h — no per-read table
+    h.level = h.level - 0.25 * dt
+    e:set(Hot, h)
+  end
+end
+```
+
+`e:get(name, into)` refills the caller's table and returns it: top-level
+fields are written, stale keys from the previous fill are cleared
+(clear-all-then-fill — a `pairs` walk assigning nil, which itself
+allocates nothing), nested values still allocate fresh per read (v1 —
+keep hot components flat), and an absent component returns nil leaving
+the table untouched. Both name spellings work (`e:get("Hot", h)` and
+`e:get(Hot, h)`).
+
+`FrameArray.new(cap)` preallocates its backing once: `push` is an
+in-bounds store, `clear` resets the logical length only, and growth
+happens solely when a push overflows capacity — the backing doubles, one
+deliberate reallocation, counted in `growth_count()` so a warmed loop
+can assert it stays flat. (Lua 5.4 has no `table.clear`; a fresh `{}`
+per frame is exactly the allocation this removes.) Also: `size()`,
+`capacity()`, `get(i)`/`set(i, v)` over the logical contents, and
+`each(fn)` — hoist `fn`, a fresh closure per frame is itself a per-frame
+allocation.
+
+What garbage remains (encode buffers, query snapshots, event payloads)
+is collected on a budget: the plugin drives one incremental GC step per
+Controller tick — `lua_gc(LUA_GCSTEP, budget)` at end of tick, so
+collection cost smears across frames instead of piling into mid-frame
+pauses. Lua 5.4's own incremental pacing stays on as the backstop; the
+step only front-loads work at the tick boundary (a budget at or above
+the per-tick allocation rate moves effectively all collection into that
+slot). Default 64 KB/tick; `labelle.raw_gc_set_step_budget(kb)` tunes it
+(0 = the collector's own basic step, negative = off, returns the
+previous value) and `labelle.raw_gc_stats()` returns
+`(steps, completed_cycles)`. The suite's hot-loop test pins the whole
+story: 1k entities of query + get-into + set + FrameArray per tick, per-
+read allocation ≈ 0 and steady-state memory flat across 100 ticks.
+
+Cross-language, same idioms: ruby spells them `e.get_into(Klass, @h)` +
+`Labelle::FrameArray` (below); typescript will lean on typed arrays /
+reused objects over the same contract when it lands.
 
 ## Using the ruby sub-module
 

@@ -32,8 +32,10 @@ const EVENT_CAP = NAME_CAP + JSON_CAP;
 const LOG_CAP = 2048; // must hold a full Lua traceback line
 // Big enough that a query over 20-digit ids can outgrow the Lua shim's
 // fixed QUERY_BUF_CAP (8 KiB ÷ 21 bytes/id ≈ 390) — the grow-and-retry
-// test needs the mock to actually overflow it.
-const MAX_ENTITIES = 512;
+// test needs the mock to actually overflow it — and that the per-frame
+// allocation hot loops can hold their ~1k live entities (+ a verdict
+// entity) at once.
+const MAX_ENTITIES = 1200;
 const MAX_COMPONENTS = 8;
 const MAX_EVENTS = 64;
 const MAX_SUBS = 16;

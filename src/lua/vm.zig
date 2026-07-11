@@ -18,6 +18,12 @@
 //! script's env from the registry entirely, so a half-initialized script
 //! never receives `update`/`deinit` hooks.
 //!
+//! GC pacing: this module also owns the per-tick GC step budget
+//! (`gc_step_budget_kb`/`stepGc` below) — the prelude's end-of-tick
+//! housekeeping drives one budgeted `lua_gc(LUA_GCSTEP, …)` per
+//! Controller tick so collection cost smears across frames instead of
+//! piling into mid-frame pauses.
+//!
 //! Script isolation: each registered script chunk runs under its own `_ENV`
 //! table whose metatable falls back to the real globals. Scripts therefore
 //! read the shared prelude (`labelle`, `Entity`, `game`, `json`) normally,
@@ -54,6 +60,8 @@ pub const c = struct {
     pub const LUA_TNIL: c_int = 0;
     pub const LUA_TTABLE: c_int = 5;
     pub const LUA_TFUNCTION: c_int = 6;
+    /// lua_gc option: one incremental collection step (lua.h LUA_GCSTEP).
+    pub const LUA_GCSTEP: c_int = 5;
     /// -LUAI_MAXSTACK - 1000 with the default LUAI_MAXSTACK = 1_000_000
     /// (luaconf.h) — the pseudo-index of the registry.
     pub const LUA_REGISTRYINDEX: c_int = -1001000;
@@ -109,6 +117,11 @@ pub const c = struct {
     pub extern fn lua_tointegerx(L: ?*State, idx: c_int, isnum: ?*c_int) i64;
     pub extern fn lua_tonumberx(L: ?*State, idx: c_int, isnum: ?*c_int) f64;
 
+    // Garbage collection. VARIADIC in 5.4 (the option selects how many
+    // int arguments follow) — the declaration must say so, or the call
+    // ABI is wrong on targets where varargs differ from fixed args.
+    pub extern fn lua_gc(L: ?*State, what: c_int, ...) c_int;
+
     // The C entry point behind Lua's `debug.traceback` (db_traceback in
     // ldblib.c is a thin wrapper over it) — same trace text, but immune to
     // scripts replacing the `debug` global.
@@ -161,6 +174,59 @@ fn logError(context: []const u8, text: []const u8) void {
         w.print("[lua] {s}", .{text}) catch {};
     const line = w.buffered();
     contract.labelle_log(line.ptr, line.len);
+}
+
+/// Per-tick GC step budget in KB — what the end-of-tick housekeeping
+/// (the prelude's `labelle.__tick_controllers`, via the raw_gc_step
+/// shim) passes to `lua_gc(LUA_GCSTEP, …)`.
+///
+/// Semantics, verified against the vendored 5.4.8 lapi.c: the budget is
+/// ADDED to the collector's debt (`budget * 1024 + GCdebt`) and steps
+/// run only while the resulting debt is positive — so the call performs
+/// at most `budget` KB worth of extra collection, and nothing at all
+/// while the collector is ahead. `0` asks for one "basic step" (the
+/// collector's own stepsize, 8 KB by default); negative disables the
+/// per-tick step entirely.
+///
+/// Interaction with Lua's own pacing: 5.4 boots in INCREMENTAL mode
+/// (pause 200, stepmul 100, stepsize 8 KB) and that organic,
+/// allocation-driven pacing stays untouched as the backstop — this seam
+/// never stops the collector, it only front-loads work at the tick
+/// boundary. A budget at or above the scripts' per-tick allocation rate
+/// moves effectively ALL collection into that controlled slot (one
+/// tick's garbage at a time — smeared, never a full-collect spike); a
+/// smaller budget shifts part of it and the organic mid-frame steps
+/// make up the rest.
+///
+/// Process-global like the VM itself and deliberately NOT reset between
+/// VMs — it is configuration, not VM state. Seam for tests (via
+/// `labelle.raw_gc_set_step_budget`) and, later, plugin params
+/// (labelle-assembler#591). Default: 64 KB covers a modest scripted
+/// game's per-tick allocation with the organic pacing as overflow.
+pub var gc_step_budget_kb: c_int = 64;
+
+/// Monotonic count of budgeted GC steps driven (calls that reached
+/// lua_gc — the budget ≥ 0 path). Never reset; tests assert deltas,
+/// mirroring the bindings' scratch_growth_count.
+pub var gc_step_count: usize = 0;
+
+/// Monotonic count of budgeted steps that ENDED a collection cycle
+/// (lua_gc returned 1). Cycles completing here mean collection keeps
+/// making it all the way around inside the per-tick slot — no full
+/// collect ever needed.
+pub var gc_cycle_count: usize = 0;
+
+/// One budgeted incremental GC step (see gc_step_budget_kb). Returns
+/// lua_gc's result — 1 when the step finished a collection cycle, 0
+/// otherwise, -1 when the collector refused (internally stopped, e.g.
+/// during an emergency collection) — or 0 without calling when the
+/// budget is negative (disabled).
+pub fn stepGc(L: ?*c.State) c_int {
+    if (gc_step_budget_kb < 0) return 0;
+    const rc = c.lua_gc(L, c.LUA_GCSTEP, gc_step_budget_kb);
+    gc_step_count += 1;
+    if (rc == 1) gc_cycle_count += 1;
+    return rc;
 }
 
 /// One embedded Lua 5.4 VM. Plain value (a single opaque pointer) — the

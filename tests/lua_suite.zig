@@ -553,3 +553,57 @@ test "labelle.component refs address components through every name-taking seam" 
     try expect(mock.componentJson(1, "Tag") == null);
     try expectComponent(1, "RefOk", "{\"ok\":true}");
 }
+
+test "FrameArray unit semantics" {
+    fresh();
+    scripting.registerScript("frame_array", @embedFile("lua/frame_array.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // The script's asserts police the semantics (push/get/set/each/clear/
+    // deliberate growth — any failure evicts it); the Zig side pins that
+    // it made it all the way through.
+    try expectComponent(1, "FrameArrayOk", "{\"ok\":true}");
+}
+
+test "e:get(name, into) refills the caller's table and clears stale keys" {
+    fresh();
+    scripting.registerScript("get_into", @embedFile("lua/get_into.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // The script's asserts police identity, the stale-key clear ({a,b}
+    // refilled from {a} → b gone), absent-leaves-untouched, fresh nested
+    // tables and the ref spelling; the Zig side pins the verdict plus the
+    // final stored payloads the refills were reading.
+    try expectComponent(1, "Cfg", "{\"a\":5}");
+    try expectComponent(1, "Hunger", "{\"level\":0.25}");
+    try expectComponent(2, "GetIntoOk", "{\"ok\":true}");
+}
+
+test "hot loop: 1k entities of get-into + FrameArray hold steady-state memory flat" {
+    fresh();
+    scripting.registerScript("hot_loop", @embedFile("lua/hot_loop.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // 110 ticks: 10 warm-up, then 100 measured. The script (see
+    // hot_loop.lua for the three collectgarbage("count") pins and the
+    // GC-step seam assertions) runs the full boundary workload each tick
+    // — query, get-into, mutate, set, FrameArray fill/clear — and writes
+    // one deterministic verdict; a violated bound lands here as a false.
+    for (0..110) |_| {
+        scripting.Controller.tick(.{}, 0.016);
+    }
+    try expectComponent(1, "HotLoop", "{\"cycles_ok\":true,\"fa_growth\":0," ++
+        "\"growth_ok\":true,\"read_ok\":true,\"running_ok\":true," ++
+        "\"steps_ok\":true,\"tick_ok\":true,\"ticks\":110}");
+
+    // The measured numbers were logged for forensics (bound tuning reads
+    // them from CI output when a pin ever trips)...
+    try expect(mock.logsContain("HotLoopStats"));
+    // ...and the workload really ran: every entity advanced 110 rounds
+    // (level 1000 - 110 * 0.25, count 110 — both exact in binary).
+    try expectComponent(2, "Hot", "{\"count\":110,\"level\":972.5}");
+    try expectComponent(1001, "Hot", "{\"count\":110,\"level\":972.5}");
+}
