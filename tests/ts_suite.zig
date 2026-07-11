@@ -632,3 +632,115 @@ test "steady-state allocation: into-refills + FrameArray hold the live malloc co
     const hot = mock.componentJson(1, "Hot") orelse return error.TestExpectedComponent;
     try expect(std.mem.indexOf(u8, hot, "\"count\":1050") != null);
 }
+
+// ── Console eval (labelle-scripting#4) ──────────────────────────────────
+
+test "console eval renders expression results" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    const r = scripting.Controller.evalCommand("1+2");
+    try expect(r.ok);
+    try expectEqualStrings("3", r.text);
+
+    // Plain objects render through JSON.stringify (the parens keep the
+    // braces an expression rather than a block).
+    const obj = scripting.Controller.evalCommand("({a: 1})");
+    try expect(obj.ok);
+    try expectEqualStrings("{\"a\":1}", obj.text);
+}
+
+test "console eval persists state across evals on the shared globals" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Global-mode eval: the assignment's completion value renders and
+    // the binding lands on globalThis for the next eval.
+    const set = scripting.Controller.evalCommand("x = 5");
+    try expect(set.ok);
+    try expectEqualStrings("5", set.text);
+
+    const get = scripting.Controller.evalCommand("x");
+    try expect(get.ok);
+    try expectEqualStrings("5", get.text);
+}
+
+test "console eval errors carry message and stack; VM and tick survive" {
+    fresh();
+    scripting.registerScript("counter", @embedFile("ts/counter.js"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.125);
+
+    const err = scripting.Controller.evalCommand("throw new Error(\"console boom\")");
+    try expect(!err.ok);
+    try expect(std.mem.indexOf(u8, err.text, "Error: console boom") != null);
+    try expect(std.mem.indexOf(u8, err.text, "console") != null);
+
+    // Syntax errors surface the same isolated way...
+    const bad = scripting.Controller.evalCommand("function (");
+    try expect(!bad.ok);
+    try expect(std.mem.indexOf(u8, bad.text, "SyntaxError") != null);
+
+    // ...the VM survived: the next eval works...
+    const again = scripting.Controller.evalCommand("1+1");
+    try expect(again.ok);
+    try expectEqualStrings("2", again.text);
+
+    // ...and the tick keeps driving the registered scripts.
+    scripting.Controller.tick(.{}, 0.125);
+    try expectComponent(1, "Counter", "{\"dt\":0.125,\"n\":2}");
+}
+
+test "console eval reaches the game world through the labelle API" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    const r = scripting.Controller.evalCommand("Entity.create().set(\"FromEval\", {a: 1})");
+    try expect(r.ok);
+    try expectEqualStrings("true", r.text);
+    try expectComponent(1, "FromEval", "{\"a\":1}");
+}
+
+test "console eval bounds oversized results into valid truncated response JSON" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    var buf: [scripting.eval.max_response_len]u8 = undefined;
+    const response = scripting.handleEvalCommand(
+        "{\"code\":\"\\\"x\\\".repeat(9000)\"}",
+        &buf,
+    );
+    try expect(response.len <= scripting.eval.max_response_len);
+    const parsed = try std.json.parseFromSlice(
+        struct { ok: bool, value: []const u8 },
+        std.testing.allocator,
+        response,
+        .{},
+    );
+    defer parsed.deinit();
+    try expect(parsed.value.ok);
+    try expect(std.mem.startsWith(u8, parsed.value.value, "xxxx"));
+    try expect(std.mem.endsWith(u8, parsed.value.value, scripting.eval.truncation_marker));
+}
+
+test "console eval during ticking leaves registered scripts undisturbed" {
+    fresh();
+    scripting.registerScript("counter", @embedFile("ts/counter.js"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.125);
+    const r = scripting.Controller.evalCommand("globalThis.session_note = \"between ticks\"");
+    try expect(r.ok);
+    scripting.Controller.tick(.{}, 0.125);
+
+    // The counter advanced exactly twice — the eval neither consumed a
+    // tick nor disturbed the script registry.
+    try expectComponent(1, "Counter", "{\"dt\":0.125,\"n\":2}");
+}

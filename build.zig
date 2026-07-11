@@ -252,17 +252,26 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         configureLanguage(b, lang_mod, lang, lua_dep_opt, quickjs_dep_opt);
+        const tests_root_mod = b.createModule(.{
+            .root_source_file = b.path("tests/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "labelle_scripting", .module = lang_mod },
+                .{ .name = "declare_core", .module = declare_core_mod },
+            },
+        });
+        // The pack hook shim's SOURCE, for the eval shared suite's AstGen
+        // compile check (tests/eval_shared_suite.zig): the file itself can
+        // only compile inside a generated game (it imports labelle-engine),
+        // so the suite `@embedFile`s it through this anonymous import and
+        // runs parse + AstGen — the strongest engine-free verification.
+        tests_root_mod.addAnonymousImport("console_eval_shim_src", .{
+            .root_source_file = b.path("packs/scripting_console/hooks/console_eval.zig"),
+        });
         const tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tests/root.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-                .imports = &.{
-                    .{ .name = "labelle_scripting", .module = lang_mod },
-                    .{ .name = "declare_core", .module = declare_core_mod },
-                },
-            }),
+            .root_module = tests_root_mod,
         });
         const run_tests = b.addRunArtifact(tests);
         test_step.dependOn(&run_tests.step);

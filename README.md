@@ -354,3 +354,30 @@ net-zero:
   construction, elements are raw doubles (no boxing at all).
 
 Design: `RFC-LANGUAGE-PLUGINS.md` (labelle-engine#730) · epic: labelle-engine#237
+
+## Studio Script Console (eval)
+
+The plugin handles the studio Script Console's
+`{plugin: "scripting", command: "eval", params: {code}}` command
+(labelle-scripting#4, console UI labelle-studio#78). Two halves:
+
+- **Eval core** (`Controller.evalCommand(code)` / `handleEvalCommand`,
+  src/root.zig + each backend's `Vm.evalConsole`) — evaluates the string
+  in the active VM's PERSISTENT console environment (`x = 5` on one eval,
+  `x` on the next: lua uses a registry-kept session `_ENV` with
+  `__index = _G`, ruby reuses one compile context — mruby's mirb-style
+  top-level-locals keep — and typescript evaluates global-mode on the
+  shared globals). Results render via each language's tostring/inspect/
+  JSON.stringify; errors come back with the full traceback and NEVER
+  kill the VM or the tick. The response is bounded JSON
+  (`{"ok":true,"value":…}` / `{"ok":false,"error":…}`, 4096-byte cap,
+  `…`-marked truncation) — all of it tested here against the mock world.
+- **Hook shim** (`packs/scripting_console/hooks/console_eval.zig`, wired
+  by `plugin.labelle`'s `.packs`) — the assembler folds this bundled
+  pack's hook into the generated game's `GameHooks`, subscribing it to
+  `engine__editor_plugin_command`. It name-filters the broadcast, calls
+  the core, and answers through `engine.plugin_command.respond`
+  (labelle-engine#758, engine ≥ 2.5.0); on engines with the event but
+  without the response channel the `@hasDecl` gate degrades to the
+  script log. Compiled only inside generated games — this repo's tests
+  parse + AstGen-check it and pin its convention-facing names.

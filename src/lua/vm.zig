@@ -46,6 +46,7 @@
 
 const std = @import("std");
 const contract = @import("../contract.zig");
+const eval_mod = @import("../eval.zig");
 
 /// Hand-declared Lua 5.4 C API — just the slice this plugin uses.
 /// Signatures mirror lua.h/lauxlib.h; `lua_State` stays opaque.
@@ -57,6 +58,8 @@ pub const c = struct {
     pub const KFn = *const fn (?*State, c_int, isize) callconv(.c) c_int;
 
     pub const LUA_OK: c_int = 0;
+    /// lua.h LUA_MULTRET — "return all results" nresults for pcall.
+    pub const LUA_MULTRET: c_int = -1;
     pub const LUA_TNIL: c_int = 0;
     pub const LUA_TTABLE: c_int = 5;
     pub const LUA_TFUNCTION: c_int = 6;
@@ -116,6 +119,12 @@ pub const c = struct {
     pub extern fn lua_tolstring(L: ?*State, idx: c_int, len: ?*usize) ?[*]const u8;
     pub extern fn lua_tointegerx(L: ?*State, idx: c_int, isnum: ?*c_int) i64;
     pub extern fn lua_tonumberx(L: ?*State, idx: c_int, isnum: ?*c_int) f64;
+    /// lauxlib's REPL-grade renderer: any value → string PUSHED on the
+    /// stack (and returned), honoring `__tostring`/`__name` and covering
+    /// nil/booleans/tables — everything `lua_tolstring` returns null for.
+    /// CAN RAISE (a throwing `__tostring`), so only call it from inside a
+    /// protected frame (the console render shim below).
+    pub extern fn luaL_tolstring(L: ?*State, idx: c_int, len: ?*usize) [*]const u8;
 
     // Garbage collection. VARIADIC in 5.4 (the option selects how many
     // int arguments follow) — the declaration must say so, or the call
@@ -145,6 +154,82 @@ const CHUNKNAME_CAP = 128;
 /// Cap for one formatted error log line. Tracebacks can outgrow anything;
 /// truncation beats a heap allocation inside the error path.
 const ERROR_LOG_CAP = 2048;
+
+// ── Console eval state (labelle-scripting#4) ─────────────────────────────
+//
+// Module-level like the VM itself: one console session per process, main
+// thread only. The render shim below is a plain C function Lua calls with
+// the eval's results as arguments — it cannot carry a Zig closure, so the
+// output slice it fills rides these module vars for the duration of one
+// `evalConsole` call.
+
+/// Registry key of the console's persistent `_ENV` (see `evalConsole`).
+/// The C registry — not a global — so scripts and console code can't
+/// clobber the session table by accident.
+const CONSOLE_ENV_KEY: [*:0]const u8 = "labelle_console_env";
+
+/// The console chunkname. The `=` prefix is Lua's "verbatim source name"
+/// convention (lua.c uses `=stdin`): errors read "console:1: …".
+const CONSOLE_CHUNKNAME: [*:0]const u8 = "=console";
+
+/// Source buffer for the expression-first compile: `return <code>;` needs
+/// the code copied next to its wrapper (luaL_loadbufferx wants one
+/// contiguous buffer). Headroom over `eval_mod.max_code_len` for the 8
+/// wrapper bytes.
+var console_src_buf: [eval_mod.max_code_len + 16]u8 = undefined;
+
+/// Where `renderConsoleResults` writes (the caller's text buffer) and how
+/// far it got. Set by `evalConsole` around the protected render call.
+var console_out: []u8 = &.{};
+var console_out_len: usize = 0;
+
+/// Message handler-protected result renderer: called BY LUA with the
+/// eval's result values as its arguments. Renders each through
+/// `luaL_tolstring` (the REPL-grade renderer — tables, nil, booleans,
+/// `__tostring` all covered), tab-separated like `print`, into
+/// `console_out`, truncation-marked at the cap. Runs under
+/// `pcallTraceback` because `luaL_tolstring` can raise (a throwing
+/// `__tostring`) — this frame holds no defers, so the longjmp is safe.
+fn renderConsoleResults(L: ?*c.State) callconv(.c) c_int {
+    const n = c.lua_gettop(L);
+    // The marker's bytes stay reserved throughout, so appending it after
+    // ANY truncation can never overflow.
+    const cap = console_out.len - eval_mod.truncation_marker.len;
+    var truncated = false;
+    var i: c_int = 1;
+    while (i <= n) : (i += 1) {
+        if (i > 1) {
+            if (console_out_len + 1 > cap) {
+                truncated = true;
+                break;
+            }
+            console_out[console_out_len] = '\t';
+            console_out_len += 1;
+        }
+        var len: usize = 0;
+        const s = c.luaL_tolstring(L, i, &len); // pushes the rendered string
+        const room = cap - console_out_len;
+        if (len > room) {
+            const cut = eval_mod.utf8SafeLen(s[0..len], room);
+            @memcpy(console_out[console_out_len..][0..cut], s[0..cut]);
+            console_out_len += cut;
+            c.lua_settop(L, -2);
+            truncated = true;
+            break;
+        }
+        @memcpy(console_out[console_out_len..][0..len], s[0..len]);
+        console_out_len += len;
+        c.lua_settop(L, -2); // pop the rendered string
+    }
+    if (truncated) {
+        @memcpy(
+            console_out[console_out_len..][0..eval_mod.truncation_marker.len],
+            eval_mod.truncation_marker,
+        );
+        console_out_len += eval_mod.truncation_marker.len;
+    }
+    return 0;
+}
 
 /// Message handler installed by `protectedCall`: turns the error value into
 /// "<message>\nstack traceback:\n..." BEFORE the stack unwinds (afterwards
@@ -249,11 +334,14 @@ pub const Vm = struct {
         c.lua_close(self.L);
     }
 
-    /// Call the function sitting below `nargs` arguments on the stack under
-    /// the traceback message handler. On error: log through labelle_log,
-    /// leave the stack as it was before the callee was pushed, return false.
-    /// `context` names the caller (script or chunk) in the log line.
-    pub fn protectedCall(self: Vm, nargs: c_int, nresults: c_int, context: []const u8) bool {
+    /// pcall under the traceback message handler — the shared protected
+    /// entry both `protectedCall` (log flavor) and `evalConsole` (capture
+    /// flavor) ride. On success the results replace callee+args on the
+    /// stack and this returns true. On failure it returns false with
+    /// exactly ONE value left where the callee sat: the msgh-formatted
+    /// "<message>\nstack traceback:\n…" error string (the msgh itself is
+    /// slid out) — the caller logs or captures it, then pops it.
+    fn pcallTraceback(self: Vm, nargs: c_int, nresults: c_int) bool {
         const L = self.L;
         const fn_index = c.lua_gettop(L) - nargs; // where the callee sits
         c.lua_pushcclosure(L, msghTraceback, 0);
@@ -267,10 +355,23 @@ pub const Vm = struct {
             c.lua_settop(L, -2);
             return true;
         }
+        // [msgh, err] — slide the msgh out, keep the error on top.
+        c.lua_rotate(L, fn_index, -1);
+        c.lua_settop(L, -2);
+        return false;
+    }
+
+    /// Call the function sitting below `nargs` arguments on the stack under
+    /// the traceback message handler. On error: log through labelle_log,
+    /// leave the stack as it was before the callee was pushed, return false.
+    /// `context` names the caller (script or chunk) in the log line.
+    pub fn protectedCall(self: Vm, nargs: c_int, nresults: c_int, context: []const u8) bool {
+        if (self.pcallTraceback(nargs, nresults)) return true;
+        const L = self.L;
         var len: usize = 0;
         const msg = c.lua_tolstring(L, -1, &len);
         logError(context, if (msg) |m| m[0..len] else "(non-string error)");
-        c.lua_settop(L, fn_index - 1); // drop msgh + error object
+        c.lua_settop(L, -2); // drop the error object
         return false;
     }
 
@@ -479,6 +580,106 @@ pub const Vm = struct {
         }
         _ = self.protectedCall(nargs, 0, "dispatch");
         c.lua_settop(L, -2); // pop labelle
+    }
+
+    /// Evaluate one console `code` string (labelle-scripting#4 — the lua
+    /// half of `Controller.evalCommand`; see root.zig for the shared
+    /// contract). REPL semantics:
+    ///
+    ///   - expression-first: compile `return <code>;` (lua.c's addreturn
+    ///     trick) so a bare expression renders its value; when that does
+    ///     not parse, compile `code` as a statement chunk;
+    ///   - PERSISTENT environment: the chunk's `_ENV` is one session
+    ///     table (`__index = _G`, kept in the C registry) reused across
+    ///     evals — `x = 5` then `x` behaves like a REPL, and the full
+    ///     labelle API is visible through the metatable fallback;
+    ///   - results render `print`-style: every returned value through
+    ///     `luaL_tolstring` (protected — `__tostring` can raise),
+    ///     tab-separated, truncation-marked at the buffer cap; zero
+    ///     results (a statement) render as "";
+    ///   - error isolation: compile and runtime errors come back as
+    ///     `ok = false` with the message + full traceback in `text`
+    ///     (the pcallTraceback machinery scripts already ride) — the VM
+    ///     and the tick survive, always.
+    pub fn evalConsole(self: Vm, code: []const u8, out: []u8) eval_mod.EvalResult {
+        const L = self.L;
+        // The render shim reserves marker room out of `out` unchecked —
+        // pin the caller contract (root.zig passes its max_text_len
+        // buffer) before any subtraction can wrap.
+        std.debug.assert(out.len > eval_mod.truncation_marker.len);
+        if (code.len > eval_mod.max_code_len) return .{
+            .ok = false,
+            .text = "console code too long (8 KiB cap)",
+        };
+
+        // Expression-first compile; statement fallback.
+        var w = std.Io.Writer.fixed(&console_src_buf);
+        w.print("return {s};", .{code}) catch unreachable; // sized code+16
+        const ret_src = w.buffered();
+        if (c.luaL_loadbufferx(L, ret_src.ptr, ret_src.len, CONSOLE_CHUNKNAME, "t") != c.LUA_OK) {
+            c.lua_settop(L, -2); // not an expression — drop, retry as statement
+            if (c.luaL_loadbufferx(L, code.ptr, code.len, CONSOLE_CHUNKNAME, "t") != c.LUA_OK) {
+                return self.takeTopErrorText(out); // compile error text
+            }
+        }
+
+        // Wire the persistent console _ENV (upvalue 1 of every main chunk).
+        self.pushConsoleEnv(); // [chunk, env]
+        if (c.lua_setupvalue(L, -2, 1) == null) {
+            // Unreachable for main chunks (same guard as loadScript): the
+            // env was NOT consumed — drop it and run in globals instead.
+            c.lua_settop(L, -2);
+        }
+
+        // Run with MULTRET so `1, 2` renders both values.
+        const base = c.lua_gettop(L) - 1; // stack size before the chunk
+        if (!self.pcallTraceback(0, c.LUA_MULTRET)) return self.takeTopErrorText(out);
+
+        const nresults = c.lua_gettop(L) - base;
+        if (nresults == 0) return .{ .ok = true, .text = "" };
+
+        // Render under protection: luaL_tolstring can raise.
+        c.lua_pushcclosure(L, renderConsoleResults, 0); // [r1..rn, shim]
+        c.lua_rotate(L, base + 1, 1); // [shim, r1..rn]
+        console_out = out;
+        console_out_len = 0;
+        defer console_out = &.{};
+        if (!self.pcallTraceback(nresults, 0)) return self.takeTopErrorText(out);
+        return .{ .ok = true, .text = out[0..console_out_len] };
+    }
+
+    /// Push the console's persistent `_ENV`, creating it on first use:
+    /// `setmetatable({}, { __index = _G })` kept under `CONSOLE_ENV_KEY`
+    /// in the C REGISTRY — alive for the life of the VM (close() drops it
+    /// with everything else), invisible to script code, and the same
+    /// isolation shape as loadScript's per-script envs: console
+    /// assignments land in the session table, reads fall through to the
+    /// real globals (prelude API included).
+    fn pushConsoleEnv(self: Vm) void {
+        const L = self.L;
+        _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, CONSOLE_ENV_KEY); // [env?]
+        if (c.lua_type(L, -1) == c.LUA_TTABLE) return;
+        c.lua_settop(L, -2); // drop the non-table
+        c.lua_createtable(L, 0, 8); // [env]
+        c.lua_createtable(L, 0, 1); // [env, meta]
+        _ = c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, c.LUA_RIDX_GLOBALS); // [env, meta, _G]
+        c.lua_setfield(L, -2, "__index"); // [env, meta]
+        _ = c.lua_setmetatable(L, -2); // [env]
+        c.lua_pushvalue(L, -1); // [env, env]
+        c.lua_setfield(L, c.LUA_REGISTRYINDEX, CONSOLE_ENV_KEY); // [env]
+    }
+
+    /// Pop the error value on top of the stack into `out` (bounded,
+    /// truncation-marked) as a failed EvalResult — the console-capture
+    /// counterpart of `protectedCall`'s log flavor.
+    fn takeTopErrorText(self: Vm, out: []u8) eval_mod.EvalResult {
+        const L = self.L;
+        var len: usize = 0;
+        const msg = c.lua_tolstring(L, -1, &len);
+        const text = if (msg) |m| m[0..len] else "(non-string error)";
+        const written = eval_mod.copyBounded(text, out);
+        c.lua_settop(L, -2);
+        return .{ .ok = false, .text = written };
     }
 
     /// Log + pop the error message a failed luaL_loadbufferx left on top

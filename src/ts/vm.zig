@@ -62,6 +62,7 @@
 
 const std = @import("std");
 const contract = @import("../contract.zig");
+const eval_mod = @import("../eval.zig");
 
 /// Hand-declared quickjs-ng 0.15 C API — just the slice this plugin uses.
 /// Real exported symbols only; the constants are pinned by abi_check.c.
@@ -288,6 +289,12 @@ const FILENAME_CAP = 128;
 /// Cap for one formatted error log line. Stacks can outgrow anything;
 /// truncation beats a heap allocation inside the error path.
 const ERROR_LOG_CAP = 2048;
+
+/// Console-eval source buffer (labelle-scripting#4): JS_Eval requires
+/// `input[input_len] == 0`, and console code arrives as a plain slice —
+/// one module-level copy adds the sentinel. Module-level like the VM
+/// itself: one console session per process, main thread only.
+var console_src_buf: [eval_mod.max_code_len + 1]u8 = undefined;
 
 /// Format + route one error line through the host's log sink.
 fn logError(context: []const u8, text: []const u8) void {
@@ -614,20 +621,29 @@ pub const Vm = struct {
     }
 
     /// Format one error VALUE as "[ts] <context>: <Error>: <message>"
-    /// plus its `.stack` flattened to one log line (the qjs stack's
-    /// newline-separated "    at fn (file:line)" frames joined by " | ",
-    /// the mruby backtrace treatment). Defensive at every step — a
-    /// pathological error object whose toString/stack getter throws
-    /// degrades gracefully instead of recursing.
+    /// plus its `.stack` and route it through labelle_log.
     fn logErrorValue(self: Vm, context: []const u8, err: c.Value) void {
-        const ctx = self.ctx;
         var buf: [ERROR_LOG_CAP]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
         if (context.len > 0)
             w.print("[ts] {s}: ", .{context}) catch {}
         else
             w.print("[ts] ", .{}) catch {};
+        self.writeErrorValue(&w, err);
+        const line = w.buffered();
+        contract.labelle_log(line.ptr, line.len);
+    }
 
+    /// Render one error VALUE as "<Error>: <message>" plus its `.stack`
+    /// flattened to one line (the qjs stack's newline-separated
+    /// "    at fn (file:line)" frames joined by " | ", the mruby
+    /// backtrace treatment) into `w` — the shared body behind
+    /// `logErrorValue` (log flavor) and `evalConsole` (capture flavor).
+    /// Defensive at every step — a pathological error object whose
+    /// toString/stack getter throws degrades gracefully instead of
+    /// recursing. Writer overflow = truncation, by design on both paths.
+    fn writeErrorValue(self: Vm, w: *std.Io.Writer, err: c.Value) void {
+        const ctx = self.ctx;
         // ToString(err): for Error objects this is "<Name>: <message>".
         var mlen: usize = 0;
         if (c.JS_ToCStringLen2(ctx, &mlen, err, false)) |m| {
@@ -662,9 +678,96 @@ pub const Vm = struct {
                 }
             }
         }
+    }
 
-        const line = w.buffered();
-        contract.labelle_log(line.ptr, line.len);
+    /// Evaluate one console `code` string (labelle-scripting#4 — the
+    /// typescript half of `Controller.evalCommand`; see root.zig for the
+    /// shared contract). REPL semantics:
+    ///
+    ///   - GLOBAL-mode eval (not a module): the completion value is the
+    ///     result (`1+2` → 3), and `var`/assignment/global-lexical
+    ///     declarations persist on the shared globals across evals —
+    ///     `x = 5` then `x` behaves like a REPL. The prelude's API
+    ///     (labelle, Entity, game) lives on those same globals;
+    ///   - results render via JSON.stringify for plain objects/arrays
+    ///     (`({a:1})` → `{"a":1}`) with a ToString fallback for
+    ///     everything else (`3`, `true`, `undefined`, functions,
+    ///     circular structures), truncation-marked at the cap;
+    ///   - error isolation: a throwing eval leaves an exception pending
+    ///     exactly like a throwing script hook — captured, rendered
+    ///     (message + `.stack`) into `ok = false` text, cleared. The VM
+    ///     and the tick survive, always. Microtasks queued by the eval
+    ///     drain before returning (`drainJobs`), like every VM entry.
+    pub fn evalConsole(self: Vm, code: []const u8, out: []u8) eval_mod.EvalResult {
+        const ctx = self.ctx;
+        if (code.len > eval_mod.max_code_len) return .{
+            .ok = false,
+            .text = "console code too long (8 KiB cap)",
+        };
+        // JS_Eval requires input[input_len] == 0 — copy to add the sentinel.
+        @memcpy(console_src_buf[0..code.len], code);
+        console_src_buf[code.len] = 0;
+
+        const ret = c.JS_Eval(ctx, &console_src_buf, code.len, "console", c.EVAL_TYPE_GLOBAL);
+        defer c.JS_FreeValue(ctx, ret);
+        self.drainJobs();
+
+        if (ret.isException()) {
+            const exc = c.JS_GetException(ctx); // owned; clears the slot
+            defer c.JS_FreeValue(ctx, exc);
+            var w = std.Io.Writer.fixed(out);
+            self.writeErrorValue(&w, exc);
+            return .{ .ok = false, .text = w.buffered() };
+        }
+        return .{ .ok = true, .text = self.renderConsoleValue(ret, out) };
+    }
+
+    /// Render one eval result value into `out` (bounded, truncation-
+    /// marked). Plain objects/arrays go through JSON.stringify — the
+    /// closest thing to an inspect the stock intrinsics offer — and
+    /// everything else (numbers, strings, booleans, undefined/null,
+    /// BigInt, functions) plus every stringify failure (circular refs,
+    /// throwing getters, stringify(function) → undefined) falls back to
+    /// ToString. A value neither path can print (Symbol, a throwing
+    /// toString) degrades to "(unprintable value)".
+    fn renderConsoleValue(self: Vm, val: c.Value, out: []u8) []const u8 {
+        const ctx = self.ctx;
+        if (val.isObject() and !c.JS_IsFunction(ctx, val)) {
+            const global = c.JS_GetGlobalObject(ctx);
+            defer c.JS_FreeValue(ctx, global);
+            const json_obj = c.JS_GetPropertyStr(ctx, global, "JSON");
+            defer c.JS_FreeValue(ctx, json_obj);
+            const stringify = c.JS_GetPropertyStr(ctx, json_obj, "stringify");
+            defer c.JS_FreeValue(ctx, stringify);
+            if (c.JS_IsFunction(ctx, stringify)) {
+                var argv = [_]c.Value{val};
+                const s = c.JS_Call(ctx, stringify, json_obj, 1, &argv);
+                defer c.JS_FreeValue(ctx, s);
+                if (s.isException()) {
+                    self.swallowException(); // circular / throwing getter
+                } else if (s.isString()) {
+                    var slen: usize = 0;
+                    if (c.JS_ToCStringLen2(ctx, &slen, s, false)) |cs| {
+                        defer c.JS_FreeCString(ctx, cs);
+                        return eval_mod.copyBounded(cs[0..slen], out);
+                    }
+                    self.swallowException();
+                }
+                // stringify returned undefined (or a non-string): fall
+                // through to ToString below.
+            }
+            // A console session can clobber `JSON` itself (`JSON = null`):
+            // the property walk above then leaves an exception pending —
+            // drop it so it can't masquerade as the NEXT entry's error.
+            self.swallowException();
+        }
+        var vlen: usize = 0;
+        if (c.JS_ToCStringLen2(ctx, &vlen, val, false)) |vs| {
+            defer c.JS_FreeCString(ctx, vs);
+            return eval_mod.copyBounded(vs[0..vlen], out);
+        }
+        self.swallowException(); // Symbol / throwing toString
+        return eval_mod.copyBounded("(unprintable value)", out);
     }
 
     /// Drop a pending exception raised WHILE formatting another one.
