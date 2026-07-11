@@ -389,12 +389,16 @@ The plugin handles the studio Script Console's
   Runtime Contract: the `#742` HungerController pattern
   (`Component.ref` + `get(…, into:)` + `set`), a cross-script
   `hunger__feed` command-event, an `engine__tick` builtin subscription,
-  `FrameArray` in the hot loop, and plain top-level hooks. Pins: the
-  scripting plugin `local:../..` (THIS checkout — every CI run
-  exercises the current tree), core/engine/gfx registry releases, a
-  sibling `labelle-null` clone (its bind touchpoint is unreleased), and
-  a pinned labelle-assembler release binary. CI generates, builds, runs
-  `LABELLE_NULL_FRAMES=5` and diffs the ordered `RUBY_*` transcript —
-  ruby's permanent regression net (labelle-scripting#10). Recipe +
-  assertions: `.github/workflows/ci.yml` → `ruby-example`; timeline:
+  `FrameArray` in the hot loop, and plain top-level hooks. It also
+  demonstrates the cross-layer interop: a game-root Zig hook
+  (`hooks/feed_watcher.zig`) consumes the SAME `hunger__feed` from the
+  same engine bus, natively — scripts for iteration speed, `hooks/` as
+  the native escape, no glue. Pins: the scripting plugin `local:../..`
+  (THIS checkout — every CI run exercises the current tree),
+  core/engine/gfx registry releases, a sibling `labelle-null` clone
+  (its bind touchpoint is unreleased), and a pinned labelle-assembler
+  release binary. CI generates, builds, runs `LABELLE_NULL_FRAMES=5`
+  and diffs the ordered `RUBY_*`/`ZIG_*` transcript — ruby's permanent
+  regression net (labelle-scripting#10). Recipe + assertions:
+  `.github/workflows/ci.yml` → `ruby-example`; timeline:
   `examples/ruby-game/ruby/hunger_controller.rb`.

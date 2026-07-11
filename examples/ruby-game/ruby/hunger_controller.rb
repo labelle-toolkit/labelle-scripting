@@ -12,7 +12,9 @@
 #   - `Labelle::FrameArray` is the per-frame HOT scratch (collect ids,
 #     then process — mruby's Array#clear would FREE the backing every
 #     tick), asserted flat via growth_count at tick 5,
-#   - plain hooks coexist: ruby/spawner.rb seeds the worker.
+#   - plain hooks coexist: ruby/spawner.rb seeds the worker,
+#   - a NATIVE game-root Zig hook (hooks/feed_watcher.zig) consumes the
+#     SAME hunger__feed from the same bus — the two-layer interop.
 #
 # `Hunger` is a real engine component (components/hunger.zig) — ruby has
 # no declare mode (the assembler's declare phase SKIPS for ruby), so the
@@ -35,6 +37,11 @@
 #   tick 1  RUBY_LEVEL_0.625      0.875 - 0.25 decay, written back
 #   tick 2  RUBY_FEED_SENT        (spawner update: emits hunger__feed)
 #           RUBY_LEVEL_0.375      0.625 - 0.25 — tick 1's write PERSISTED
+#           ZIG_FEED_SEEN_0.5     (hooks/feed_watcher.zig — the native
+#                                  subscriber, at THIS frame's
+#                                  dispatchEvents: frame end, after the
+#                                  controller ticks, one tick BEFORE the
+#                                  ruby handler's inbox dispatch)
 #   tick 3  RUBY_ENGINE_TICK_SEEN (spawner's builtin sub, same inbox)
 #           RUBY_FED_LEVEL_0.875  inbox: feed handler ran — id + exact
 #                                  f32 0.5 amount round-tripped the bus;
