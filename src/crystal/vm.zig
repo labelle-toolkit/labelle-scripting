@@ -30,11 +30,17 @@
 //! crashing at an address equal to the first parsed byte). The glue's
 //! `labelle_cr_boot` runs the documented embed sequence (GC.init +
 //! Crystal.init_runtime + Crystal.main_user_code) ONCE per process —
-//! guarded here, zig-side, so a re-setup after deinit never re-runs the
-//! top level. Boot happens on the game's main thread, which is also
-//! what registers the host thread's stack with bdw-gc (GC_init detects
-//! the calling thread's stack bounds); collections then run normally —
-//! the suite forces GC.collect every tick to pin exactly that.
+//! guarded here, zig-side, so a re-setup after deinit never re-runs
+//! the top level over live state. It reports 0 ok / the 1-based FAILED
+//! stage; nonzero fails the setup loudly
+//! (error.CrystalRuntimeBootFailed) and POISONS crystal scripting for
+//! the process — a partial boot cannot be retried (empirically pinned:
+//! see runtime_boot_poisoned's doc), so every later setup fails fast
+//! with a pointed message instead of corrupting quietly. Boot happens
+//! on the game's main thread, which is also what registers the host
+//! thread's stack with bdw-gc (GC_init detects the calling thread's
+//! stack bounds); collections then run normally — the suite forces
+//! GC.collect every tick to pin exactly that.
 //!
 //! The handshake runs BEFORE boot on purpose: a stale localized object
 //! in the plugin's build cache must fail fast, before its top-level
@@ -71,25 +77,44 @@ pub const SUPPORTED_CR_ABI_VERSION: u32 = 1;
 // into (the generated game via the assembler's declared steps; the test
 // binary via build.zig's crystal wiring).
 extern fn labelle_cr_abi_version() u32;
-extern fn labelle_cr_boot() void;
+extern fn labelle_cr_boot() i32;
 extern fn labelle_cr_setup() i32;
 extern fn labelle_cr_dispatch_inbox() void;
 extern fn labelle_cr_tick(dt: f32) void;
 extern fn labelle_cr_deinit() void;
 
 /// Crystal's runtime boots at most once per process (re-running the
-/// top level would re-initialize every constant and class var behind
-/// live state). Zig-side so the guard needs no crystal code to run.
+/// top level after a good boot would re-initialize every constant and
+/// class var behind live state) — latched only when `labelle_cr_boot`
+/// returns 0.
 var runtime_booted = false;
+
+/// Latched when a boot FAILS, and never cleared: a partial boot cannot
+/// be retried. That is an EMPIRICAL fact, not caution — the retry
+/// design was implemented first and this repo's own suite convicted
+/// it: a stage-3 failure (a raise mid-`main_user_code`) followed by a
+/// second, "successful" boot re-runs the ENTIRE top level — stdlib
+/// initializers included — over the half-initialized first pass, and
+/// the process later dies with SIGSEGV under forced GC collections
+/// (the gc_churn workload; re-initialized runtime class vars leave the
+/// collector scanning stale roots). So a failed boot poisons crystal
+/// scripting for the process lifetime: every later setup fails fast
+/// with a pointed message instead of corrupting quietly. The
+/// dedicated boot suite (tests/crystal_boot_suite.zig — its own test
+/// binary, because poisoning is process-wide) pins both halves.
+var runtime_boot_poisoned = false;
 
 fn logHost(msg: []const u8) void {
     contract.labelle_log(msg.ptr, msg.len);
 }
 
 pub const Vm = struct {
-    /// Handshake with the linked glue, then the one-time runtime boot;
-    /// no state to allocate.
-    pub fn init() error{CrystalGlueVersionMismatch}!Vm {
+    /// Handshake with the linked glue, then the once-on-success runtime
+    /// boot; no state to allocate. A nonzero boot report fails setup
+    /// loudly — the same fail-at-boot-not-mid-game philosophy as the
+    /// ABI-version refusal: scripts must never run over a runtime whose
+    /// GC or constant tables never initialized.
+    pub fn init() error{ CrystalGlueVersionMismatch, CrystalRuntimeBootFailed }!Vm {
         const got = labelle_cr_abi_version();
         if (got != SUPPORTED_CR_ABI_VERSION) {
             logHost("[scripting] crystal glue ABI mismatch — the linked " ++
@@ -97,8 +122,27 @@ pub const Vm = struct {
                 "plugin version (stale plugin-build cache?); regenerate/rebuild");
             return error.CrystalGlueVersionMismatch;
         }
+        if (runtime_boot_poisoned) {
+            logHost("[scripting] crystal runtime boot previously failed and a " ++
+                "partial boot cannot be retried (a top-level re-run over the " ++
+                "half-initialized first pass crashes in GC collections) — " ++
+                "scripting is disabled for this process; fix the first " ++
+                "failure's reported stage and restart the game");
+            return error.CrystalRuntimeBootFailed;
+        }
         if (!runtime_booted) {
-            labelle_cr_boot();
+            if (labelle_cr_boot() != 0) {
+                // The glue already logged WHICH stage raised (a static
+                // per-stage line — see labelle_cr_boot); this names the
+                // consequence and the poison latch's doc names why no
+                // retry is offered.
+                runtime_boot_poisoned = true;
+                logHost("[scripting] crystal runtime boot failed — no scripts " ++
+                    "are running (the stage report is the log line above); " ++
+                    "scripting stays disabled for this process — fix the " ++
+                    "reported failure and restart the game");
+                return error.CrystalRuntimeBootFailed;
+            }
             runtime_booted = true;
         }
         return .{};

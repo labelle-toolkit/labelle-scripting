@@ -14,7 +14,12 @@
 # |                             | runs BEFORE boot, so its body is pinned    |
 # |                             | to a bare literal (see the fun)            |
 # | `labelle_cr_boot`           | `Vm.init`, once per process — the crystal  |
-# |                             | runtime boot (below)                       |
+# |                             | runtime boot (below); returns 0 ok / the   |
+# |                             | 1-based FAILED STAGE, and on nonzero the   |
+# |                             | Zig arm fails setup loudly and POISONS     |
+# |                             | scripting for the process (a partial boot  |
+# |                             | cannot be retried — the empirical          |
+# |                             | rationale lives in src/crystal/vm.zig)     |
 # | `labelle_cr_setup`          | end of `Controller.setup` — runs the       |
 # |                             | game's `Game.register`, then every         |
 # |                             | script's `init` (raising inits EVICT)      |
@@ -234,19 +239,42 @@ fun labelle_cr_abi_version : UInt32
   1_u32
 end
 
-# One-time runtime boot — the module doc's three-step embed sequence.
-# The Zig arm guards the once-ness; a second call would re-run the top
-# level over live state.
-fun labelle_cr_boot : Void
-  GC.init
-  Crystal.init_runtime
-  program_name = "labelle".to_unsafe
-  Crystal.main_user_code(1, pointerof(program_name))
-    rescue ex
-      # The runtime may be too half-booted for interpolation — a literal
-      # through the raw contract symbol is the one safe report.
-      msg = "crystal: runtime boot failed"
-      LibLabelle.labelle_log(msg.to_unsafe, msg.bytesize)
+# Runtime boot — the module doc's three-step embed sequence. Returns 0
+# on success, else the 1-BASED STAGE that raised; the Zig arm fails
+# setup loudly on nonzero and only latches "booted" on 0 (a swallowed
+# boot failure would leave every later setup running scripts over a
+# runtime whose GC/constants never initialized — the corrupt-quietly
+# mode this contract exists to prevent). The Zig arm guards the
+# once-ness AND refuses any re-boot after a failure: a repeat call
+# after success would re-run the top level over live state, and a
+# repeat after a PARTIAL run corrupts the runtime outright (crystal
+# scripting is poisoned for the process — src/crystal/vm.zig carries
+# the empirical evidence).
+#
+# Raise containment here predates the runtime proper: rescue itself is
+# safe pre-top-level (raise allocates via bdw-gc's lazy init and never
+# needs the eager-constant tables — the #734-POC-era spike pinned
+# exactly that), but string INTERPOLATION isn't, so the failure reports
+# are static literals picked per stage.
+fun labelle_cr_boot : Int32
+  stage = 1_i32
+  begin
+    GC.init
+    stage = 2
+    Crystal.init_runtime
+    stage = 3
+    program_name = "labelle".to_unsafe
+    Crystal.main_user_code(1, pointerof(program_name))
+    0_i32
+  rescue ex
+    msg = case stage
+          when 1 then "crystal: runtime boot failed during GC.init"
+          when 2 then "crystal: runtime boot failed during Crystal.init_runtime"
+          else        "crystal: runtime boot failed during top-level initialization (main_user_code)"
+          end
+    LibLabelle.labelle_log(msg.to_unsafe, msg.bytesize)
+    stage
+  end
 end
 
 fun labelle_cr_setup : Int32

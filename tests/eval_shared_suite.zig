@@ -12,6 +12,7 @@
 const std = @import("std");
 const scripting = @import("labelle_scripting");
 const mock = @import("mock_world.zig");
+const crystal_lib_paths = @import("crystal_lib_paths");
 const eval = scripting.eval;
 
 const expect = std.testing.expect;
@@ -387,4 +388,36 @@ test "packaging: the language schema vocabulary IS build.zig's Language enum" {
         }
     }
     try expect(found);
+}
+
+// ── build support: CRYSTAL_LIBRARY_PATH splitting ────────────────────
+
+test "crystal_lib_paths: colon-separated env values yield one path per entry" {
+    // `crystal env CRYSTAL_LIBRARY_PATH` is a colon-separated LIST (the
+    // brew/tarball single-dir case is just its one-entry degenerate);
+    // build.zig walks this iterator to addLibraryPath each entry, and
+    // the assembler's {crystal_env:CRYSTAL_LIBRARY_PATH} splice row owes
+    // the same split. A whole-value path would survive every single-dir
+    // machine and silently lose gc/pcre2 on the first multi-entry
+    // environment — exactly the drift this pin exists to catch.
+    const Case = struct { value: []const u8, want: []const []const u8 };
+    const cases = [_]Case{
+        // The multi-entry environment (a user override prepending a dir).
+        .{ .value = "/custom/libs:/opt/crystal/lib\n", .want = &.{ "/custom/libs", "/opt/crystal/lib" } },
+        // The common single-dir output, trailing newline included.
+        .{ .value = "/opt/homebrew/lib\n", .want = &.{"/opt/homebrew/lib"} },
+        // Empty segments (leading/doubled/trailing colons) are skipped,
+        // not handed to the linker as "" paths.
+        .{ .value = "::/a/b::\n", .want = &.{"/a/b"} },
+        // A blank value yields no paths at all.
+        .{ .value = "  \n", .want = &.{} },
+    };
+    for (cases) |case| {
+        var it = crystal_lib_paths.iterate(case.value);
+        for (case.want) |want| {
+            const got = it.next() orelse return error.TestExpectedEntry;
+            try expectEqualStrings(want, got);
+        }
+        try expectEqual(@as(?[]const u8, null), it.next());
+    }
 }

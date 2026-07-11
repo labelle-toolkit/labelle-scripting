@@ -89,10 +89,16 @@
         // .library_paths' {crystal_env:CRYSTAL_LIBRARY_PATH} = `crystal
         // env CRYSTAL_LIBRARY_PATH`, resolved at generate — where
         // crystal's own link line points (brew's /opt/homebrew/lib, the
-        // official linux tarball's bundled lib/crystal/). Both are new
-        // splice vocabulary specified for the #741 crystal follow-up;
-        // this repo's build.zig test wiring implements the identical
-        // recipe natively for the suite. Desktop-first, like rust.
+        // official linux tarball's bundled lib/crystal/). The value is a
+        // COLON-SEPARATED list (single-dir installs are its one-entry
+        // degenerate): the splice must split on ':' and emit ONE library
+        // path per non-empty entry — tools/crystal_lib_paths.zig is the
+        // reference implementation this repo's own wiring uses, pinned
+        // by the shared suite's multi-entry fixtures. Both placeholders
+        // are new splice vocabulary specified for the #741 crystal
+        // follow-up; this repo's build.zig test wiring implements the
+        // identical recipe natively for the suite. Desktop-first, like
+        // rust.
         .{
             .language = "crystal",
             .steps = .{
@@ -128,8 +134,22 @@
                     .artifact = "{cache}/labelle_crystal_scripts_lib.o",
                     .link = .object,
                     .platforms = .{"desktop"},
+                    // gcc_s is the UNWINDER: crystal's begin/rescue/raise
+                    // (the glue's whole containment story) needs _Unwind_*
+                    // at final link. On linux-gnu crystal's own toolchain
+                    // links through the gcc driver, which appends -lgcc_s
+                    // implicitly — the object's unwind references are
+                    // libgcc's, so gcc_s is the matching spelling under
+                    // zig's driverless link (and the rust precedent: the
+                    // rust entry above links it for panic=unwind, green on
+                    // this repo's ubuntu lane). NOT "unwind": llvm-libunwind
+                    // is no system lib on stock runners, and mixing
+                    // unwinders against a gcc-toolchain object is the risk,
+                    // not the fix. CI's ubuntu lane is the functional
+                    // arbiter — the raise-containment tests actually unwind
+                    // there, so a wrong choice fails tests, not just links.
                     .system_libs = .{
-                        .linux = .{ "gc", "pcre2-8", "pthread", "dl", "rt", "m" },
+                        .linux = .{ "gc", "pcre2-8", "gcc_s", "pthread", "dl", "rt", "m" },
                     },
                     .library_paths = .{"{crystal_env:CRYSTAL_LIBRARY_PATH}"},
                 },

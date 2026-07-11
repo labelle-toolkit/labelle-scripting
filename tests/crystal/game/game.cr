@@ -28,11 +28,20 @@ require "./events"
 require "./lifecycle"
 require "./gc_churn"
 
-# Test-only host symbol (exported by tests/crystal_suite.zig): copies
-# the selected scenario name into `out_buf`, returns its length.
+# Test-only host symbols (exported by tests/crystal_suite.zig): the
+# scenario name pull, and the boot-failure stage flag.
 lib LibSuite
   fun labelle_cr_test_scenario(out_buf : UInt8*, cap : LibC::SizeT) : LibC::SizeT
+  fun labelle_cr_test_boot_should_fail : Int32
 end
+
+# The boot-failure probe: a TOP-LEVEL statement, so it runs during the
+# runtime boot's `main_user_code` pass — exactly where a real game's
+# raising constant initializer would fire (boot stage 3). Only the
+# dedicated boot-containment binary (tests/crystal_boot_suite.zig)
+# ever answers 1 — a failed boot poisons the process, so that pin
+# cannot share a binary with this suite; here the flag is hardwired 0.
+raise "test boot failure requested" if LibSuite.labelle_cr_test_boot_should_fail == 1
 
 module Game
   # The game registration convention (see native-crystal/src/game/game.cr

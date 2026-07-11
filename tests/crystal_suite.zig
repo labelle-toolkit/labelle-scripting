@@ -25,10 +25,13 @@
 //! failures here.
 //!
 //! One crystal-only wrinkle: the runtime (GC + top level) boots ONCE
-//! per process at the first setup and stays up across deinits — so
-//! unlike the embedded suites, "fresh" means a fresh REGISTRY, never a
-//! fresh runtime. That is the production semantic too (src/crystal/
-//! vm.zig's runtime_booted).
+//! per process at the first successful setup and stays up across
+//! deinits — so unlike the embedded suites, "fresh" means a fresh
+//! REGISTRY, never a fresh runtime. That is the production semantic
+//! too (src/crystal/vm.zig's runtime_booted). Its failure half —
+//! boot fails → setup errs loudly → the process is POISONED — cannot
+//! be staged in this binary at all (poisoning is process-wide), so it
+//! rides a dedicated second binary: tests/crystal_boot_suite.zig.
 
 const std = @import("std");
 const scripting = @import("labelle_scripting");
@@ -52,6 +55,16 @@ export fn labelle_cr_test_scenario(out: [*]u8, cap: usize) usize {
     const n = @min(scenario_len, cap);
     @memcpy(out[0..n], scenario_buf[0..n]);
     return n;
+}
+
+/// The test object's TOP LEVEL (tests/crystal/game/game.cr) probes
+/// this during the boot's main_user_code pass and raises on 1 — the
+/// staged boot failure. In THIS binary it is hardwired 0: a failed
+/// boot poisons crystal scripting process-wide (src/crystal/vm.zig),
+/// so the containment pin lives in its own binary,
+/// tests/crystal_boot_suite.zig.
+export fn labelle_cr_test_boot_should_fail() i32 {
+    return 0;
 }
 
 fn selectScenario(name: []const u8) void {

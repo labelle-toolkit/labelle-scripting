@@ -487,6 +487,14 @@ module Game
 end
 ```
 
+**A failed runtime boot fails loudly and stays failed.** The boot
+reports which stage raised (GC.init / init_runtime / top-level
+initialization — a game constant initializer throwing lands here);
+setup errors, no scripts run, and crystal scripting stays disabled for
+the process — a partial boot cannot be retried (a top-level re-run
+over the half-initialized first pass crashes in GC collections; the
+boot suite pins this). Fix the reported stage and restart.
+
 **Exceptions never cross the FFI boundary.** Every glue entry point
 (and every script hook individually) runs under begin/rescue: a raise
 in `init` logs and EVICTS the script; a raise in `update`/`on_event`

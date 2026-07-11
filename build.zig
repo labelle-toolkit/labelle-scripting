@@ -18,6 +18,10 @@
 
 const std = @import("std");
 
+/// `crystal env CRYSTAL_LIBRARY_PATH` splitting (colon-separated) —
+/// shared with the test suite as the `crystal_lib_paths` named module.
+const crystal_lib_paths = @import("tools/crystal_lib_paths.zig");
+
 /// The language sub-modules this plugin can embed. One per game — the
 /// choice is a whole-VM decision, so it lives in the build graph, not at
 /// runtime. Adding a language is additive: extend this enum, gate its
@@ -243,6 +247,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The CRYSTAL_LIBRARY_PATH splitter, promoted the same way (this
+    // build script imports it directly; the eval shared suite unit-tests
+    // its multi-entry behavior through the named module — same file, so
+    // the code the wiring runs can never drift from the code under test).
+    const crystal_lib_paths_mod = b.createModule(.{
+        .root_source_file = b.path("tools/crystal_lib_paths.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Tests: the contract symbols are `extern` in src/contract.zig and the
     // test root provides them (tests/mock_world.zig `export`s a toy world),
     // mirroring production exactly — there the assembled game binary is the
@@ -276,6 +290,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "labelle_scripting", .module = lang_mod },
                 .{ .name = "declare_core", .module = declare_core_mod },
+                .{ .name = "crystal_lib_paths", .module = crystal_lib_paths_mod },
             },
         });
         // The pack hook shim's SOURCE, for the eval shared suite's AstGen
@@ -400,37 +415,49 @@ pub fn build(b: *std.Build) void {
             tests.step.dependOn(&localize.step);
             tests_root_mod.addObjectFile(.{ .cwd_relative = lib_obj_path });
 
-            // The crystal runtime's system libraries — mirror of
-            // plugin.labelle's crystal `.system_libs` (what the assembler
-            // row will link in consumer games): bdw-gc always, pcre2
-            // because game scripts may use Regex, iconv on macOS only
-            // (String encodings; glibc builds it in). crystal 1.15+'s
-            // event loop is kqueue/epoll-native — no libevent. The search
-            // path comes from `crystal env CRYSTAL_LIBRARY_PATH`, exactly
+            // The search paths come from `crystal env
+            // CRYSTAL_LIBRARY_PATH` — a COLON-SEPARATED list
+            // (tools/crystal_lib_paths.zig is the splitting point,
+            // tested in the eval shared suite): each entry is exactly
             // where `crystal build` itself points its link line (brew's
             // /opt/homebrew/lib, the official linux tarball's bundled
-            // lib/crystal/); resolved only when crystal exists so a
-            // crystal-less `zig build --help` still configures — the
-            // crystal_build step above is what fails loudly then.
+            // lib/crystal/, any user-prepended dirs). Resolved only when
+            // crystal exists so a crystal-less `zig build --help` still
+            // configures — the crystal_build step above is what fails
+            // loudly then. Collected once: two binaries link the object
+            // (below).
+            var crystal_lib_dirs: std.ArrayList([]const u8) = .empty;
             if (b.findProgram(&.{"crystal"}, &.{}) catch null) |crystal_exe| {
                 const lib_path_raw = b.run(&.{ crystal_exe, "env", "CRYSTAL_LIBRARY_PATH" });
-                const lib_path = std.mem.trim(u8, lib_path_raw, " \n\r\t");
-                if (lib_path.len > 0)
-                    tests_root_mod.addLibraryPath(.{ .cwd_relative = lib_path });
+                var lib_paths = crystal_lib_paths.iterate(lib_path_raw);
+                while (lib_paths.next()) |entry| {
+                    crystal_lib_dirs.append(b.allocator, entry) catch @panic("OOM");
+                }
             }
-            tests_root_mod.linkSystemLibrary("gc", .{});
-            tests_root_mod.linkSystemLibrary("pcre2-8", .{});
-            switch (target.result.os.tag) {
-                .macos => tests_root_mod.linkSystemLibrary("iconv", .{}),
-                else => {
-                    // glibc-hosted: crystal's own link line adds these
-                    // (modern glibc folds most in, the stubs stay safe).
-                    tests_root_mod.linkSystemLibrary("pthread", .{});
-                    tests_root_mod.linkSystemLibrary("dl", .{});
-                    tests_root_mod.linkSystemLibrary("rt", .{});
-                    tests_root_mod.linkSystemLibrary("m", .{});
+            linkCrystalRuntime(tests_root_mod, target.result.os.tag, crystal_lib_dirs.items);
+
+            // The BOOT-containment binary (tests/crystal_boot_suite.zig):
+            // a failed boot POISONS crystal scripting process-wide (see
+            // src/crystal/vm.zig's runtime_boot_poisoned), so its pin
+            // cannot share a process with the main suite — same localized
+            // object, same mock world, its own test binary.
+            const boot_root_mod = b.createModule(.{
+                .root_source_file = b.path("tests/crystal_boot_suite.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "labelle_scripting", .module = lang_mod },
                 },
-            }
+            });
+            boot_root_mod.addObjectFile(.{ .cwd_relative = lib_obj_path });
+            linkCrystalRuntime(boot_root_mod, target.result.os.tag, crystal_lib_dirs.items);
+            const boot_tests = b.addTest(.{
+                .root_module = boot_root_mod,
+            });
+            boot_tests.step.dependOn(&localize.step);
+            const run_boot_tests = b.addRunArtifact(boot_tests);
+            test_step.dependOn(&run_boot_tests.step);
         }
 
         const run_tests = b.addRunArtifact(tests);
@@ -566,6 +593,38 @@ fn configureLanguage(
             // and linked onto the final binary the same two ways (the
             // assembler's `.language_builds` steps in consumer games,
             // the test-loop wiring in this repo's suite).
+        },
+    }
+}
+
+/// The crystal runtime's system libraries + search paths — mirror of
+/// plugin.labelle's crystal `.system_libs`/`.library_paths` (what the
+/// assembler row will link in consumer games): bdw-gc always, pcre2
+/// because game scripts may use Regex, iconv on macOS only (String
+/// encodings; glibc builds it in), gcc_s on linux (the unwinder —
+/// crystal's begin/rescue needs _Unwind_*, and the object's references
+/// are libgcc's because crystal links through the gcc driver; same
+/// spelling the rust wiring uses for panic=unwind, proven on this
+/// repo's ubuntu lane — see the plugin.labelle crystal entry's comment
+/// for the full rationale). crystal 1.15+'s event loop is
+/// kqueue/epoll-native — no libevent. Shared by the two crystal test
+/// binaries (main suite + boot suite).
+fn linkCrystalRuntime(mod: *std.Build.Module, os_tag: std.Target.Os.Tag, lib_dirs: []const []const u8) void {
+    for (lib_dirs) |dir| {
+        mod.addLibraryPath(.{ .cwd_relative = dir });
+    }
+    mod.linkSystemLibrary("gc", .{});
+    mod.linkSystemLibrary("pcre2-8", .{});
+    switch (os_tag) {
+        .macos => mod.linkSystemLibrary("iconv", .{}),
+        else => {
+            mod.linkSystemLibrary("gcc_s", .{});
+            // glibc-hosted: crystal's own link line adds these (modern
+            // glibc folds most in, the stubs stay safe).
+            mod.linkSystemLibrary("pthread", .{});
+            mod.linkSystemLibrary("dl", .{});
+            mod.linkSystemLibrary("rt", .{});
+            mod.linkSystemLibrary("m", .{});
         },
     }
 }
