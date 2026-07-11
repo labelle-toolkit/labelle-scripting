@@ -41,6 +41,9 @@ jobs:
       # a REAL failure exits nonzero before the grep matters (pipefail).
       - name: Run tests
         run: |
+          # Actions' default shell is `bash -e {0}` WITHOUT pipefail — set
+          # it explicitly or tee masks a zig build failure with exit 0.
+          set -o pipefail
           zig build test 2>&1 | tee test.log
           if grep -q "failed command:" test.log; then
             echo "E: phantom 'failed command:' in a passing build — a test binary left residual stderr (see above)"
@@ -112,6 +115,10 @@ jobs:
       - name: Generate + build + run the ruby example game
         run: |
           # Fresh HOME for the whole flow: the assembler keeps its package
+          # Actions' default shell has no pipefail — without it the tee
+          # below masks a failed generate with exit 0.
+          set -o pipefail
+
           # cache under ~/.labelle — never let a runner's (or, when run
           # locally, a developer's) real one leak into the run.
           export HOME="$RUNNER_TEMP/labelle-home"
@@ -127,8 +134,8 @@ jobs:
           $ASM install --project-root .
           $ASM generate --project-root . 2>&1 | tee generate.log
 
-          # Belt and braces on top of the exit code (runs under
-          # `bash -e -o pipefail`): never trust artifacts past a failed
+          # Belt and braces on top of the exit code (pipefail set at the
+          # top of this step): never trust artifacts past a failed
           # generate.
           if grep -q 'generate failed' generate.log; then
             echo "E: generate reported failure"
