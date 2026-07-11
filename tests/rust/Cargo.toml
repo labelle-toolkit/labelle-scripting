@@ -1,0 +1,17 @@
+# The rust suite's test crate: the SHIPPED glue + labelle module
+# (native/src/, byte-identical via #[path] — see src/lib.rs) recomposed
+# around tests/rust/game/'s scenario scripts, built as a staticlib and
+# linked into the rust test binary by build.zig's cargo wiring. The
+# profile mirrors native/Cargo.toml — panic = "unwind" is load-bearing
+# (the catch_unwind containment is exactly what the suite pins).
+[package]
+name = "labelle_rust_scripts_test"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "unwind"

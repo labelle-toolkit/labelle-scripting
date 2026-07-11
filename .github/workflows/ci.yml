@@ -19,13 +19,41 @@ jobs:
         with:
           version: 0.16.0
 
+      # The rust sub-module's suite (labelle-engine#741): `zig build test`
+      # cargo-builds tests/rust's staticlib (zero crate deps, --locked, no
+      # network) and links it into the rust test binary. rustc ≥ 1.82
+      # (rust-version in the Cargo.tomls); rustfmt for the check below.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
       # The lua dep is lazy — `zig build test` fetches it on demand
       # (network needed once; hash-pinned in build.zig.zon).
+      #
+      # A green build must also be CLEAN: zig's build runner relays a
+      # test binary's residual stderr through its failure printer EVEN
+      # ON SUCCESS ("No matter the result…" in build_runner.zig), which
+      # appends a phantom `failed command:` line — exactly what the rust
+      # panic-containment tests produced while expected panics still hit
+      # rust's default stderr reporter (now routed to the game log sink
+      # by the glue's panic hook). The grep pins that this stays fixed;
+      # a REAL failure exits nonzero before the grep matters (pipefail).
       - name: Run tests
-        run: zig build test
+        run: |
+          zig build test 2>&1 | tee test.log
+          if grep -q "failed command:" test.log; then
+            echo "E: phantom 'failed command:' in a passing build — a test binary left residual stderr (see above)"
+            exit 1
+          fi
 
       - name: Formatting
         run: zig fmt --check build.zig src tests
+
+      - name: Rust formatting
+        run: |
+          cargo fmt --check --manifest-path native/Cargo.toml
+          cargo fmt --check --manifest-path tests/rust/Cargo.toml
 
   # Ruby example game (labelle-scripting#10) — the ruby counterpart of the
   # assembler's `examples/scripting-smoke`, living in THIS repo so every
