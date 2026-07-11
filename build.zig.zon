@@ -5,9 +5,9 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Upstream Lua 5.4 source, compiled into the module when
-        // `-Dlanguage=lua` (the default). Lazy so games on a future
-        // different language never download it (build.zig gates the
-        // b.lazyDependency call on the language option).
+        // `-Dlanguage=lua` (the default). Always FETCHED regardless of
+        // language: the declare-mode extractor (tools/declare) is
+        // lua-based and ships with every install (see build.zig).
         .lua = .{
             .url = "https://www.lua.org/ftp/lua-5.4.8.tar.gz",
             .hash = "N-V-__8AAKEzFAAA695b9LXBhUSVK5MAV_VKSm1mEj3Acbze",
@@ -23,5 +23,8 @@
         // package: the assembler builds it FROM the consuming game's
         // resolved copy (`zig build labelle-declare`, assembler#585).
         "tools",
+        // The ruby sub-module's vendored mruby snapshot (upstream sources
+        // + generated presym/bytecode C); compiled only for -Dlanguage=ruby.
+        "vendor",
     },
 }

@@ -389,10 +389,12 @@ pub const Vm = struct {
         return ok;
     }
 
-    /// Call a prelude function `labelle.<name>` with no arguments — how the
-    /// Controller triggers `labelle.dispatch_inbox()` at tick start. Silently
-    /// a no-op when the prelude (or the function) is missing.
-    pub fn callLabelleFn(self: Vm, name: [*:0]const u8) void {
+    /// Call a prelude function `labelle.<name>`, passing `dt` when given —
+    /// how the Controller triggers `labelle.dispatch_inbox()` at tick
+    /// start (and the controller-tier sweeps on backends that have one).
+    /// Silently a no-op when the prelude (or the function) is missing —
+    /// which is exactly how this backend skips the controller hooks.
+    pub fn callLabelleFn(self: Vm, name: [*:0]const u8, dt: ?f32) void {
         const L = self.L;
         _ = c.lua_getglobal(L, "labelle"); // [labelle]
         if (c.lua_type(L, -1) != c.LUA_TTABLE) {
@@ -404,7 +406,12 @@ pub const Vm = struct {
             c.lua_settop(L, -3);
             return;
         }
-        _ = self.protectedCall(0, 0, "dispatch");
+        var nargs: c_int = 0;
+        if (dt) |v| {
+            c.lua_pushnumber(L, v);
+            nargs = 1;
+        }
+        _ = self.protectedCall(nargs, 0, "dispatch");
         c.lua_settop(L, -2); // pop labelle
     }
 
