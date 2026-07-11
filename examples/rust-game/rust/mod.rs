@@ -83,8 +83,14 @@ pub fn register(scripts: &mut Scripts) {
 // (u64 end to end; a bit-63 id survives exactly).
 
 /// The unsigned integer after `needle` (e.g. `"\"entity\":"`), or None.
+/// Tolerates a string-encoded id (`"entity":"123"`): dynamic-language
+/// emitters that can't hold u64 precision natively spell ids as JSON
+/// strings, and an exemplar parser should read both spellings.
 pub(crate) fn u64_field(json: &[u8], needle: &str) -> Option<u64> {
     let mut i = skip_to_value(json, needle)?;
+    if i < json.len() && json[i] == b'"' {
+        i += 1;
+    }
     let mut val: u64 = 0;
     let mut any = false;
     while i < json.len() && json[i].is_ascii_digit() {
@@ -124,7 +130,9 @@ fn skip_to_value(json: &[u8], needle: &str) -> Option<usize> {
     }
     let at = (0..=json.len() - nb.len()).find(|&i| &json[i..i + nb.len()] == nb)?;
     let mut i = at + nb.len();
-    while i < json.len() && json[i] == b' ' {
+    // Any JSON whitespace, not just the encoder-side space — a
+    // pretty-printed payload is legal JSON too.
+    while i < json.len() && json[i].is_ascii_whitespace() {
         i += 1;
     }
     Some(i)
