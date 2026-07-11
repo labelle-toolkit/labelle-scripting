@@ -3,3 +3,7 @@ zig-out/
 # Zig 0.16 extracts package deps here (recreated from build.zig.zon
 # hashes); the vendored Lua tree does not belong in the repo.
 zig-pkg/
+# Stray cargo target dirs from hand-run `cargo build`s in the rust
+# crates (the wired builds all --target-dir into the zig cache).
+native/target/
+tests/rust/target/

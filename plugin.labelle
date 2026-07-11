@@ -18,6 +18,52 @@
     // suite (and vice versa). Assemblers older than v0.83.0 ignore this
     // key and keep the fast-path.
     .params_schema = .{
-        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript" }, .required = true },
+        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript", "rust" }, .required = true },
+    },
+    // Per-LANGUAGE build steps (labelle-engine#741, native-compiled
+    // family) — the #586 `.build` Step schema, applied only when the
+    // project's declared `.params.language` matches an entry's language.
+    // Deliberately NOT the top-level `.build` key: v0.83.0 runs `.build`
+    // steps for EVERY project that attaches the plugin (a lua game would
+    // suddenly need cargo), and `.build`'s strict subtree parse means a
+    // conditional key inside it would hard-fail v0.83.0 generates. A
+    // manifest-LEVEL key rides the documented forward-compat instead
+    // (old assemblers ignore it — they can't splice rust anyway).
+    //
+    // Consumed by the assembler's native-language splice row (the #741
+    // follow-up), which also stages the game's rust/ dir over the staged
+    // package's native/src/game/ so cargo compiles the game's scripts
+    // into liblabelle_rust_scripts.a — linked into the game binary,
+    // where its labelle_* externs resolve against the host's exports.
+    // Desktop-first: cross-target cargo (android/ios/wasm rust triples)
+    // is future work, so the step declares a platform allowlist and a
+    // non-desktop rust generate fails up front, not at link time.
+    .language_builds = .{
+        .{
+            .language = "rust",
+            .steps = .{
+                .{
+                    .name = "cargo-scripts",
+                    .command = .{ "cargo", "build", "--release", "--quiet", "--locked", "--manifest-path", "{package}/native/Cargo.toml", "--target-dir", "{cache}" },
+                    // {staticlib:NAME} expands per target OS at emission
+                    // (lib<NAME>.a on unix, <NAME>.lib on windows) — cargo's
+                    // artifact names are target-specific.
+                    .artifact = "{cache}/release/{staticlib:labelle_rust_scripts}",
+                    .link = .static_lib,
+                    .platforms = .{"desktop"},
+                    // The crate keeps panic = "unwind" (the catch_unwind
+                    // containment depends on it), so the final link needs
+                    // rust's native static libs. Per-OS: this is cargo's
+                    // `--print native-static-libs` set for linux minus -lc
+                    // (the game's own libc link covers it); macOS needs
+                    // none beyond the system libs zig already links;
+                    // windows resolves its set (bcrypt etc.) when the
+                    // windows lane opens — the allowlist gates it today.
+                    .system_libs = .{
+                        .linux = .{ "gcc_s", "util", "rt", "pthread", "m", "dl" },
+                    },
+                },
+            },
+        },
     },
 }

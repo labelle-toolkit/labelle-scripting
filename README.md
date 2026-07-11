@@ -19,7 +19,8 @@ Every language binds the engine's **Script Runtime Contract** (`labelle-engine/c
 | `lua` (Lua 5.4) | ✅ bootstrap done (#738) + per-frame allocation utilities (#2) — vendored Lua 5.4.8, contract-bound, tested against a mock host |
 | `ruby` (mruby 3.4) | ✅ done (labelle-engine#742) — vendored mruby, controllers + Component.ref + FrameArray, tested against the same mock host |
 | `typescript` (QuickJS) | ✅ done (labelle-engine#745) — quickjs-ng 0.15, ES-module scripts, BigInt ids, typed via contract/labelle.d.ts, tested against the same mock host (plain JS at runtime; the TS→JS transpile hook is assembler#586) |
-| `rust` / `crystal` | planned (needs assembler build hooks) |
+| `rust` (staticlib) | ✅ done (labelle-engine#741) — first native-compiled sub-module: game `rust/` sources cargo-built into the shipped crate (`native/`), `Script` trait + safe wrappers, panics caught at every FFI entry, tested against the same mock host (end-to-end game wiring needs the assembler's native-language splice — the #741 follow-up) |
+| `crystal` | planned (rust's build-hook + splice shape, plus the POC's embedding rules) |
 | `go` (c-archive) | planned |
 | `csharp` (CoreCLR) | planned — last |
 
@@ -354,6 +355,84 @@ net-zero:
   construction, elements are raw doubles (no boxing at all).
 
 Design: `RFC-LANGUAGE-PLUGINS.md` (labelle-engine#730) · epic: labelle-engine#237
+
+## Using the rust sub-module
+
+Build with `-Dlanguage=rust` — the first **native-compiled** sub-module
+(labelle-engine#741): there is no VM and nothing embeds. Your game's
+`rust/` dir is compiled by cargo into the crate this plugin ships
+(`native/` — Cargo manifest, the `labelle` module, the entry-point glue)
+as its `game` module, producing `liblabelle_rust_scripts.a`, which links
+into the game binary. The contract header IS the binding (the POC's
+finding): the crate declares the `labelle_*` symbols `extern "C"` and
+they resolve against the host's exports in the same binary — zero
+bindings layer, zero indirection. The plugin's Zig side shrinks to a
+thin dispatcher onto the glue's `labelle_rs_*` entry points
+(`src/rust/vm.zig`), driven by the same Controller as every VM language.
+
+Your `rust/mod.rs` implements one convention entry point; scripts are
+plain structs implementing the `Script` trait, state in their fields:
+
+```rust
+use crate::labelle::{self, EntityId, Script, Scripts};
+
+pub fn register(scripts: &mut Scripts) {
+    scripts.add("player", Box::new(Player::default()));
+}
+
+#[derive(Default)]
+struct Player {
+    e: EntityId,
+    pos: Vec<u8>, // reused every tick — steady state allocates nothing
+}
+
+impl Script for Player {
+    fn init(&mut self) {
+        self.e = labelle::create_entity();
+        labelle::set_component(self.e, "Position", r#"{"x":0,"y":0}"#);
+        labelle::subscribe("cargo__delivered");
+    }
+    fn on_event(&mut self, name: &str, payload: &str) {
+        if name == "cargo__delivered" {
+            labelle::log(&format!("got {}", payload));
+        }
+    }
+    fn update(&mut self, _dt: f32) {
+        labelle::get_component_into(self.e, "Position", &mut self.pos);
+        // parse, mutate, set — ids are u64 END TO END (no BigInt/bitcast
+        // caveats: rust's u64 carries bit-63 ids exactly).
+    }
+}
+```
+
+**Panics never cross the FFI boundary.** Every glue entry point (and
+every script hook individually) runs under `catch_unwind`: a panic in
+`init` logs and EVICTS the script (no `update`/`deinit` on
+half-initialized state); a panic in `update`/`on_event` logs every tick
+and the script stays; siblings always keep running — the same isolation
+story as a lua `error()`, minus the traceback (you get the panic
+message and location on stderr via the standard panic hook). The crate
+pins `panic = "unwind"` because of this; don't switch it to abort.
+
+**Per-frame allocation** is the rust freebie: the wrappers take
+caller-owned `Vec`s (`get_component_into`, `query_into`, `poll_into`),
+`clear()` retains capacity, growth is required-size-driven and happens
+at most once — hold buffers in script fields and the steady state is
+allocation-free (the suite pins 100 working ticks with zero capacity
+movement).
+
+**No console eval**: compiled code can't be evaluated — the studio
+Script Console gets a documented `ok:false` refusal.
+
+**End-to-end wiring** (generate → cargo → link) rides the assembler's
+native-language splice — the #741 follow-up: it stages your `rust/` over
+the staged package's `native/src/game/`, passes `-Dlanguage=rust`, and
+runs the build step declared in this repo's `plugin.labelle`
+(`.language_builds` — cargo → staticlib → `addObjectFile`, desktop-first).
+Until that assembler release, the sub-module is fully usable against the
+mock host and via hand-wiring (link the staticlib yourself, as
+build.zig's own test wiring demonstrates). Needs a rust toolchain
+(rustc ≥ 1.82) wherever the game builds.
 
 ## Studio Script Console (eval)
 

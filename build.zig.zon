@@ -40,6 +40,12 @@
         // The ruby sub-module's vendored mruby snapshot (upstream sources
         // + generated presym/bytecode C); compiled only for -Dlanguage=ruby.
         "vendor",
+        // The rust sub-module's crate (labelle-engine#741): the labelle
+        // module + glue + Cargo manifest the assembler's declared build
+        // step compiles the GAME's rust/ sources into (plugin.labelle
+        // `.language_builds`). Must ship — the step's cargo runs against
+        // the consumer's staged copy of this directory.
+        "native",
         // Bundled packs plugin.labelle's `.packs` references (the studio
         // console's eval-handler hook rides packs/scripting_console/) —
         // the assembler resolves them from the consuming game's FETCHED

@@ -1,0 +1,27 @@
+# The rust-scripts crate a labelle game builds its rust/ sources into
+# (labelle-engine#741). The assembler's declared build step (see
+# plugin.labelle `.language_builds`) runs
+#
+#   cargo build --release --quiet --locked
+#         --manifest-path {package}/native/Cargo.toml --target-dir {cache}
+#
+# and links {cache}/release/liblabelle_rust_scripts.a into the game.
+# Zero dependencies on purpose: the contract header IS the binding
+# (labelle-engine#734 POC finding #3), so a game's rust scripts build
+# offline with nothing but a rust toolchain.
+[package]
+name = "labelle_rust_scripts"
+version = "0.1.0"
+edition = "2021"
+# `unsafe extern` blocks + `#[unsafe(no_mangle)]` (stable since 1.82).
+rust-version = "1.82"
+
+[lib]
+crate-type = ["staticlib"]
+
+# panic = "unwind" (the default) is LOAD-BEARING, spelled out so nobody
+# "optimizes" it to abort: the glue catches script panics at every FFI
+# entry (catch_unwind) — one panicking script logs and the tick
+# survives. With abort, any script panic would kill the whole game.
+[profile.release]
+panic = "unwind"

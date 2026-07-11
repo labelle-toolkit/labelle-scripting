@@ -20,12 +20,20 @@
 //! rides the C contract.
 //!
 //! Language sub-modules: build.zig selects exactly one (`-Dlanguage=lua`,
-//! `-Dlanguage=ruby` or `-Dlanguage=typescript`) and surfaces the choice
-//! through the `scripting_options` module; the comptime switch below is
-//! what keeps unselected backends out of analysis entirely. Each backend
-//! directory (src/lua/, src/ruby/, src/ts/, …) exposes the same tiny
-//! surface: `vm.Vm` (init/close/loadScript/callScriptHook/evictScript/
-//! callLabelleFn) and `bindings.install`.
+//! `-Dlanguage=ruby`, `-Dlanguage=typescript` or `-Dlanguage=rust`) and
+//! surfaces the choice through the `scripting_options` module; the
+//! comptime switch below is what keeps unselected backends out of
+//! analysis entirely. Each backend directory (src/lua/, src/ruby/,
+//! src/ts/, src/rust/, …) exposes the same tiny surface: `vm.Vm`
+//! (init/close/loadScript/callScriptHook/evictScript/callLabelleFn) and
+//! `bindings.install`.
+//!
+//! Two integration FAMILIES share that surface (RFC-LANGUAGE-PLUGINS):
+//! embedded-VM backends (lua/ruby/typescript) run sources delivered via
+//! `registerScript`; the native-compiled backend (rust — src/rust/vm.zig)
+//! is a thin dispatcher onto entry points of a cargo-built staticlib the
+//! game links, and registered sources are refused (native code can't run
+//! from text). The Controller below is family-agnostic on purpose.
 
 const std = @import("std");
 const build_options = @import("scripting_options");
@@ -55,6 +63,10 @@ const Backend = switch (build_options.language) {
     .typescript => struct {
         pub const vm = @import("ts/vm.zig");
         pub const bindings = @import("ts/bindings.zig");
+    },
+    .rust => struct {
+        pub const vm = @import("rust/vm.zig");
+        pub const bindings = @import("rust/bindings.zig");
     },
 };
 

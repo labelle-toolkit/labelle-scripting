@@ -22,7 +22,14 @@ const std = @import("std");
 /// runtime. Adding a language is additive: extend this enum, gate its
 /// vendored runtime in the switch below, add `src/<lang>/` and its arm
 /// in src/root.zig's backend switch. Nothing existing changes.
-const Language = enum { lua, ruby, typescript };
+///
+/// `rust` is the first NATIVE-COMPILED entry (labelle-engine#741): no
+/// vendored runtime — game scripts compile via cargo into a staticlib
+/// (native/ is the crate; the assembler's declared build step runs
+/// cargo in consumer games, this build.zig's test wiring runs it for
+/// the repo's own suite) and the selected sub-module is a thin
+/// dispatcher onto the crate's exported entry points.
+const Language = enum { lua, ruby, typescript, rust };
 
 /// Lua 5.4.8 sources, minus the `lua.c`/`luac.c` executable mains
 /// (interpreter core + auxlib + all standard libraries).
@@ -284,6 +291,43 @@ pub fn build(b: *std.Build) void {
         const tests = b.addTest(.{
             .root_module = tests_root_mod,
         });
+
+        // The rust binary's staticlib (labelle-engine#741): the suite links
+        // the crate the tests drive — the SHIPPED glue + labelle module
+        // (native/src/, recomposed by #[path] around tests/rust/game/'s
+        // scenario scripts; see tests/rust/src/lib.rs). cargo builds it
+        // with a persistent --target-dir under the zig cache so edits
+        // rebuild in cargo-incremental time; the Run step declares no
+        // outputs, so zig re-runs it every build and cargo's own
+        // staleness check (a few ms when clean) is the cache. `--locked`
+        // pins the committed Cargo.lock (zero deps — no network, ever).
+        // Local dev needs a rust toolchain (rustc ≥ 1.82), same as CI.
+        if (lang == .rust) {
+            const rust_target_dir = b.cache_root.join(
+                b.allocator,
+                &.{"rust-suite-target"},
+            ) catch @panic("OOM");
+            const cargo = b.addSystemCommand(&.{
+                "cargo",     "build",
+                "--release", "--quiet",
+                "--locked",  "--manifest-path",
+            });
+            cargo.addFileArg(b.path("tests/rust/Cargo.toml"));
+            cargo.addArgs(&.{ "--target-dir", rust_target_dir });
+            tests.step.dependOn(&cargo.step);
+            tests_root_mod.addObjectFile(.{ .cwd_relative = b.fmt(
+                "{s}/release/liblabelle_rust_scripts_test.a",
+                .{rust_target_dir},
+            ) });
+            // panic = "unwind" (load-bearing — the glue's catch_unwind is
+            // under test) needs an unwinder at link time. macOS: libSystem
+            // carries it (link_libc). Linux-gnu: rustc links libgcc_s for
+            // its staticlibs' _Unwind_* — mirror it here.
+            if (target.result.os.tag == .linux) {
+                tests_root_mod.linkSystemLibrary("gcc_s", .{});
+            }
+        }
+
         const run_tests = b.addRunArtifact(tests);
         test_step.dependOn(&run_tests.step);
     }
@@ -394,6 +438,19 @@ fn configureLanguage(
                 .file = b.path("src/ts/abi_check.c"),
                 .flags = &quickjs_flags,
             });
+        },
+        .rust => {
+            // Native-compiled (labelle-engine#741): NOTHING is vendored or
+            // compiled into the module — src/rust/vm.zig is pure Zig
+            // declaring the crate glue's labelle_rs_* externs. The
+            // staticlib that defines them (native/'s crate, carrying the
+            // GAME's rust/ sources as its `game` module) is built by
+            // cargo OUTSIDE this module and linked onto the final binary:
+            // in consumer games by the assembler's declared build step
+            // (plugin.labelle `.language_builds`), in this repo's own
+            // suite by the test-loop wiring below. Keeping cargo out of
+            // the module means a consumer's `b.dependency` never shells
+            // out — external builds stay declared, auditable steps.
         },
     }
 }
