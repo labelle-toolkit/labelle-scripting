@@ -47,7 +47,7 @@ jobs:
       # "no embeddable-source integration" and embed nothing (the first
       # registerScript grep below fails loudly). Bump deliberately,
       # never float.
-      ASSEMBLER_VERSION: v0.82.0
+      ASSEMBLER_VERSION: v0.83.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/ruby-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
