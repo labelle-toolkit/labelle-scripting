@@ -225,7 +225,15 @@ pub extern "C" fn labelle_rs_dispatch_inbox() {
             let mut buf = std::mem::take(&mut reg.inbox_buf);
             while labelle::poll_into(&mut buf) {
                 // Entries are "<name> <json>"; an entry is never empty.
-                let text = std::str::from_utf8(&buf).unwrap_or("");
+                let text = match std::str::from_utf8(&buf) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        // Never drop silently: name the problem, skip the
+                        // entry, keep draining.
+                        labelle::log("rust: non-UTF8 event entry skipped");
+                        continue;
+                    }
+                };
                 let (name, payload) = match text.split_once(' ') {
                     Some(pair) => pair,
                     None => (text, ""),

@@ -173,6 +173,19 @@ impl Scripts {
 // ── Safe wrappers ────────────────────────────────────────────────────────
 
 /// Create an empty entity. Returns 0 when the host is not bound.
+/// FFI-safe out-pointer for a Vec-backed buffer: an EMPTY Vec's
+/// `as_mut_ptr()` is a non-null DANGLING pointer (alignment sentinel,
+/// never allocated) — the contract's probe legs are specified as
+/// NULL/cap-0, so hand the host a real NULL rather than a dangling value
+/// it must promise never to touch.
+fn ffi_out_ptr(v: &mut Vec<u8>) -> *mut u8 {
+    if v.capacity() == 0 {
+        std::ptr::null_mut()
+    } else {
+        v.as_mut_ptr()
+    }
+}
+
 pub fn create_entity() -> EntityId {
     unsafe { labelle_entity_create() }
 }
@@ -217,7 +230,7 @@ pub fn get_component_into(id: EntityId, name: &str, out: &mut Vec<u8>) -> bool {
             id,
             name.as_ptr(),
             name.len(),
-            out.as_mut_ptr(),
+            ffi_out_ptr(out),
             out.capacity(),
         );
         if required == 0 {
@@ -233,7 +246,7 @@ pub fn get_component_into(id: EntityId, name: &str, out: &mut Vec<u8>) -> bool {
             id,
             name.as_ptr(),
             name.len(),
-            out.as_mut_ptr(),
+            ffi_out_ptr(out),
             out.capacity(),
         );
         if got == 0 || got > out.capacity() {
@@ -268,7 +281,7 @@ pub fn query_into(names_json: &str, ids: &mut Vec<EntityId>, scratch: &mut Vec<u
         let required = labelle_query(
             names_json.as_ptr(),
             names_json.len(),
-            scratch.as_mut_ptr(),
+            ffi_out_ptr(scratch),
             scratch.capacity(),
         );
         if required == 0 {
@@ -281,7 +294,7 @@ pub fn query_into(names_json: &str, ids: &mut Vec<EntityId>, scratch: &mut Vec<u
             let got = labelle_query(
                 names_json.as_ptr(),
                 names_json.len(),
-                scratch.as_mut_ptr(),
+                ffi_out_ptr(scratch),
                 scratch.capacity(),
             );
             if got == 0 {
@@ -350,7 +363,7 @@ pub fn poll_into(out: &mut Vec<u8>) -> bool {
         if next > out.capacity() {
             out.reserve(next);
         }
-        let written = labelle_event_poll(out.as_mut_ptr(), out.capacity());
+        let written = labelle_event_poll(ffi_out_ptr(out), out.capacity());
         if written == 0 || written > out.capacity() {
             return false;
         }
