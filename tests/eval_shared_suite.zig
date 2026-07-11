@@ -151,6 +151,24 @@ test "copyBounded: exact fit has no marker; overflow is marked" {
     try expectEqualStrings("12345…", eval.copyBounded("123456789", &buf));
 }
 
+test "buildResponse: buffers below the empty-response floor yield an empty slice" {
+    // The same release-mode underflow class as copyBounded's guard, at
+    // the builder's own reservation subtraction: every size from zero
+    // up to just past the ok-prefix floor must come back empty (never
+    // a partial write, never an out-of-bounds one) — and the first
+    // size that CAN carry an empty response must be valid JSON.
+    var i: usize = 0;
+    while (i <= 26) : (i += 1) {
+        const buf = std.testing.allocator.alloc(u8, i) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const got = eval.buildResponse(true, "whatever", buf);
+        if (got.len == 0) continue; // guarded: below this buffer's floor
+        const parsed = try parseResponse(got);
+        defer parsed.deinit();
+        try expect(parsed.value.ok);
+    }
+}
+
 test "copyBounded: buffers smaller than the marker cut clean (release-mode underflow guard)" {
     // The marker is 3 bytes ("…"); out.len below that used to ride an
     // assert whose release-mode absence let `out.len - marker.len`

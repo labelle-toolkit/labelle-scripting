@@ -135,14 +135,18 @@ pub const replacement_char = "\u{FFFD}";
 /// ATOMIC units (an escape sequence, one ASCII byte, one whole UTF-8
 /// sequence, or one replacement char), so when the budget runs out the
 /// cut lands between units, the truncation marker is appended, and the
-/// JSON is closed — structurally valid at any `buf.len` (≥ 32;
-/// asserted). Callers pass a response-cap-sized buffer so the engine
-/// channel never truncates after us (its mid-escape cut is exactly what
-/// this pre-bounding exists to avoid).
+/// JSON is closed — structurally valid at any buffer that fits an empty
+/// response. A buffer too small for even that yields an empty slice —
+/// the one shape that cannot masquerade as a response (a runtime guard,
+/// not an assert: pub fn, and in release builds an assert vanishes,
+/// letting the reservation subtraction below underflow into an
+/// out-of-bounds write). Callers pass a response-cap-sized buffer so
+/// the engine channel never truncates after us (its mid-escape cut is
+/// exactly what this pre-bounding exists to avoid).
 pub fn buildResponse(ok: bool, text: []const u8, buf: []u8) []const u8 {
     const prefix = if (ok) "{\"ok\":true,\"value\":\"" else "{\"ok\":false,\"error\":\"";
     const tail = "\"}";
-    std.debug.assert(buf.len >= prefix.len + truncation_marker.len + tail.len);
+    if (buf.len < prefix.len + truncation_marker.len + tail.len) return buf[0..0];
     // Reserve room for the worst-case tail: marker + closing quote/brace.
     const budget = buf.len - truncation_marker.len - tail.len;
 
