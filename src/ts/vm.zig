@@ -269,6 +269,19 @@ pub const c = struct {
     // Calls and C functions.
     pub extern fn JS_Call(ctx: ?*Context, func_obj: Value, this_obj: Value, argc: c_int, argv: ?[*]const Value) Value;
     pub extern fn JS_NewCFunction2(ctx: ?*Context, func: *const CFunction, name: [*:0]const u8, length: c_int, cproto: c_int, magic: c_int) Value;
+
+    // Promise plumbing. JSHostPromiseRejectionTracker — `promise` and
+    // `reason` are JSValueConst, which is plain by-value JSValue in this
+    // build (JS_CHECK_JSVALUE is a no-codegen debug mode we never set):
+    // BORROWED values, the callback must not free them.
+    pub const HostPromiseRejectionTracker = fn (
+        ctx: ?*Context,
+        promise: Value,
+        reason: Value,
+        is_handled: bool,
+        user_data: ?*anyopaque,
+    ) callconv(.c) void;
+    pub extern fn JS_SetHostPromiseRejectionTracker(rt: ?*Runtime, cb: ?*const HostPromiseRejectionTracker, user_data: ?*anyopaque) void;
 };
 
 /// Global name of the prelude-owned namespace registry:
@@ -308,6 +321,36 @@ fn logError(context: []const u8, text: []const u8) void {
     contract.labelle_log(line.ptr, line.len);
 }
 
+/// Host promise-rejection tracker, installed once per runtime at
+/// `Vm.init`. A handler that throws inside a promise reaction is caught
+/// by the promise MACHINERY (promise_reaction_job rejects the derived
+/// promise and returns clean), so `JS_ExecutePendingJob`'s rc<0 leg —
+/// drainJobs' "async job" log — never sees it; without this hook an
+/// unhandled rejection vanishes silently, which the error policy (and
+/// drainJobs' doc) forbids. Log-only, never aborts anything.
+///
+/// Fired at REJECTION time with `is_handled = false` when no reaction is
+/// attached yet; attaching one later re-invokes with `is_handled = true`
+/// (which we ignore — log-only means no retraction), so a
+/// reject-now-catch-later chain leaves one stale warning line: the
+/// standard trade-off for immediate logging without a pending-rejection
+/// ledger. `promise`/`reason` are borrowed (JSValueConst) — never freed
+/// here; `logErrorValue` only reads them.
+fn promiseRejectionTracker(
+    ctx_opt: ?*c.Context,
+    promise: c.Value,
+    reason: c.Value,
+    is_handled: bool,
+    user_data: ?*anyopaque,
+) callconv(.c) void {
+    _ = promise;
+    _ = user_data;
+    if (is_handled) return;
+    const ctx = ctx_opt orelse return;
+    const vm = Vm{ .rt = c.JS_GetRuntime(ctx) orelse return, .ctx = ctx };
+    vm.logErrorValue("unhandled promise rejection", reason);
+}
+
 /// One embedded QuickJS VM. Plain two-pointer value — the Controller owns
 /// exactly one per game process.
 pub const Vm = struct {
@@ -323,6 +366,9 @@ pub const Vm = struct {
             c.JS_FreeRuntime(rt);
             return error.JsStateInit;
         };
+        // Unhandled rejections must LOG, not vanish — see the tracker's
+        // doc for why drainJobs' rc<0 leg alone can never catch them.
+        c.JS_SetHostPromiseRejectionTracker(rt, &promiseRejectionTracker, null);
         return .{ .rt = rt, .ctx = ctx };
     }
 
@@ -339,6 +385,13 @@ pub const Vm = struct {
     /// VM entry, so a script using async/await for fire-and-forget work
     /// isn't silently frozen and rejections surface in the log instead of
     /// vanishing. Job errors never abort anything (update-hook policy).
+    ///
+    /// Two log paths cover the failure space: the rc<0 leg below is
+    /// job-MACHINERY errors only — a handler that throws is caught by
+    /// the promise machinery itself (the derived promise rejects,
+    /// ExecutePendingJob returns clean), so throw-in-reaction failures
+    /// reach the log via `promiseRejectionTracker` when nothing
+    /// downstream handles them.
     pub fn drainJobs(self: Vm) void {
         while (true) {
             var out_ctx: ?*c.Context = null;
@@ -710,15 +763,22 @@ pub const Vm = struct {
 
         const ret = c.JS_Eval(ctx, &console_src_buf, code.len, "console", c.EVAL_TYPE_GLOBAL);
         defer c.JS_FreeValue(ctx, ret);
-        self.drainJobs();
 
         if (ret.isException()) {
+            // Capture + render the SYNC exception BEFORE draining jobs: a
+            // microtask this same eval queued can itself fail, and the
+            // job path (drainJobs → logPendingException) takes whatever
+            // the context's single pending-exception slot holds — so
+            // draining first lets the job's error consume/replace the
+            // eval's and the response reports the wrong failure.
             const exc = c.JS_GetException(ctx); // owned; clears the slot
             defer c.JS_FreeValue(ctx, exc);
             var w = std.Io.Writer.fixed(out);
             self.writeErrorValue(&w, exc);
+            self.drainJobs(); // job failures keep their own log path
             return .{ .ok = false, .text = w.buffered() };
         }
+        self.drainJobs();
         return .{ .ok = true, .text = self.renderConsoleValue(ret, out) };
     }
 

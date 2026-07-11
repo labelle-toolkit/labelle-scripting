@@ -97,6 +97,42 @@ test "buildResponse: never splits a multi-byte codepoint at the cut" {
     }
 }
 
+test "buildResponse: invalid UTF-8 bytes become U+FFFD; valid sequences survive" {
+    var buf: [128]u8 = undefined;
+    // A lone 0xFF, a VALID 2-byte é that must pass through whole, a
+    // stray continuation byte, and a truncated 2-byte sequence at the
+    // very end — every invalid byte becomes one replacement char.
+    const got = eval.buildResponse(true, "a\xffb" ++ "é" ++ "\x80z\xc3", &buf);
+    // The WHOLE response is valid UTF-8 (JSON is UTF-8 by definition —
+    // this is what the studio's JSON.parse chokes on otherwise)...
+    try expect(std.unicode.utf8ValidateSlice(got));
+    // ...and round-trips with byte-exact replacement placement.
+    const parsed = try parseResponse(got);
+    defer parsed.deinit();
+    try expect(parsed.value.ok);
+    try expectEqualStrings(
+        "a" ++ eval.replacement_char ++ "bé" ++ eval.replacement_char ++ "z" ++ eval.replacement_char,
+        parsed.value.value,
+    );
+}
+
+test "buildResponse: replacement chars compose with truncation at any buffer size" {
+    // Alternating ASCII + invalid byte: whatever the cut position, the
+    // response must stay valid UTF-8 and valid JSON, marker included.
+    const text = "x\xff" ** 40;
+    var i: usize = 32;
+    while (i <= 56) : (i += 1) {
+        const buf = std.testing.allocator.alloc(u8, i) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const got = eval.buildResponse(true, text, buf);
+        try expect(std.unicode.utf8ValidateSlice(got));
+        const parsed = try parseResponse(got);
+        defer parsed.deinit();
+        try expect(parsed.value.ok);
+        try expect(std.mem.endsWith(u8, parsed.value.value, eval.truncation_marker));
+    }
+}
+
 // ── truncation helpers ───────────────────────────────────────────────
 
 test "utf8SafeLen: keeps a sequence that ends exactly at the limit" {
@@ -173,6 +209,71 @@ test "handleEvalCommand: responds ok:false on malformed params" {
     defer parsed.deinit();
     try expect(!parsed.value.ok);
     try expect(std.mem.indexOf(u8, parsed.value.@"error", "invalid eval params") != null);
+}
+
+// ── packaging consistency ────────────────────────────────────────────
+
+test "packaging: build.zig.zon ships every directory plugin.labelle references" {
+    // A bundled pack (or a ship_from_plugin convention dir) is resolved
+    // by the assembler from the CONSUMER's fetched copy of this package —
+    // if build.zig.zon's `.paths` whitelist doesn't ship the directory,
+    // the manifest points at content the tarball doesn't have and the
+    // console hook silently never wires. Parse both files (embedded via
+    // build.zig anonymous imports) and cross-check.
+    const gpa = std.testing.allocator;
+
+    const PluginManifest = struct {
+        packs: []const []const u8 = &.{},
+        convention_dirs: []const struct {
+            name: []const u8,
+            extension: ?[]const u8 = null,
+            mode: enum { copy_and_scan, copy_only, ship_from_plugin } = .copy_and_scan,
+        } = &.{},
+    };
+    const plugin_src: [:0]const u8 = @embedFile("plugin_labelle_src");
+    const pm = try std.zon.parse.fromSliceAlloc(
+        PluginManifest,
+        gpa,
+        plugin_src,
+        null,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer std.zon.parse.free(gpa, pm);
+
+    const BuildZon = struct { paths: []const []const u8 = &.{} };
+    const zon_src: [:0]const u8 = @embedFile("build_zig_zon_src");
+    const bz = try std.zon.parse.fromSliceAlloc(
+        BuildZon,
+        gpa,
+        zon_src,
+        null,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer std.zon.parse.free(gpa, bz);
+
+    const ships = struct {
+        fn dir(paths: []const []const u8, name: []const u8) bool {
+            for (paths) |p| {
+                if (std.mem.eql(u8, p, name)) return true;
+            }
+            return false;
+        }
+    }.dir;
+
+    // Every bundled pack lives under packs/ — referencing ANY requires
+    // shipping the directory.
+    if (pm.packs.len > 0) try expect(ships(bz.paths, "packs"));
+    // ship_from_plugin convention dirs are read from THIS package too;
+    // game-sourced modes (copy_and_scan/copy_only) read the game tree
+    // and need no shipping.
+    for (pm.convention_dirs) |cd| {
+        if (cd.mode == .ship_from_plugin) try expect(ships(bz.paths, cd.name));
+    }
+
+    // And the manifest DOES reference the console pack today — keeps the
+    // cross-check meaningful (deleting `.packs` should revisit this test).
+    try expectEqual(@as(usize, 1), pm.packs.len);
+    try expectEqualStrings("scripting_console", pm.packs[0]);
 }
 
 // ── pack hook shim: source-level verification ────────────────────────

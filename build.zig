@@ -270,6 +270,17 @@ pub fn build(b: *std.Build) void {
         tests_root_mod.addAnonymousImport("console_eval_shim_src", .{
             .root_source_file = b.path("packs/scripting_console/hooks/console_eval.zig"),
         });
+        // Both manifests, for the shared suite's packaging-consistency pin:
+        // every unit plugin.labelle references (bundled packs, convention
+        // dirs) must be covered by build.zig.zon's `.paths` whitelist — a
+        // referenced-but-unshipped directory would hand consumers a
+        // manifest pointing at content their fetched copy doesn't have.
+        tests_root_mod.addAnonymousImport("plugin_labelle_src", .{
+            .root_source_file = b.path("plugin.labelle"),
+        });
+        tests_root_mod.addAnonymousImport("build_zig_zon_src", .{
+            .root_source_file = b.path("build.zig.zon"),
+        });
         const tests = b.addTest(.{
             .root_module = tests_root_mod,
         });

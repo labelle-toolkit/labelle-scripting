@@ -113,17 +113,32 @@ pub fn extractCode(params_json: []const u8, scratch: []u8) ?[]const u8 {
     return code;
 }
 
+/// U+FFFD REPLACEMENT CHARACTER — what `buildResponse` substitutes for
+/// every byte that is not part of a valid UTF-8 sequence. Language VMs
+/// hand back arbitrary byte strings (lua `string.char(255)`), and JSON
+/// is UTF-8 by definition: passing such bytes through raw would make the
+/// whole response unparseable on the studio side even though the eval
+/// SUCCEEDED.
+pub const replacement_char = "\u{FFFD}";
+
 /// Build the console response JSON into `buf`:
 ///   `{"ok":true,"value":"<escaped text>"}` /
 ///   `{"ok":false,"error":"<escaped text>"}`.
 ///
-/// Bounded at `buf.len` with escape-safe truncation: when the escaped
-/// text would overflow, it is cut at a whole escape sequence / whole
-/// UTF-8 codepoint, the truncation marker is appended, and the JSON is
-/// closed — the result is ALWAYS structurally valid, whatever `buf.len`
-/// (≥ 32; asserted). Callers pass a response-cap-sized buffer so the
-/// engine channel never truncates after us (its mid-escape cut is
-/// exactly what this pre-bounding exists to avoid).
+/// The emitted string body is ALWAYS valid UTF-8 JSON, whatever bytes
+/// `text` carries: control bytes and JSON metacharacters are escaped,
+/// valid multi-byte sequences pass through whole, and every invalid
+/// byte (stray continuation, bad lead, overlong/surrogate encoding,
+/// truncated tail) becomes one `replacement_char`.
+///
+/// Bounded at `buf.len` with unit-safe truncation: the escaper emits
+/// ATOMIC units (an escape sequence, one ASCII byte, one whole UTF-8
+/// sequence, or one replacement char), so when the budget runs out the
+/// cut lands between units, the truncation marker is appended, and the
+/// JSON is closed — structurally valid at any `buf.len` (≥ 32;
+/// asserted). Callers pass a response-cap-sized buffer so the engine
+/// channel never truncates after us (its mid-escape cut is exactly what
+/// this pre-bounding exists to avoid).
 pub fn buildResponse(ok: bool, text: []const u8, buf: []u8) []const u8 {
     const prefix = if (ok) "{\"ok\":true,\"value\":\"" else "{\"ok\":false,\"error\":\"";
     const tail = "\"}";
@@ -135,13 +150,17 @@ pub fn buildResponse(ok: bool, text: []const u8, buf: []u8) []const u8 {
     var w: usize = prefix.len;
     var truncated = false;
 
+    // Outlives the switch below (the `\u00XX` arm formats into it and
+    // the emit reads it after the arm ends).
+    var ubuf: [6]u8 = undefined;
+
     var i: usize = 0;
     while (i < text.len) {
         const b = text[i];
-        // One escaped unit: either a 1-6 byte escape for this single
-        // byte, or the raw byte itself. Multi-byte UTF-8 is emitted raw
-        // byte-by-byte; the safe-cut below repairs any split.
-        const esc: []const u8 = switch (b) {
+        // How many input bytes this unit consumes (all arms take 1
+        // except a whole valid multi-byte sequence).
+        var step: usize = 1;
+        const unit: []const u8 = switch (b) {
             '"' => "\\\"",
             '\\' => "\\\\",
             '\n' => "\\n",
@@ -151,38 +170,36 @@ pub fn buildResponse(ok: bool, text: []const u8, buf: []u8) []const u8 {
             0x0C => "\\f",
             else => blk: {
                 if (b < 0x20) {
-                    var ubuf: [6]u8 = undefined;
-                    const u = std.fmt.bufPrint(&ubuf, "\\u{x:0>4}", .{b}) catch unreachable;
-                    break :blk u;
+                    break :blk std.fmt.bufPrint(&ubuf, "\\u{x:0>4}", .{b}) catch unreachable;
                 }
-                break :blk text[i .. i + 1];
+                if (b < 0x80) break :blk text[i .. i + 1];
+                // Multi-byte lead (or a stray byte pretending to be one):
+                // pass the sequence through WHOLE iff it decodes as valid
+                // UTF-8; anything else — bad lead, truncated tail,
+                // overlong/surrogate encoding, stray continuation — is
+                // replaced one byte at a time (each invalid byte = one
+                // replacement char, the conventional policy).
+                const seq_len = std.unicode.utf8ByteSequenceLength(b) catch
+                    break :blk replacement_char;
+                if (i + seq_len > text.len) break :blk replacement_char;
+                _ = std.unicode.utf8Decode(text[i..][0..seq_len]) catch
+                    break :blk replacement_char;
+                step = seq_len;
+                break :blk text[i..][0..seq_len];
             },
         };
-        if (w + esc.len > budget) {
+        if (w + unit.len > budget) {
             truncated = true;
             break;
         }
-        @memcpy(buf[w..][0..esc.len], esc);
-        w += esc.len;
-        i += 1;
+        @memcpy(buf[w..][0..unit.len], unit);
+        w += unit.len;
+        i += step;
     }
 
     if (truncated) {
-        // The budget edge may have fallen inside a raw multi-byte UTF-8
-        // sequence: text[i] is the first byte NOT emitted — when it is a
-        // continuation byte, the sequence's head (lead + earlier
-        // continuations, all raw-emitted single bytes, so input and
-        // output walked in lockstep) is already in `buf` and must come
-        // back out. Escapes are emitted atomically above, so this strip
-        // can never eat into one.
-        if (text[i] & 0xC0 == 0x80) {
-            var back: usize = 0;
-            while (i > 0 and w > prefix.len and back < 4) : (back += 1) {
-                i -= 1;
-                w -= 1;
-                if (text[i] & 0xC0 != 0x80) break; // dropped the lead too
-            }
-        }
+        // Units are atomic (see above), so the cut cannot have split an
+        // escape or a UTF-8 sequence — the marker composes directly.
         @memcpy(buf[w..][0..truncation_marker.len], truncation_marker);
         w += truncation_marker.len;
     }

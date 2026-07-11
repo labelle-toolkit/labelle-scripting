@@ -726,3 +726,45 @@ test "hot loop: 1k entities of get-into + FrameArray hold steady-state memory fl
     try expectComponent(2, "Hot", "{\"count\":110,\"level\":972.5}");
     try expectComponent(1001, "Hot", "{\"count\":110,\"level\":972.5}");
 }
+
+test "console eval: invalid UTF-8 result bytes become replacement chars in valid response JSON" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // lua strings are arbitrary bytes; JSON is UTF-8 by definition — a
+    // raw 0xFF passed through would make the WHOLE response unparseable
+    // on the studio side even though the eval succeeded.
+    var buf: [scripting.eval.max_response_len]u8 = undefined;
+    const response = scripting.handleEvalCommand(
+        "{\"code\":\"return string.char(255)\"}",
+        &buf,
+    );
+    try expect(std.unicode.utf8ValidateSlice(response));
+    const parsed = try std.json.parseFromSlice(
+        struct { ok: bool, value: []const u8 },
+        std.testing.allocator,
+        response,
+        .{},
+    );
+    defer parsed.deinit();
+    try expect(parsed.value.ok);
+    try expectEqualStrings(scripting.eval.replacement_char, parsed.value.value);
+
+    // Mixed: the VALID multi-byte é passes through whole — only the raw
+    // invalid byte is replaced.
+    const mixed = scripting.handleEvalCommand(
+        "{\"code\":\"return \\\"é\\\" .. string.char(255) .. \\\"z\\\"\"}",
+        &buf,
+    );
+    try expect(std.unicode.utf8ValidateSlice(mixed));
+    const p2 = try std.json.parseFromSlice(
+        struct { ok: bool, value: []const u8 },
+        std.testing.allocator,
+        mixed,
+        .{},
+    );
+    defer p2.deinit();
+    try expect(p2.value.ok);
+    try expectEqualStrings("é" ++ scripting.eval.replacement_char ++ "z", p2.value.value);
+}

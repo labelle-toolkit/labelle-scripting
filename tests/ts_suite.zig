@@ -744,3 +744,61 @@ test "console eval during ticking leaves registered scripts undisturbed" {
     // tick nor disturbed the script registry.
     try expectComponent(1, "Counter", "{\"dt\":0.125,\"n\":2}");
 }
+
+test "console eval: a failing microtask never masks the sync eval error" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // The eval queues a microtask that ITSELF throws, then throws
+    // synchronously. The context has ONE pending-exception slot: the
+    // response must carry the SYNC error (captured before the job
+    // drain), while the job's failure surfaces through the log — the
+    // handler throw is caught by the promise machinery (the derived
+    // promise rejects; ExecutePendingJob returns clean), so it reaches
+    // the log via the unhandled-rejection tracker, not the rc<0 leg.
+    const r = scripting.Controller.evalCommand(
+        "Promise.resolve().then(() => { throw new Error(\"job boom\") }); throw new Error(\"eval boom\")",
+    );
+    try expect(!r.ok);
+    try expect(std.mem.indexOf(u8, r.text, "eval boom") != null);
+    try expect(std.mem.indexOf(u8, r.text, "job boom") == null);
+    try expect(mock.logsContain("unhandled promise rejection"));
+    try expect(mock.logsContain("job boom"));
+
+    // Jobs-only (no sync throw): result unaffected, rejection logged —
+    // the drain still runs on the success path exactly as before.
+    const ok_case = scripting.Controller.evalCommand(
+        "Promise.resolve().then(() => { throw new Error(\"job2 boom\") }); 42",
+    );
+    try expect(ok_case.ok);
+    try expectEqualStrings("42", ok_case.text);
+    try expect(mock.logsContain("job2 boom"));
+}
+
+test "console eval: lone surrogates render into valid UTF-8 response JSON" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // JS strings are UTF-16 and can hold unpaired surrogates; whatever
+    // byte shape ToCString picks for one (U+FFFD directly, or CESU-8
+    // surrogate bytes the response builder then replaces), the response
+    // must stay valid UTF-8 JSON. Soft-pin the bookends only.
+    var buf: [scripting.eval.max_response_len]u8 = undefined;
+    const response = scripting.handleEvalCommand(
+        "{\"code\":\"\\\"a\\\" + String.fromCharCode(0xD800) + \\\"z\\\"\"}",
+        &buf,
+    );
+    try expect(std.unicode.utf8ValidateSlice(response));
+    const parsed = try std.json.parseFromSlice(
+        struct { ok: bool, value: []const u8 },
+        std.testing.allocator,
+        response,
+        .{},
+    );
+    defer parsed.deinit();
+    try expect(parsed.value.ok);
+    try expect(std.mem.startsWith(u8, parsed.value.value, "a"));
+    try expect(std.mem.endsWith(u8, parsed.value.value, "z"));
+}

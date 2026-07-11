@@ -949,3 +949,18 @@ test "console eval during ticking leaves registered scripts undisturbed" {
     // tick nor disturbed the script registry.
     try expectComponent(1, "Counter", "{\"dt\":0.125,\"n\":2}");
 }
+
+test "console eval: mruby inspect hex-escapes invalid bytes (already JSON-safe)" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // The ruby render path is `#inspect`, and mruby's String#inspect
+    // hex-escapes non-UTF-8 bytes — so invalid bytes never reach the
+    // response builder raw from here (the builder's U+FFFD replacement
+    // is pinned language-independently in the shared suite and by the
+    // lua suite, whose tostring DOES pass raw bytes).
+    const r = scripting.Controller.evalCommand("255.chr");
+    try expect(r.ok);
+    try expectEqualStrings("\"\\xff\"", r.text);
+}
