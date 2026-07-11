@@ -177,8 +177,12 @@ jobs:
           set +e
           ERR=$(zig build 2>&1)
           set -e
-          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
-          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          # `|| true`: with pipefail on, a NO-MATCH grep would otherwise
+          # exit 1 and set -e kills the step silently — and the happy path
+          # (first build succeeds, ERR empty, nothing to fix) is real: this
+          # example's fingerprint has never actually needed the dance.
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
           if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
             echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
             sed -i "s/${BAD}/${GOOD}/" build.zig.zon
