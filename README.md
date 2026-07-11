@@ -437,7 +437,14 @@ build.zig's own test wiring demonstrates). Needs a rust toolchain
 ## Using the crystal sub-module
 
 Build with `-Dlanguage=crystal` — the second **native-compiled**
-sub-module (labelle-engine#741), on rust's exact skeleton. Your game's
+sub-module (labelle-engine#741), on rust's exact skeleton. One v1
+scope rule first: game scripts should stick to crystal's core stdlib
+(`Regex` included — pcre2 ships in the declared system libs). The
+OPTIONAL stdlib native deps (OpenSSL, YAML, Compress/zlib, …) need
+system libraries the plugin's fixed manifest list cannot predict —
+using them fails at final link with unresolved symbols naming the
+library; generate-time capture of crystal's printed link line is the
+planned follow-up. Your game's
 `crystal/` dir is compiled by `crystal build --cross-compile` together
 with the sources this plugin ships (`native-crystal/` — the `Labelle`
 module and the entry-point glue) as its `Game` module; because crystal

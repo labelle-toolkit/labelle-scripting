@@ -105,8 +105,21 @@
                 .{
                     .name = "crystal-scripts",
                     // No .artifact: intermediate step — the object it
-                    // emits still carries crystal's `main`.
-                    .command = .{ "crystal", "build", "--cross-compile", "--target", "{crystal_target}", "{package}/native-crystal/src/main.cr", "-o", "{cache}/labelle_crystal_scripts" },
+                    // emits still carries crystal's `main`. --release for
+                    // consumer builds (cargo parity: crystal's default is
+                    // "not fully optimized"; the repo's own tests build
+                    // debug for compile speed, consumers get release).
+                    //
+                    // v1 LIMITATION (documented, not solved here): game
+                    // scripts using OPTIONAL stdlib native deps (OpenSSL,
+                    // YAML, Compress/zlib …) need system libs this fixed
+                    // list cannot predict — such games fail at final link
+                    // with unresolved symbols naming the lib. The follow-up
+                    // is generate-time capture of crystal's printed link
+                    // line (the assembler-row spec's {crystal_env:…} class
+                    // of mechanism); until then, scripts stick to the core
+                    // set (Regex included — pcre2 ships below).
+                    .command = .{ "crystal", "build", "--release", "--cross-compile", "--target", "{crystal_target}", "{package}/native-crystal/src/main.cr", "-o", "{cache}/labelle_crystal_scripts" },
                     .platforms = .{"desktop"},
                 },
                 .{
