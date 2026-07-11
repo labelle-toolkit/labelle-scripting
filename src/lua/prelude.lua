@@ -27,6 +27,15 @@
 -- json.decode tags every array it produces, so get→set round-trips keep
 -- arrayness without re-tagging.
 --
+-- Component-ref rule (RFC-LANGUAGE-PLUGINS revs 6-7, "one DSL, two
+-- consumers"): `local Hunger = labelle.component("Hunger", { level = 1.0 })`
+-- is a SCHEMA DECLARATION at build time (the labelle-declare runner
+-- extracts it and the assembler codegens a real Zig component) and, at
+-- runtime, evaluates to a lightweight REF — a table carrying the name —
+-- accepted anywhere a component-name string is (Entity get/set/has/remove,
+-- game.query). The runtime call declares NOTHING; the component already
+-- exists in the game's registry because the build saw the same line.
+--
 -- Handler ownership: labelle.on records WHICH script registered each
 -- handler by reading __labelle_current_script — the global vm.zig stamps
 -- around every VM→script entry (chunk body, init/update/deinit), the
@@ -290,9 +299,30 @@ function json.decode(s)
   return v
 end
 
+-- ── component refs ───────────────────────────────────────────────────────
+-- A ref is `{ __labelle_component = "<Name>" }` — what labelle.component
+-- returns in BOTH modes (see the header's component-ref rule; the declare
+-- runner's stub returns the same shape so chunk-scope `local H =
+-- labelle.component(...)` behaves identically). `component_name`
+-- normalizes ref-or-string at every site that accepts a component name.
+
+local function component_name(name)
+  if type(name) == "table" then
+    local ref = name.__labelle_component
+    if type(ref) ~= "string" then
+      -- Level 3: component_name(1) → the Entity method / query (2) → the
+      -- script's call site (3).
+      error("labelle: expected a component name or labelle.component ref", 3)
+    end
+    return ref
+  end
+  return name
+end
+
 -- ── Entity ───────────────────────────────────────────────────────────────
 -- Thin id wrapper: components in and out as plain Lua tables, the JSON leg
--- hidden. `e.id` stays public — events and raw calls speak ids.
+-- hidden. `e.id` stays public — events and raw calls speak ids. Component
+-- name parameters accept a string or a labelle.component ref.
 
 local Entity = {}
 Entity.__index = Entity
@@ -311,7 +341,7 @@ end
 
 --- Component as a table, or nil when absent (unknown name / dead entity).
 function Entity:get(name)
-  local s = labelle.raw_component_get(self.id, name)
+  local s = labelle.raw_component_get(self.id, component_name(name))
   if s == "" then return nil end
   return json.decode(s)
 end
@@ -320,15 +350,15 @@ end
 --- defaults". Returns true on success.
 function Entity:set(name, tbl)
   local payload = tbl == nil and "" or json.encode(tbl)
-  return labelle.raw_component_set(self.id, name, payload) == 0
+  return labelle.raw_component_set(self.id, component_name(name), payload) == 0
 end
 
 function Entity:has(name)
-  return labelle.raw_component_has(self.id, name)
+  return labelle.raw_component_has(self.id, component_name(name))
 end
 
 function Entity:remove(name)
-  return labelle.raw_component_remove(self.id, name) == 0
+  return labelle.raw_component_remove(self.id, component_name(name)) == 0
 end
 
 function Entity:destroy()
@@ -366,14 +396,15 @@ local function decode_id_array(s)
   return ids
 end
 
---- Iterate entities carrying ALL the named components:
----   for e in game.query("CloudDrift", "Position") do ... end
+--- Iterate entities carrying ALL the named components (strings or
+--- labelle.component refs, freely mixed):
+---   for e in game.query("CloudDrift", Position) do ... end
 --- Yields Entity wrappers over the contract's id-JSON snapshot, so spawning
 --- or destroying entities inside the loop is safe.
 function game.query(...)
   local names = {}
   for i = 1, select("#", ...) do
-    names[i] = (select(i, ...))
+    names[i] = component_name((select(i, ...)))
   end
   local out = labelle.raw_query(json.encode(names))
   local ids = out ~= "" and decode_id_array(out) or {}
@@ -422,6 +453,33 @@ end
 ---   e:set("Path", { waypoints = labelle.array({}) })
 function labelle.array(t)
   return setmetatable(t or {}, ARRAY_MT)
+end
+
+--- Declare a component — at BUILD time (the labelle-declare runner
+--- extracts `name` + the spec's inferred field schema and the assembler
+--- generates a real registry component from it). At RUNTIME — here — the
+--- same call is pure sugar: it validates nothing, declares nothing, and
+--- returns a lightweight ref usable anywhere a component-name string is:
+---
+---   local Hunger = labelle.component("Hunger", { level = 1.0 })
+---   function update(dt)
+---     for e in game.query(Hunger) do
+---       local h = e:get(Hunger)
+---       h.level = h.level - dt * 0.01
+---       e:set(Hunger, h)
+---     end
+---   end
+---
+--- One DSL, two consumers (RFC-LANGUAGE-PLUGINS): the spec/opts tables are
+--- the build-time contract and are deliberately ignored here — the
+--- generated component (fields, defaults, persist policy) already lives in
+--- the game's registry by the time this line runs.
+function labelle.component(name, spec, opts)
+  if type(name) ~= "string" or name == "" then
+    error("labelle.component: expected a non-empty component name string", 2)
+  end
+  local _, _ = spec, opts -- build-time contract; unused at runtime
+  return { __labelle_component = name }
 end
 
 --- Log through the game's sink (stringifies for convenience).
