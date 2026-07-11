@@ -538,3 +538,18 @@ test "registerScript replaces sources by name" {
     try expectComponent(1, "V", "{\"v\":2}");
     try expectEqual(@as(usize, 1), mock.aliveCount());
 }
+
+test "labelle.component refs address components through every name-taking seam" {
+    fresh();
+    scripting.registerScript("component_ref", @embedFile("lua/component_ref.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // The script's own asserts police ref/string equivalence, query-by-ref
+    // and the non-ref-table rejection (any failure evicts it and RefOk
+    // never lands); the Zig side pins that the ref writes reached the SAME
+    // "Hunger"/"Tag" names a string write would (Tag was removed via ref).
+    try expectComponent(1, "Hunger", "{\"level\":0.5,\"starving\":false}");
+    try expect(mock.componentJson(1, "Tag") == null);
+    try expectComponent(1, "RefOk", "{\"ok\":true}");
+}

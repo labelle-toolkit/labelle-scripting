@@ -5,14 +5,15 @@
 //! than N sibling packages because every language binds the same Script
 //! Runtime Contract and exposes the same Controller — one module name
 //! (`labelle_scripting`), one plugin entry in project.labelle, N
-//! interchangeable VMs behind it. Unchosen languages must cost nothing:
-//! lua's vendored runtime is a `.lazy = true` dependency resolved through
-//! `b.lazyDependency` (never even downloaded unless selected), while
-//! ruby's vendored mruby output lives in-repo under vendor/mruby/ and is
-//! only COMPILED when selected — fetch-laziness is lost there (mruby has
-//! no amalgamation and its upstream build needs host ruby+rake, which
+//! interchangeable VMs behind it. Unchosen languages must not be
+//! COMPILED: lua's vendored runtime rides a `.lazy = true` dependency,
+//! ruby's vendored mruby output lives in-repo under vendor/mruby/ (mruby
+//! has no amalgamation and its upstream build needs host ruby+rake, which
 //! consumers must never need; see vendor/mruby's provenance note in the
-//! README), build-laziness is kept.
+//! README). Lua IS always fetched, whatever the language: the
+//! declare-mode extractor (tools/declare, `zig build labelle-declare`,
+//! labelle-assembler#585) is itself lua-based and ships with every
+//! install of the plugin.
 
 const std = @import("std");
 
@@ -155,6 +156,14 @@ pub fn build(b: *std.Build) void {
         "Scripting language sub-module to embed (default: lua)",
     ) orelse .lua;
 
+    // The vendored Lua 5.4 sources serve TWO consumers: the lua language
+    // sub-module (when selected) and the declare-mode extractor below
+    // (ALWAYS — it IS the lua declare runner, whatever language the game
+    // scripts in). So the lazy fetch lives here, not under the language
+    // gate: lua is fetched for every install; unselected it merely isn't
+    // COMPILED into the plugin module.
+    const lua_dep_opt = b.lazyDependency("lua", .{});
+
     // The plugin module. The assembler requests plugin modules by the
     // convention name `labelle_<pluginname>`; plugin.labelle says
     // `.name = "scripting"`, so `labelle_scripting` is both the package
@@ -168,7 +177,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    configureLanguage(b, scripting_mod, language);
+    configureLanguage(b, scripting_mod, language, lua_dep_opt);
+
+    // The extractor CORE as a named module for the tests below: tests/ is
+    // its own module root, so tools/declare/extract.zig can't be reached by
+    // path import from there (cross-root path imports don't resolve) — the
+    // named module is the standard promotion. No C sources attached HERE on
+    // purpose: within the lua test binary the lua objects already come from
+    // the language module (extract.zig only declares externs, which unify
+    // by symbol name), so attaching them again would duplicate every lua
+    // symbol at link time.
+    const declare_core_mod = b.createModule(.{
+        .root_source_file = b.path("tools/declare/extract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // Tests: the contract symbols are `extern` in src/contract.zig and the
     // test root provides them (tests/mock_world.zig `export`s a toy world),
@@ -180,6 +203,11 @@ pub fn build(b: *std.Build) void {
     // shared glue cannot silently break the languages it wasn't built
     // against. (The exported module above stays single-language; only the
     // repo's own tests pay for building all VMs.)
+    //
+    // `declare_core` is wired into every binary but the test root only
+    // ANALYZES it under `.lua` (comptime gate) — its lua_* externs can
+    // resolve only where the language module compiled lua in; module
+    // analysis is lazy, so the ruby binary never touches it.
     const test_step = b.step("test", "Run all language suites against the mock host world");
     inline for (@typeInfo(Language).@"enum".fields) |field| {
         const lang: Language = @enumFromInt(field.value);
@@ -189,7 +217,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
-        configureLanguage(b, lang_mod, lang);
+        configureLanguage(b, lang_mod, lang, lua_dep_opt);
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tests/root.zig"),
@@ -198,25 +226,67 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
                 .imports = &.{
                     .{ .name = "labelle_scripting", .module = lang_mod },
+                    .{ .name = "declare_core", .module = declare_core_mod },
                 },
             }),
         });
         const run_tests = b.addRunArtifact(tests);
         test_step.dependOn(&run_tests.step);
     }
+
+    // ── labelle-declare: the declare-mode schema extractor ──────────────
+    // (RFC-LANGUAGE-PLUGINS revs 6-7, labelle-engine#237.) A tiny host exe
+    // the assembler builds + runs at GENERATE time (`zig build
+    // labelle-declare`, labelle-assembler#585): it loads each game script's
+    // chunk body against a stub `labelle` and prints the declared-component
+    // schema JSON on stdout. Deliberately host-targeted and Debug-pinned —
+    // it never ships in a game, whatever -Dtarget/-Doptimize the consuming
+    // game build passes — and built regardless of -Dlanguage since it
+    // embeds lua directly (its OWN copy of the C sources: the exe is a
+    // separate compilation, nothing is compiled twice into one binary).
+    // Reached only through its named step, so plain `zig build` / consumer
+    // dependency wiring never pays for it.
+    if (lua_dep_opt) |lua_dep| {
+        const declare_mod = b.createModule(.{
+            .root_source_file = b.path("tools/declare/main.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        });
+        declare_mod.addIncludePath(lua_dep.path("src"));
+        declare_mod.addCSourceFiles(.{
+            .root = lua_dep.path("src"),
+            .files = &lua_sources,
+        });
+        const declare_exe = b.addExecutable(.{
+            .name = "labelle-declare",
+            .root_module = declare_mod,
+        });
+        const declare_step = b.step(
+            "labelle-declare",
+            "Build the declare-mode schema extractor (zig-out/bin/labelle-declare)",
+        );
+        declare_step.dependOn(&b.addInstallArtifact(declare_exe, .{}).step);
+    }
 }
 
 /// Wire `mod` for one language: the `scripting_options` module feeding
 /// src/root.zig's comptime backend switch, plus the language's vendored
-/// runtime sources. Unselected runtimes are neither fetched (lua, lazy
-/// dependency) nor compiled (ruby, in-repo vendor).
-fn configureLanguage(b: *std.Build, mod: *std.Build.Module, language: Language) void {
+/// runtime sources. Unselected runtimes are not compiled into the module
+/// (the lua FETCH is unconditional — see build(), the declare extractor
+/// needs it — but its objects only enter the module here).
+fn configureLanguage(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    language: Language,
+    lua_dep_opt: ?*std.Build.Dependency,
+) void {
     const opts = b.addOptions();
     opts.addOption(Language, "language", language);
     mod.addOptions("scripting_options", opts);
 
     switch (language) {
-        .lua => if (b.lazyDependency("lua", .{})) |lua_dep| {
+        .lua => if (lua_dep_opt) |lua_dep| {
             // Vendored Lua 5.4, compiled straight into the module: every
             // .c in the official release tarball except the two standalone
             // mains (lua.c interpreter, luac.c compiler). The explicit list

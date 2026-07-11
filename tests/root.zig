@@ -31,3 +31,12 @@ test {
         .ruby => @import("ruby_suite.zig"),
     };
 }
+
+// The declare-mode extractor goldens (tools/declare via the `declare_core`
+// named module) ride the LUA test binary only: extract.zig's lua_* externs
+// resolve against the lua objects the lua-language module compiled in —
+// the ruby binary carries mruby, no lua symbols. The comptime gate keeps
+// the module unanalyzed (and so unlinked) everywhere else.
+comptime {
+    if (scripting.language == .lua) _ = @import("declare_tool.zig");
+}
