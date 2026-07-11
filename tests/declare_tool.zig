@@ -235,8 +235,7 @@ test "float defaults must fit f32: finite-but-huge fails alongside NaN/inf; the 
     );
     // 3.4e38 sits just under f32 max (3.4028235e38): still a legal
     // default, and %.14g keeps it exact.
-    try expectSchema(
-        &.{.{ .path = "edge.lua", .source = "labelle.component(\"Edge\", { v = 3.4e38 })" }},
+    try expectSchema(&.{.{ .path = "edge.lua", .source = "labelle.component(\"Edge\", { v = 3.4e38 })" }},
         \\{"components":[{"name":"Edge","persist":"persistent","fields":[{"name":"v","type":"f32","default":3.4e+38}]}]}
     );
     // vec2 axes ride the same range check.
