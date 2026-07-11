@@ -25,7 +25,9 @@ const std = @import("std");
 const HungerFeed = @import("../events/hunger__feed.zig").HungerFeed;
 
 pub const FeedWatcher = struct {
-    pub fn hunger__feed(self: *FeedWatcher, feed: HungerFeed) void {
+    // *const: this receiver is stateless (the dispatcher holds *FeedWatcher
+    // and coerces). A hook that accumulates state takes `*FeedWatcher`.
+    pub fn hunger__feed(self: *const FeedWatcher, feed: HungerFeed) void {
         _ = self;
         std.log.info("ZIG_FEED_SEEN_{d} entity={d}", .{ feed.amount, feed.entity });
     }
