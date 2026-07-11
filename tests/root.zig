@@ -16,6 +16,7 @@
 //! world are process-global (the contract is process-global by nature),
 //! so every test starts with `fresh()` and tears its VM down via defer.
 
+const std = @import("std");
 const scripting = @import("labelle_scripting");
 const mock = @import("mock_world.zig");
 
@@ -49,4 +50,26 @@ comptime {
 // its own suite.
 comptime {
     if (scripting.language == .lua) _ = @import("eval_shared_suite.zig");
+}
+
+test "dispatch contract (#3): explicit-tick-only, zero-arg deinit" {
+    // The assembler's splice (labelle-assembler#596) emits
+    // `scripting.Controller.tick(&g, scaled_dt)` EXPLICITLY and selects
+    // the generated deinit call by arity. If this test fails, you are
+    // about to double-tick every scripted game (a `Systems` decl gets
+    // auto-ticked by the engine ON TOP of the splice's explicit tick) or
+    // break every generated deinit block — coordinate an assembler
+    // release first. See the Controller doc in src/root.zig.
+    comptime {
+        std.debug.assert(!@hasDecl(scripting, "Systems"));
+        std.debug.assert(!@hasDecl(scripting.Controller, "Systems"));
+        const deinit_info = @typeInfo(@TypeOf(scripting.Controller.deinit)).@"fn";
+        std.debug.assert(deinit_info.params.len == 0);
+    }
+    // And the explicit-tick shape itself: (game: anytype, dt: f32).
+    comptime {
+        const tick_info = @typeInfo(@TypeOf(scripting.Controller.tick)).@"fn";
+        std.debug.assert(tick_info.params.len == 2);
+        std.debug.assert(tick_info.params[1].type.? == f32);
+    }
 }
