@@ -535,6 +535,16 @@ yourself, as build.zig's own test wiring demonstrates). Needs a
 crystal toolchain (≥ 1.16 — `Crystal.init_runtime`) wherever the game
 builds.
 
+**A stability note, stated plainly**: crystal has no public embedding
+API — `Crystal.init_runtime` and `Crystal.main_user_code` are
+`:nodoc:` internals and may change between crystal releases. That is
+the deal the whole native-crystal story rides on (the POC chose them
+because nothing supported exists), and the guard is the version pin:
+CI builds against a pinned crystal (1.17), the boot handshake fails
+fast on drift, and any toolchain bump goes through this repo's full
+suite before consumers see it. Treat crystal version bumps as
+deliberate, reviewed changes — never incidental.
+
 ## Studio Script Console (eval)
 
 The plugin handles the studio Script Console's
