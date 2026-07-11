@@ -16,7 +16,6 @@
 //! world are process-global (the contract is process-global by nature),
 //! so every test starts with `fresh()` and tears its VM down via defer.
 
-const std = @import("std");
 const scripting = @import("labelle_scripting");
 const mock = @import("mock_world.zig");
 
@@ -55,21 +54,29 @@ comptime {
 test "dispatch contract (#3): explicit-tick-only, zero-arg deinit" {
     // The assembler's splice (labelle-assembler#596) emits
     // `scripting.Controller.tick(&g, scaled_dt)` EXPLICITLY and selects
-    // the generated deinit call by arity. If this test fails, you are
-    // about to double-tick every scripted game (a `Systems` decl gets
-    // auto-ticked by the engine ON TOP of the splice's explicit tick) or
-    // break every generated deinit block — coordinate an assembler
-    // release first. See the Controller doc in src/root.zig.
+    // the generated deinit call by arity. @compileError (not assert —
+    // a failed comptime assert prints a message-less 'unreachable code')
+    // so the offender lands on the coordination requirement directly.
+    // See the Controller doc in src/root.zig.
     comptime {
-        std.debug.assert(!@hasDecl(scripting, "Systems"));
-        std.debug.assert(!@hasDecl(scripting.Controller, "Systems"));
+        if (@hasDecl(scripting, "Systems") or @hasDecl(scripting.Controller, "Systems"))
+            @compileError("dispatch contract (labelle-scripting#3): a Systems decl " ++
+                "would be auto-ticked by the engine ON TOP of the splice's explicit " ++
+                "Controller.tick, double-ticking every scripted game — coordinate an " ++
+                "assembler release before adding one (see src/root.zig Controller doc)");
         const deinit_info = @typeInfo(@TypeOf(scripting.Controller.deinit)).@"fn";
-        std.debug.assert(deinit_info.params.len == 0);
-    }
-    // And the explicit-tick shape itself: (game: anytype, dt: f32).
-    comptime {
+        if (deinit_info.params.len != 0)
+            @compileError("dispatch contract (labelle-scripting#3): generated deinit " ++
+                "blocks select the ZERO-ARG arm by arity — changing Controller.deinit's " ++
+                "signature breaks every generated game; coordinate an assembler release");
         const tick_info = @typeInfo(@TypeOf(scripting.Controller.tick)).@"fn";
-        std.debug.assert(tick_info.params.len == 2);
-        std.debug.assert(tick_info.params[1].type.? == f32);
+        // params[1].type is null for anytype — that shape change must land
+        // on the coordination message too, not on a generic null unwrap.
+        if (tick_info.params.len != 2 or
+            tick_info.params[1].type == null or
+            tick_info.params[1].type.? != f32)
+            @compileError("dispatch contract (labelle-scripting#3): the splice emits " ++
+                "Controller.tick(&g, scaled_dt) — the (anytype, f32) shape is frozen; " ++
+                "coordinate an assembler release before changing it");
     }
 }
