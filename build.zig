@@ -1,19 +1,19 @@
 //! labelle-scripting build: the shared plugin glue plus exactly ONE
 //! language sub-module, selected at build time.
 //!
-//! Language selection is a build option (`-Dlanguage=lua|ruby`) rather
-//! than N sibling packages because every language binds the same Script
-//! Runtime Contract and exposes the same Controller — one module name
-//! (`labelle_scripting`), one plugin entry in project.labelle, N
+//! Language selection is a build option (`-Dlanguage=lua|ruby|typescript`)
+//! rather than N sibling packages because every language binds the same
+//! Script Runtime Contract and exposes the same Controller — one module
+//! name (`labelle_scripting`), one plugin entry in project.labelle, N
 //! interchangeable VMs behind it. Unchosen languages must not be
-//! COMPILED: lua's vendored runtime rides a `.lazy = true` dependency,
-//! ruby's vendored mruby output lives in-repo under vendor/mruby/ (mruby
-//! has no amalgamation and its upstream build needs host ruby+rake, which
-//! consumers must never need; see vendor/mruby's provenance note in the
-//! README). Lua IS always fetched, whatever the language: the
-//! declare-mode extractor (tools/declare, `zig build labelle-declare`,
-//! labelle-assembler#585) is itself lua-based and ships with every
-//! install of the plugin.
+//! COMPILED: lua's and typescript's vendored runtimes ride `.lazy = true`
+//! dependencies, ruby's vendored mruby output lives in-repo under
+//! vendor/mruby/ (mruby has no amalgamation and its upstream build needs
+//! host ruby+rake, which consumers must never need; see vendor/mruby's
+//! provenance note in the README). Lua IS always fetched, whatever the
+//! language: the declare-mode extractor (tools/declare, `zig build
+//! labelle-declare`, labelle-assembler#585) is itself lua-based and ships
+//! with every install of the plugin.
 
 const std = @import("std");
 
@@ -22,7 +22,7 @@ const std = @import("std");
 /// runtime. Adding a language is additive: extend this enum, gate its
 /// vendored runtime in the switch below, add `src/<lang>/` and its arm
 /// in src/root.zig's backend switch. Nothing existing changes.
-const Language = enum { lua, ruby };
+const Language = enum { lua, ruby, typescript };
 
 /// Lua 5.4.8 sources, minus the `lua.c`/`luac.c` executable mains
 /// (interpreter core + auxlib + all standard libraries).
@@ -146,6 +146,33 @@ const mruby_sources = [_][]const u8{
 ///                    C string literals instead of aliasing them.
 const mruby_defines = [_][]const u8{ "-DMRB_INT64", "-DMRB_NO_BOXING", "-DMRB_NO_DEFAULT_RO_DATA_P" };
 
+/// quickjs-ng v0.15.1 library sources — the exact `qjs_sources` list from
+/// upstream's CMakeLists.txt (quickjs-libc.c deliberately excluded: it is
+/// the os/std module layer for the qjs CLI; game scripts get the labelle
+/// API instead, and scripts arrive through registerScript, never disk).
+const quickjs_sources = [_][]const u8{
+    "dtoa.c",
+    "libregexp.c",
+    "libunicode.c",
+    "quickjs.c",
+};
+
+/// Flags the vendored quickjs-ng MUST be compiled with:
+///   -D_GNU_SOURCE      — upstream compiles with it unconditionally
+///                        (CMakeLists `qjs_defines`); harmless off-Linux.
+///   -DJS_NAN_BOXING=0  — pin JSValue to the {union, i64 tag} struct
+///                        encoding on EVERY target. The header would flip
+///                        32-bit targets (wasm32) to NaN-boxed u64 values,
+///                        which the Zig bindings' hand-mirrored `c.Value`
+///                        ABI could not follow. The struct encoding is the
+///                        primary, always-tested representation upstream;
+///                        pinning it costs 32-bit targets a fatter value
+///                        and buys one mirror that is correct everywhere.
+///   -funsigned-char    — upstream compiles with it (CMakeLists
+///                        `xcheck_add_c_compiler_flag`); char signedness
+///                        is ABI-adjacent in the lexer tables, so match.
+const quickjs_flags = [_][]const u8{ "-D_GNU_SOURCE", "-DJS_NAN_BOXING=0", "-funsigned-char" };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -164,6 +191,13 @@ pub fn build(b: *std.Build) void {
     // COMPILED into the plugin module.
     const lua_dep_opt = b.lazyDependency("lua", .{});
 
+    // quickjs (the typescript sub-module's VM) is only COMPILED when
+    // selected, but the fetch marking happens whenever configureLanguage's
+    // .typescript arm runs — which the all-languages test loop below does
+    // on every configure. In a consumer game only its chosen language's
+    // module is built; the fetch is the whole cost of the others.
+    const quickjs_dep_opt = b.lazyDependency("quickjs", .{});
+
     // The plugin module. The assembler requests plugin modules by the
     // convention name `labelle_<pluginname>`; plugin.labelle says
     // `.name = "scripting"`, so `labelle_scripting` is both the package
@@ -177,7 +211,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    configureLanguage(b, scripting_mod, language, lua_dep_opt);
+    configureLanguage(b, scripting_mod, language, lua_dep_opt, quickjs_dep_opt);
 
     // The extractor CORE as a named module for the tests below: tests/ is
     // its own module root, so tools/declare/extract.zig can't be reached by
@@ -217,7 +251,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
-        configureLanguage(b, lang_mod, lang, lua_dep_opt);
+        configureLanguage(b, lang_mod, lang, lua_dep_opt, quickjs_dep_opt);
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tests/root.zig"),
@@ -280,6 +314,7 @@ fn configureLanguage(
     mod: *std.Build.Module,
     language: Language,
     lua_dep_opt: ?*std.Build.Dependency,
+    quickjs_dep_opt: ?*std.Build.Dependency,
 ) void {
     const opts = b.addOptions();
     opts.addOption(Language, "language", language);
@@ -317,6 +352,27 @@ fn configureLanguage(
             mod.addCSourceFile(.{
                 .file = b.path("src/ruby/shim.c"),
                 .flags = &mruby_defines,
+            });
+        },
+        .typescript => if (quickjs_dep_opt) |qjs_dep| {
+            // Vendored quickjs-ng (see quickjs_sources) plus
+            // src/ts/abi_check.c — no runtime shim, only _Static_asserts
+            // pinning the header facts the Zig bindings hand-mirror
+            // (JSValue layout, tag numbering, flag values), compiled
+            // against the SAME fetched headers and defines so a future
+            // pin bump that moves any of them fails the build instead of
+            // corrupting values at runtime. Everything the bindings call
+            // is a real exported symbol in quickjs-ng v0.15+ (unlike
+            // mruby, where the macro layer forced a functional shim).
+            mod.addIncludePath(qjs_dep.path("."));
+            mod.addCSourceFiles(.{
+                .root = qjs_dep.path("."),
+                .files = &quickjs_sources,
+                .flags = &quickjs_flags,
+            });
+            mod.addCSourceFile(.{
+                .file = b.path("src/ts/abi_check.c"),
+                .flags = &quickjs_flags,
             });
         },
     }

@@ -16,12 +16,12 @@
 //! assembler wires all plugins uniformly), while the actual world access
 //! rides the C contract.
 //!
-//! Language sub-modules: build.zig selects exactly one (`-Dlanguage=lua`
-//! or `-Dlanguage=ruby`) and surfaces the choice through the
-//! `scripting_options` module; the comptime switch below is what keeps
-//! unselected backends out of analysis entirely. Each backend directory
-//! (src/lua/, src/ruby/, later src/js/, …) exposes the same tiny surface:
-//! `vm.Vm` (init/close/loadScript/callScriptHook/evictScript/
+//! Language sub-modules: build.zig selects exactly one (`-Dlanguage=lua`,
+//! `-Dlanguage=ruby` or `-Dlanguage=typescript`) and surfaces the choice
+//! through the `scripting_options` module; the comptime switch below is
+//! what keeps unselected backends out of analysis entirely. Each backend
+//! directory (src/lua/, src/ruby/, src/ts/, …) exposes the same tiny
+//! surface: `vm.Vm` (init/close/loadScript/callScriptHook/evictScript/
 //! callLabelleFn) and `bindings.install`.
 
 const std = @import("std");
@@ -43,6 +43,10 @@ const Backend = switch (build_options.language) {
     .ruby => struct {
         pub const vm = @import("ruby/vm.zig");
         pub const bindings = @import("ruby/bindings.zig");
+    },
+    .typescript => struct {
+        pub const vm = @import("ts/vm.zig");
+        pub const bindings = @import("ts/bindings.zig");
     },
 };
 

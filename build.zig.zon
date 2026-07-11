@@ -13,11 +13,25 @@
             .hash = "N-V-__8AAKEzFAAA695b9LXBhUSVK5MAV_VKSm1mEj3Acbze",
             .lazy = true,
         },
+        // Upstream QuickJS — the maintained quickjs-ng fork, pinned to a
+        // release tag — compiled into the module when
+        // `-Dlanguage=typescript`. Lazy like lua; note that this repo's
+        // OWN `zig build test` builds every language, so a checkout of
+        // labelle-scripting itself always fetches it — consumer games
+        // only compile (and only need) the language they picked.
+        .quickjs = .{
+            .url = "https://github.com/quickjs-ng/quickjs/archive/refs/tags/v0.15.1.tar.gz",
+            .hash = "N-V-__8AADVSQQAuOTWaTtpZv890cKhmNLPE9UbCFZv0uFX9",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "plugin.labelle",
+        // contract/labelle.d.ts — the hand-authored TypeScript type
+        // declarations for the script API (typescript sub-module).
+        "contract",
         "src",
         // The declare-mode extractor (tools/declare/) ships with the
         // package: the assembler builds it FROM the consuming game's
