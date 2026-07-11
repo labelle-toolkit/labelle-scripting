@@ -70,7 +70,11 @@ test "dispatch contract (#3): explicit-tick-only, zero-arg deinit" {
                 "blocks select the ZERO-ARG arm by arity — changing Controller.deinit's " ++
                 "signature breaks every generated game; coordinate an assembler release");
         const tick_info = @typeInfo(@TypeOf(scripting.Controller.tick)).@"fn";
-        if (tick_info.params.len != 2 or tick_info.params[1].type.? != f32)
+        // params[1].type is null for anytype — that shape change must land
+        // on the coordination message too, not on a generic null unwrap.
+        if (tick_info.params.len != 2 or
+            tick_info.params[1].type == null or
+            tick_info.params[1].type.? != f32)
             @compileError("dispatch contract (labelle-scripting#3): the splice emits " ++
                 "Controller.tick(&g, scaled_dt) — the (anytype, f32) shape is frozen; " ++
                 "coordinate an assembler release before changing it");
