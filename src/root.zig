@@ -16,17 +16,22 @@
 //! assembler wires all plugins uniformly), while the actual world access
 //! rides the C contract.
 //!
-//! Language sub-modules: build.zig selects exactly one (`-Dlanguage=lua`)
-//! and surfaces the choice through the `scripting_options` module; the
-//! comptime switch below is what keeps unselected backends out of
-//! analysis entirely. Each backend directory (src/lua/, later src/js/, …)
-//! exposes the same tiny surface: `vm.Vm` (init/close/loadScript/
-//! callScriptHook/evictScript/callLabelleFn) and `bindings.install`.
+//! Language sub-modules: build.zig selects exactly one (`-Dlanguage=lua`
+//! or `-Dlanguage=ruby`) and surfaces the choice through the
+//! `scripting_options` module; the comptime switch below is what keeps
+//! unselected backends out of analysis entirely. Each backend directory
+//! (src/lua/, src/ruby/, later src/js/, …) exposes the same tiny surface:
+//! `vm.Vm` (init/close/loadScript/callScriptHook/evictScript/
+//! callLabelleFn) and `bindings.install`.
 
 const std = @import("std");
 const build_options = @import("scripting_options");
 
 pub const contract = @import("contract.zig");
+
+/// The selected language (introspection/tests — the test root switches
+/// its suite on this).
+pub const language = build_options.language;
 
 /// The active language backend, resolved at comptime from the build
 /// option. Adding a language = new `src/<lang>/` + one arm here.
@@ -34,6 +39,10 @@ const Backend = switch (build_options.language) {
     .lua => struct {
         pub const vm = @import("lua/vm.zig");
         pub const bindings = @import("lua/bindings.zig");
+    },
+    .ruby => struct {
+        pub const vm = @import("ruby/vm.zig");
+        pub const bindings = @import("ruby/bindings.zig");
     },
 };
 
@@ -144,6 +153,12 @@ pub const Controller = struct {
                 vm.evictScript(s.name);
             }
         }
+
+        // Backends with a controller tier (ruby) instantiate + set up the
+        // registered controller classes now, after every script's init —
+        // scripts loaded and initialized first, structure on top. For
+        // backends without the prelude function (lua) this is a no-op.
+        vm.callLabelleFn("__setup_controllers", null);
     }
 
     /// Advance every script by one frame. Order per frame:
@@ -151,27 +166,33 @@ pub const Controller = struct {
     ///      the same scaled dt Zig scripts received this tick;
     ///   2. drain the event inbox (handlers see last frame's events before
     ///      any update logic);
-    ///   3. each script's `update(dt)`, registration order.
+    ///   3. each script's `update(dt)`, registration order;
+    ///   4. controller `tick(dt)`s, registration order (backends with a
+    ///      controller tier — a no-op for the rest).
     /// Script errors are logged with a full traceback and never abort the
     /// tick — the remaining scripts still run. No-op before setup.
     pub fn tick(game: anytype, dt: f32) void {
         _ = game;
         const vm = active_vm orelse return;
         contract.labelle_time_dt_stamp(dt);
-        vm.callLabelleFn("dispatch_inbox");
+        vm.callLabelleFn("dispatch_inbox", null);
         for (script_registry[0..script_count]) |s| {
             // Update errors are logged per-call and do NOT evict — unlike a
             // failed init, the script's state is intact and the author gets
             // a traceback every tick until it's fixed.
             _ = vm.callScriptHook(s.name, "update", dt);
         }
+        vm.callLabelleFn("__tick_controllers", dt);
     }
 
-    /// Run each script's `deinit()` (registration order), then close the
-    /// VM — Lua's GC releases everything else. Idempotent; registrations
+    /// Teardown, LIFO against setup: controller `teardown`s in reverse
+    /// registration order (where the backend has controllers), then each
+    /// script's `deinit()` (registration order), then close the VM — the
+    /// language's GC releases everything else. Idempotent; registrations
     /// survive (they're process-lifetime; see `registerScript`).
     pub fn deinit() void {
         const vm = active_vm orelse return;
+        vm.callLabelleFn("__teardown_controllers", null);
         for (script_registry[0..script_count]) |s| {
             _ = vm.callScriptHook(s.name, "deinit", null);
         }

@@ -19,5 +19,8 @@
         "build.zig.zon",
         "plugin.labelle",
         "src",
+        // The ruby sub-module's vendored mruby snapshot (upstream sources
+        // + generated presym/bytecode C); compiled only for -Dlanguage=ruby.
+        "vendor",
     },
 }

@@ -448,6 +448,15 @@ pub fn logsContain(needle: []const u8) bool {
     return false;
 }
 
+/// Index of the FIRST log line containing `needle`, or null — ordering
+/// assertions (controller setup/teardown sequences) go through this.
+pub fn logIndexOf(needle: []const u8) ?usize {
+    for (world.logs[0..world.log_count], 0..) |*l, i| {
+        if (std.mem.indexOf(u8, l.buf[0..l.len], needle) != null) return i;
+    }
+    return null;
+}
+
 /// How many labelle_log lines contain `needle` — "logged exactly once"
 /// assertions (per-handler dispatch errors) go through this.
 pub fn logCount(needle: []const u8) usize {
