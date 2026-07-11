@@ -63,8 +63,17 @@ pub fn build(b: *std.Build) void {
     });
     scripting_mod.addOptions("scripting_options", opts);
 
+    // The vendored Lua 5.4 sources serve TWO consumers today: the lua
+    // language sub-module (when selected) and the declare-mode extractor
+    // below (always — it IS the lua declare runner). One lazyDependency
+    // call feeds both; with lua the only language, the marker is always
+    // needed anyway. When a second language lands, the declare tool grows
+    // the same per-language gate as the VM switch and this hoists back
+    // under it.
+    const lua_dep_opt = b.lazyDependency("lua", .{});
+
     switch (language) {
-        .lua => if (b.lazyDependency("lua", .{})) |lua_dep| {
+        .lua => if (lua_dep_opt) |lua_dep| {
             // Vendored Lua 5.4, compiled straight into the module: every
             // .c in the official release tarball except the two standalone
             // mains (lua.c interpreter, luac.c compiler). The explicit list
@@ -83,6 +92,55 @@ pub fn build(b: *std.Build) void {
         },
     }
 
+    // ── labelle-declare: the declare-mode schema extractor ──────────────
+    // (RFC-LANGUAGE-PLUGINS revs 6-7, labelle-engine#237.) A tiny host exe
+    // the assembler builds + runs at GENERATE time (`zig build
+    // labelle-declare`, labelle-assembler#585): it loads each game script's
+    // chunk body against a stub `labelle` and prints the declared-component
+    // schema JSON on stdout. Deliberately host-targeted and Debug-pinned —
+    // it never ships in a game, whatever -Dtarget/-Doptimize the consuming
+    // game build passes — and built regardless of -Dlanguage since it
+    // embeds lua directly (its OWN copy of the C sources: the exe is a
+    // separate compilation, nothing is compiled twice into one binary).
+    // Reached only through its named step, so plain `zig build` / consumer
+    // dependency wiring never pays for it.
+    if (lua_dep_opt) |lua_dep| {
+        const declare_mod = b.createModule(.{
+            .root_source_file = b.path("tools/declare/main.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        });
+        declare_mod.addIncludePath(lua_dep.path("src"));
+        declare_mod.addCSourceFiles(.{
+            .root = lua_dep.path("src"),
+            .files = &lua_sources,
+        });
+        const declare_exe = b.addExecutable(.{
+            .name = "labelle-declare",
+            .root_module = declare_mod,
+        });
+        const declare_step = b.step(
+            "labelle-declare",
+            "Build the declare-mode schema extractor (zig-out/bin/labelle-declare)",
+        );
+        declare_step.dependOn(&b.addInstallArtifact(declare_exe, .{}).step);
+    }
+
+    // The extractor CORE as a named module for the tests below: tests/ is
+    // its own module root, so tools/declare/extract.zig can't be reached by
+    // path import from there (cross-root path imports don't resolve) — the
+    // named module is the standard promotion. No C sources attached HERE on
+    // purpose: within the test binary the lua objects already come from
+    // `scripting_mod` (extract.zig only declares externs, which unify by
+    // symbol name), so attaching them again would duplicate every lua
+    // symbol at link time.
+    const declare_core_mod = b.createModule(.{
+        .root_source_file = b.path("tools/declare/extract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Tests: the contract symbols are `extern` in src/contract.zig and the
     // test root provides them (tests/mock_world.zig `export`s a toy world),
     // mirroring production exactly — there the assembled game binary is the
@@ -95,6 +153,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{
                 .{ .name = "labelle_scripting", .module = scripting_mod },
+                .{ .name = "declare_core", .module = declare_core_mod },
             },
         }),
     });

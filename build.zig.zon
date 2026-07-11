@@ -19,5 +19,9 @@
         "build.zig.zon",
         "plugin.labelle",
         "src",
+        // The declare-mode extractor (tools/declare/) ships with the
+        // package: the assembler builds it FROM the consuming game's
+        // resolved copy (`zig build labelle-declare`, assembler#585).
+        "tools",
     },
 }

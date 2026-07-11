@@ -21,6 +21,13 @@ comptime {
     _ = mock;
 }
 
+// The declare-mode extractor goldens (tools/declare via the `declare_core`
+// named module) ride the same test binary: its lua externs resolve against
+// the lua objects `labelle_scripting` already compiled in.
+test {
+    _ = @import("declare_tool.zig");
+}
+
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
@@ -538,6 +545,21 @@ test "controller lifecycle: prefab/scene/remove, deinit hooks, re-setup" {
     try expect(mock.entityAlive(3)); // second marker
     try expectComponent(4, "Prefab", "{\"name\":\"ship\"}"); // second ship
     try expectEqual(@as(usize, 4), mock.aliveCount());
+}
+
+test "labelle.component refs address components through every name-taking seam" {
+    fresh();
+    scripting.registerScript("component_ref", @embedFile("lua/component_ref.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // The script's own asserts police ref/string equivalence, query-by-ref
+    // and the non-ref-table rejection (any failure evicts it and RefOk
+    // never lands); the Zig side pins that the ref writes reached the SAME
+    // "Hunger"/"Tag" names a string write would (Tag was removed via ref).
+    try expectComponent(1, "Hunger", "{\"level\":0.5,\"starving\":false}");
+    try expect(mock.componentJson(1, "Tag") == null);
+    try expectComponent(1, "RefOk", "{\"ok\":true}");
 }
 
 test "registerScript replaces sources by name" {
