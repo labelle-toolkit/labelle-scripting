@@ -45,9 +45,23 @@
                 .{
                     .name = "cargo-scripts",
                     .command = .{ "cargo", "build", "--release", "--quiet", "--locked", "--manifest-path", "{package}/native/Cargo.toml", "--target-dir", "{cache}" },
-                    .artifact = "{cache}/release/liblabelle_rust_scripts.a",
+                    // {staticlib:NAME} expands per target OS at emission
+                    // (lib<NAME>.a on unix, <NAME>.lib on windows) — cargo's
+                    // artifact names are target-specific.
+                    .artifact = "{cache}/release/{staticlib:labelle_rust_scripts}",
                     .link = .static_lib,
                     .platforms = .{"desktop"},
+                    // The crate keeps panic = "unwind" (the catch_unwind
+                    // containment depends on it), so the final link needs
+                    // rust's native static libs. Per-OS: this is cargo's
+                    // `--print native-static-libs` set for linux minus -lc
+                    // (the game's own libc link covers it); macOS needs
+                    // none beyond the system libs zig already links;
+                    // windows resolves its set (bcrypt etc.) when the
+                    // windows lane opens — the allowlist gates it today.
+                    .system_libs = .{
+                        .linux = .{ "gcc_s", "util", "rt", "pthread", "m", "dl" },
+                    },
                 },
             },
         },
