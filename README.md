@@ -19,7 +19,7 @@ Every language binds the engine's **Script Runtime Contract** (`labelle-engine/c
 | `lua` (Lua 5.4) | ✅ bootstrap done (#738) + per-frame allocation utilities (#2) — vendored Lua 5.4.8, contract-bound, tested against a mock host |
 | `ruby` (mruby 3.4) | ✅ done (labelle-engine#742) — vendored mruby, controllers + Component.ref + FrameArray, tested against the same mock host |
 | `typescript` (QuickJS) | ✅ done (labelle-engine#745) — quickjs-ng 0.15, ES-module scripts, BigInt ids, typed via contract/labelle.d.ts, tested against the same mock host (plain JS at runtime; the TS→JS transpile hook is assembler#586) |
-| `rust` (staticlib) | ✅ done (labelle-engine#741) — first native-compiled sub-module: game `rust/` sources cargo-built into the shipped crate (`native/`), `Script` trait + safe wrappers, panics caught at every FFI entry, tested against the same mock host (end-to-end game wiring needs the assembler's native-language splice — the #741 follow-up) |
+| `rust` (staticlib) | ✅ done (labelle-engine#741) — first native-compiled sub-module: game `rust/` sources cargo-built into the shipped crate (`native/`), `Script` trait + safe wrappers, panics caught at every FFI entry, tested against the same mock host AND end-to-end (`examples/rust-game` through the assembler's native-language splice, labelle-assembler ≥ v0.84.0) |
 | `crystal` | planned (rust's build-hook + splice shape, plus the POC's embedding rules) |
 | `go` (c-archive) | planned |
 | `csharp` (CoreCLR) | planned — last |
@@ -425,14 +425,13 @@ movement).
 Script Console gets a documented `ok:false` refusal.
 
 **End-to-end wiring** (generate → cargo → link) rides the assembler's
-native-language splice — the #741 follow-up: it stages your `rust/` over
-the staged package's `native/src/game/`, passes `-Dlanguage=rust`, and
-runs the build step declared in this repo's `plugin.labelle`
-(`.language_builds` — cargo → staticlib → `addObjectFile`, desktop-first).
-Until that assembler release, the sub-module is fully usable against the
-mock host and via hand-wiring (link the staticlib yourself, as
-build.zig's own test wiring demonstrates). Needs a rust toolchain
-(rustc ≥ 1.82) wherever the game builds.
+native-language splice (labelle-assembler ≥ v0.84.0): it stages your
+`rust/` as a LIVE LINK over the staged package's `native/src/game/`
+(edit a `.rs`, rerun `zig build` — no re-generate), passes
+`-Dlanguage=rust`, and runs the build step declared in this repo's
+`plugin.labelle` (`.language_builds` — cargo → staticlib →
+`addObjectFile`, desktop-first). `examples/rust-game` is the running
+proof. Needs a rust toolchain (rustc ≥ 1.82) wherever the game builds.
 
 ## Studio Script Console (eval)
 
@@ -481,3 +480,25 @@ The plugin handles the studio Script Console's
   regression net (labelle-scripting#10). Recipe + assertions:
   `.github/workflows/ci.yml` → `ruby-example`; timeline:
   `examples/ruby-game/ruby/hunger_controller.rb`.
+
+- **`examples/rust-game/`** — the NATIVE-COMPILED counterpart
+  (labelle-engine#741): the SAME hunger sawtooth, `rust/` Script-trait
+  structs instead of ruby — so the two transcripts diff token-for-token
+  and the cross-language story is visible by eye. No VM, nothing
+  embeds: the assembler's native-language splice (labelle-assembler ≥
+  v0.84.0) links `rust/` over the staged plugin package's
+  `native/src/game/` (a live link — edits rebuild without
+  re-generating) and the plugin's declared `.language_builds` cargo
+  step compiles it into `liblabelle_rust_scripts.a`, linked into the
+  game binary where the `labelle_*` contract symbols resolve against
+  the host's exports. The scripts show the family's idioms: buffer
+  reuse at every contract boundary (`get_component_into` /
+  `query_into` into field-held `Vec`s — `clear()` retains capacity,
+  pinned flat by `RUST_BUFFERS_OK`), u64 ids end to end, cross-script
+  `hunger__feed` + `engine__tick` over the same bus, and the same
+  game-root Zig hook consuming the same emit natively. CI generates
+  (asserting NO `registerScript` — the family's signature), cargo-
+  builds, runs `LABELLE_NULL_FRAMES=5` and diffs the ordered
+  `RUST_*`/`ZIG_*` transcript — the native family's permanent
+  regression net. Recipe + assertions: `.github/workflows/ci.yml` →
+  `rust-example`; timeline: `examples/rust-game/rust/mod.rs`.

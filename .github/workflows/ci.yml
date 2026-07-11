@@ -57,6 +57,10 @@ jobs:
         run: |
           cargo fmt --check --manifest-path native/Cargo.toml
           cargo fmt --check --manifest-path tests/rust/Cargo.toml
+          # The rust example game's sources have no manifest of their own
+          # (they compile as the plugin crate's game module) — check them
+          # file-wise.
+          rustfmt --check --edition 2021 examples/rust-game/rust/*.rs
 
   # Ruby example game (labelle-scripting#10) — the ruby counterpart of the
   # assembler's `examples/scripting-smoke`, living in THIS repo so every
@@ -232,3 +236,229 @@ jobs:
             exit 1
           fi
           echo "PASS: ruby drove the real engine — plain hooks + Component.ref controller + cross-script hunger__feed (ruby AND native Zig hook off one bus) + FrameArray + engine__tick over 5 headless frames, against this repo's HEAD"
+
+  # Rust example game (labelle-engine#741) — the NATIVE-COMPILED counterpart
+  # of ruby-example, living in THIS repo so every push runs a real rust game
+  # through the real assembler against the real engine: examples/rust-game
+  # pins its scripting plugin `local:../..` (the CURRENT checkout), so the
+  # native/ crate, the glue and src/rust/vm.zig under review are exactly
+  # what cargo compiles and the generated game links. The native family's
+  # permanent regression net — and the end-to-end proof that generate →
+  # stage → cargo → link → run works, not just the mock-host suite.
+  rust-example:
+    runs-on: ubuntu-latest
+    # Cold toolkit fetch + engine compile + one zero-dep cargo release
+    # build normally lands well under 15; bound a wedged runner far below
+    # GitHub's 6h default.
+    timeout-minutes: 30
+    env:
+      # The pinned labelle-assembler release the example generates with —
+      # a BINARY release (tag → release.yml assets). Must carry the
+      # native-language splice (labelle-assembler#608): v0.84.0 is the
+      # FIRST release that recognizes rust (`NATIVE_LANGUAGES` row),
+      # stages the game's rust/ as a live link over the staged package's
+      # native/src/game/, and consumes plugin.labelle's `.language_builds`
+      # cargo step. v0.83.0 and older warn "no scripting integration yet"
+      # and wire nothing (the no-registerScript grep below would pass
+      # vacuously, but the Controller.tick grep fails loudly). Bump
+      # deliberately, never float.
+      ASSEMBLER_VERSION: v0.84.0
+    steps:
+      # Checkout into a subdir so the example's sibling pins resolve:
+      # examples/rust-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
+      - uses: actions/checkout@v4
+        with:
+          path: labelle-scripting
+
+      # Sibling checkout for the null backend — same reason and same
+      # pattern as ruby-example above (the `script_contract.bind`
+      # touchpoint is on labelle-null main, unreleased).
+      - name: Checkout labelle-null (bind touchpoint is unreleased)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The generated game's build SHELLS OUT to cargo (the plugin's
+      # declared `.language_builds` step) — the toolchain must exist
+      # before `zig build`. Same pin story as the test job: rustc ≥ 1.82.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download the pinned labelle-assembler release binary
+        run: |
+          curl -fL -o labelle-assembler \
+            "https://github.com/labelle-toolkit/labelle-assembler/releases/download/${ASSEMBLER_VERSION}/labelle-assembler-linux-x86_64"
+          chmod +x labelle-assembler
+
+      # Mirrors ruby-example's flow: generate → codegen greps → build
+      # (fingerprint dance) → bounded headless run → ordered-transcript
+      # diff. The native-family deltas are the point of every grep below.
+      # Frame-by-frame timeline: rust/mod.rs's header.
+      - name: Generate + build + run the rust example game
+        run: |
+          # Actions' default shell has no pipefail — without it the tee
+          # below masks a failed generate with exit 0.
+          set -o pipefail
+
+          # Cargo must SURVIVE the fresh-HOME swap below: rustup resolves
+          # its default toolchain through settings under the REAL home
+          # ($RUSTUP_HOME), and the shim in PATH dies without them
+          # ("rustup could not choose a version of cargo to run"). Pin
+          # both cargo homes to the real locations FIRST — only the
+          # assembler's package cache (~/.labelle) must land in the
+          # isolated HOME.
+          export RUSTUP_HOME="$HOME/.rustup"
+          export CARGO_HOME="$HOME/.cargo"
+
+          # Fresh HOME for the whole flow: the assembler keeps its package
+          # cache under ~/.labelle — never let a runner's (or, when run
+          # locally, a developer's) real one leak into the run.
+          export HOME="$RUNNER_TEMP/labelle-home"
+          mkdir -p "$HOME"
+
+          cd labelle-scripting/examples/rust-game
+          ASM=$GITHUB_WORKSPACE/labelle-assembler
+
+          # Fetch core/engine/gfx releases into the package cache. The
+          # scripting plugin needs no fetch (`local:../..` — this
+          # checkout) and neither does the backend (`backend_package`
+          # pins the sibling labelle-null clone above).
+          $ASM install --project-root .
+          $ASM generate --project-root . 2>&1 | tee generate.log
+
+          # Belt and braces on top of the exit code (pipefail set at the
+          # top of this step): never trust artifacts past a failed
+          # generate.
+          if grep -q 'generate failed' generate.log; then
+            echo "E: generate reported failure"
+            exit 1
+          fi
+          # Native splices skip the declare phase SILENTLY (zero embedded
+          # scripts — the phase no-ops before its language gate), unlike
+          # ruby's pointed skip note. Its presence would mean the splice
+          # got misclassified as an embed family.
+          if grep -q 'script-declared components' generate.log; then
+            echo "E: declare-phase note printed for a native splice"
+            exit 1
+          fi
+
+          # Codegen assertions — each is one link of the chain; fail
+          # loudly if a regression drops it.
+          M=.labelle/null_desktop/main.zig
+          B=.labelle/null_desktop/build.zig
+          # THE native-family assertion: rust arrives as machine code —
+          # nothing embeds, nothing registers. A registerScript line here
+          # means the splice fell back to the embed family.
+          if grep -q 'registerScript' $M; then
+            echo "E: registerScript emitted for a native-compiled language"
+            exit 1
+          fi
+          # Splice (family-shared): the generated flag half of the
+          # templates' double-gate.
+          grep -qF 'const scripting_enabled = true;' $M
+          # labelle-null template: the bind touchpoint (proves the sibling
+          # checkout — not the stale v0.3.0 release — was staged).
+          grep -qF 'engine.script_contract.bind(&g);' $M
+          # Splice: the Controller tick that drives inbox dispatch +
+          # every script's update(dt) through the crate glue.
+          grep -qF 'scripting.Controller.tick(&g, scaled_dt);' $M
+          # Splice: the event tap between plugin ticks and dispatchEvents.
+          grep -qF 'engine.script_contract.drainEvents(&g);' $M
+          # Game-root hooks scan: the native hunger__feed subscriber
+          # (hooks/feed_watcher.zig) folded into the GameHooks receiver
+          # tuple — the Zig half of the cross-layer events interop.
+          grep -qF 'feed_u_watcher.FeedWatcher' $M
+          # Build wiring: the plugin's -Dlanguage option selects the rust
+          # dispatcher (src/rust/vm.zig — no VM compiled in).
+          grep -qF '.language = .rust' $B
+          # Build wiring (.language_builds → #586 steps): the emitted
+          # cargo command, verbatim through the declared argv prefix (the
+          # --manifest-path value is a generate-time absolute literal).
+          grep -qF 'b.addSystemCommand(&.{ "cargo", "build", "--release", "--quiet", "--locked", "--manifest-path"' $B
+          # Build wiring: the {staticlib:...}-expanded artifact path —
+          # per-OS name resolved at build time (liblabelle_rust_scripts.a
+          # here, labelle_rust_scripts.lib on windows) — and its link
+          # onto the game binary.
+          grep -qF 'b.path(b.fmt("plugin-build/scripting/release/{s}labelle_rust_scripts{s}", .{ plugin_build_lib_prefix, plugin_build_lib_ext }))' $B
+          grep -qF 'exe.root_module.addObjectFile(plugin_scripting_build_artifact_0);' $B
+          # Build wiring: the declared per-OS system libs (the
+          # panic=unwind staticlib needs the toolchain's native static
+          # libs at the final link on linux).
+          grep -qF 'exe.root_module.linkSystemLibrary("gcc_s", .{});' $B
+          # Staging is a LIVE LINK, not a copy (deps are shared across
+          # targets — .labelle/deps/): the game's rust/ IS the staged
+          # crate's game module, so edits flow into the next `zig build`
+          # without a re-generate. One symlink test + one read-through
+          # beats a second full build.
+          STAGED=.labelle/deps/labelle-scripting/native/src/game
+          test -L "$STAGED"
+          cmp rust/mod.rs "$STAGED/mod.rs"
+
+          cd .labelle/null_desktop
+
+          # labelle-cli-equivalent fixFingerprint dance — the assembler
+          # emits a placeholder fingerprint.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          # `|| true`: with pipefail on, a NO-MATCH grep would otherwise
+          # exit 1 and set -e kills the step silently — and the happy path
+          # (first build succeeds, ERR empty, nothing to fix) is real: this
+          # example's fingerprint has never actually needed the dance.
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # Headless bounded run: no window, no GL — the binary runs to
+          # completion (rc=0) or crashes.
+          LABELLE_NULL_FRAMES=5 ./zig-out/bin/rust_game > run.log 2>&1
+
+          # Pin the exact ordered milestone sequence — token-for-token the
+          # ruby transcript's shape, so the cross-language story is
+          # diffable by eye. Tokens carry BEHAVIOR: every RUST_LEVEL_*
+          # value is the level the script wrote through the real ECS that
+          # tick (each one reachable only via the previous tick's
+          # persisted write), RUST_FED_LEVEL_0.875 is re-READ after the
+          # feed handler's write — the emitted id and f32 0.5 amount
+          # round-tripped the engine bus bit-exact — ZIG_FEED_SEEN_0.5 is
+          # the NATIVE game-root hook consuming the same emit at tick 2's
+          # dispatchEvents (frame end, one tick BEFORE the rust handler's
+          # inbox — the cross-layer latency is part of the pin), and
+          # RUST_BUFFERS_OK pins the Vec clear-retains-capacity idiom
+          # flat (rust's FrameArray equivalent). The char class includes
+          # '.' for exactly the value-carrying tokens. Timeline:
+          # rust/mod.rs.
+          grep -oE '(RUST|ZIG)_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          RUST_INIT
+          RUST_CTRL_READY
+          RUST_LEVEL_0.625
+          RUST_FEED_SENT
+          RUST_LEVEL_0.375
+          ZIG_FEED_SEEN_0.5
+          RUST_ENGINE_TICK_SEEN
+          RUST_FED_LEVEL_0.875
+          RUST_LEVEL_0.625
+          RUST_LEVEL_0.375
+          RUST_LEVEL_0.125
+          RUST_STARVING
+          RUST_BUFFERS_OK
+          RUST_CTRL_DONE
+          RUST_DEINIT
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: rust-example milestone sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: rust drove the real engine — Script-trait structs compiled by the plugin's cargo step, buffer-reuse wrappers, cross-script hunger__feed (rust AND native Zig hook off one bus) + engine__tick over 5 headless frames, against this repo's HEAD"
