@@ -10,7 +10,7 @@ Script [labelle](https://github.com/labelle-toolkit) games in **Lua, TypeScript,
 },
 ```
 
-Drop scripts in your language's convention dir (`lua/`, `ruby/`, …) and go. One language per project (validated at `labelle generate`); unchosen languages cost nothing — never fetched (lua, a lazy dependency) or never compiled (ruby, an in-repo vendor snapshot).
+Drop scripts in your language's convention dir (`lua/`, `ruby/`, `ts/`, …) and go. One language per project (validated at `labelle generate`); unchosen languages cost nothing — never fetched (lua and quickjs, lazy dependencies) or never compiled (ruby, an in-repo vendor snapshot).
 
 Every language binds the engine's **Script Runtime Contract** (`labelle-engine/contract/labelle_script.h`, `LABELLE_CONTRACT_VERSION 1`): entities, components-by-name (JSON), events (subscribe + poll-drain), queries, prefabs, input, time. Both integration families — embedded-VM (lua, ruby/mruby, typescript/QuickJS, csharp/CoreCLR) and native-compiled (rust, crystal, go) — consume the identical surface, proven end to end by the [POC](https://github.com/labelle-toolkit/labelle-engine/pull/734).
 
@@ -18,7 +18,7 @@ Every language binds the engine's **Script Runtime Contract** (`labelle-engine/c
 |---|---|
 | `lua` (Lua 5.4) | ✅ bootstrap done (#738) + per-frame allocation utilities (#2) — vendored Lua 5.4.8, contract-bound, tested against a mock host |
 | `ruby` (mruby 3.4) | ✅ done (labelle-engine#742) — vendored mruby, controllers + Component.ref + FrameArray, tested against the same mock host |
-| `typescript` (QuickJS) | planned |
+| `typescript` (QuickJS) | ✅ done (labelle-engine#745) — quickjs-ng 0.15, ES-module scripts, BigInt ids, typed via contract/labelle.d.ts, tested against the same mock host (plain JS at runtime; the TS→JS transpile hook is assembler#586) |
 | `rust` / `crystal` | planned (needs assembler build hooks) |
 | `go` (c-archive) | planned |
 | `csharp` (CoreCLR) | planned — last |
@@ -252,5 +252,105 @@ or exit (see vendor/mruby/README.md, which also carries the packaging
 TODO: move the in-repo vendor snapshot to a lazy prebuilt tarball once a
 labelle-hosted one exists — mruby has no amalgamation and its upstream
 build needs host ruby+rake, which consumers never see).
+
+## Using the typescript sub-module
+
+Build with `-Dlanguage=typescript` (embeds [quickjs-ng](https://github.com/quickjs-ng/quickjs)
+0.15, a pinned lazy dependency compiled only when selected). The Zig side
+is identical to lua/ruby — same `registerScript`/`Controller` seam, same
+contract, same mock-tested semantics — only the sources are JavaScript:
+
+```zig
+scripting.registerScript("player", @embedFile("ts/player.js"));
+```
+
+Scripts are **plain JS at runtime** — the TS→JS transpile arrives with
+the assembler build hook (labelle-assembler#586). What makes this the
+*typescript* sub-module today is the authoring surface:
+`contract/labelle.d.ts` hand-declares types for the whole script API, so
+you get typed autocomplete and checking now:
+
+- **.js scripts**: put `// @ts-check` at the top and add a
+  `jsconfig.json` whose `"include"` lists your scripts plus
+  `labelle.d.ts` (copy it or point at the resolved package's
+  `contract/` dir) — your editor checks every call against the real API.
+- **.ts scripts**: check with `tsc --noEmit` the same way, and (until
+  assembler#586 lands) run the emitted `.js` through `registerScript`.
+
+Script side — each script is an **ES module**: module scope is the
+isolation boundary (top-level `let`/`const`/`function` are private to the
+file; two scripts defining `update` never collide) and lifecycle hooks
+are the module's **exports** — an unexported `function update` is
+module-private and never called. Modules are strict mode by spec;
+`import` is refused (scripts arrive through `registerScript`, never
+disk); top-level `await` is rejected at load.
+
+```js
+// @ts-check
+let player = null;
+
+labelle.on("cargo__delivered", (ev) => {   // decoded payload object
+  labelle.log(`got ${ev.amount}`);
+});
+
+export function init() {
+  player = Entity.create();
+  player.set("Position", { x: 0, y: 0 });  // components as objects
+}
+
+export function update(dt) {
+  const pos = player.get("Position");
+  pos.x += 10 * dt;
+  player.set("Position", pos);
+  for (const e of game.query("Bullet", "Position")) e.destroy();
+}
+```
+
+Script errors log `"<Error>: <message>"` plus the JS stack (with
+`file:line` locations) through the game's sink and never kill the tick;
+a script that fails to load or whose `init()` throws is evicted — its
+event handlers are purged with it (`export function deinit` never runs
+for an evicted script).
+
+**Entity ids are BigInt** — the one JS-specific rule worth learning.
+Numbers lose exactness past 2^53 and u64 ids use bit 63, so `e.id` is a
+BigInt holding the TRUE unsigned value (`${e.id}` prints it correctly —
+no lua/ruby signed-bitcast caveat). Consequences:
+
+- compare ids with `===` between BigInts; a Number-held small id from a
+  payload compares equal via `==`, or normalize first:
+  `Entity.wrap(ev.owner).id === e.id`;
+- id arithmetic is BigInt arithmetic (`let sum = 0n`) — mixing BigInt
+  and Number in `+` is a TypeError by design;
+- embed ids in payloads directly: `labelle.emit("fired", { owner: e.id })`
+  encodes the BigInt as the contract's unsigned decimal
+  (`labelle.u64str(id)` still ships for cross-language parity);
+- **never** use `JSON.parse`/`JSON.stringify` for payloads —
+  `labelle.json_decode`/`labelle.json_encode` are the id-exact codec
+  (decode materializes integer tokens past 2^53 as BigInt; stringify
+  would throw on BigInt). Otherwise the codec keeps JSON.stringify's
+  semantics (undefined-valued keys omitted, functions skipped in
+  objects), plus sorted keys so encodings are byte-stable.
+
+**Arrays vs objects**: nothing to learn — `{}` and `[]` are distinct
+types and round-trip natively (lua's `labelle.array` has no JS
+counterpart because the ambiguity doesn't exist).
+
+**Per-frame allocation**: QuickJS is reference-counted with a cycle
+collector on top — acyclic garbage frees at the last reference, so there
+is no per-frame GC step to budget and a net-zero tick leaves the live
+allocation count EXACTLY flat (the suite pins 100 working ticks flat on
+`JS_ComputeMemoryUsage.malloc_count`). The idioms that keep a hot loop
+net-zero:
+
+- `e.get("Hunger", into)` — REFILLS a caller-owned object in place and
+  returns it (scalar fields cross as immediates, no fresh object per
+  read); pair with `e.set("Hunger", into)`;
+- `labelle.FrameArray` for per-frame lists — `clear()` resets the
+  logical length and KEEPS the backing (whether `arr.length = 0`
+  retains storage is engine-internal, so never rely on it); growth only
+  on overflow and visible via `growthCount`;
+- a reused `Float64Array` for pure-numeric scratch — fixed capacity by
+  construction, elements are raw doubles (no boxing at all).
 
 Design: `RFC-LANGUAGE-PLUGINS.md` (labelle-engine#730) · epic: labelle-engine#237

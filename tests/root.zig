@@ -29,6 +29,7 @@ test {
     _ = switch (scripting.language) {
         .lua => @import("lua_suite.zig"),
         .ruby => @import("ruby_suite.zig"),
+        .typescript => @import("ts_suite.zig"),
     };
 }
 
