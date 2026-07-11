@@ -129,7 +129,19 @@ can assert it stays flat. (Lua 5.4 has no `table.clear`; a fresh `{}`
 per frame is exactly the allocation this removes.) Also: `size()`,
 `capacity()`, `get(i)`/`set(i, v)` over the logical contents, and
 `each(fn)` — hoist `fn`, a fresh closure per frame is itself a per-frame
-allocation.
+allocation. One consequence of the O(1) `clear`: the backing keeps
+strong references to cleared values until later pushes overwrite them
+(free for the per-frame refill loop; irrelevant for numbers/ids). If an
+array parked something heavy and then shrinks its fill for many frames,
+`release()` drops every parked reference — the backing is overwritten
+with `false`, O(capacity), still allocation-free — and keeps capacity.
+
+One boundary to know about: Lua interns only *short* strings (≤ 40
+bytes). A component whose serialized JSON exceeds that comes back from
+the contract as a fresh long string on every read — allocation the
+decode side cannot avoid, get-into or not. Keep hot-loop components
+compact (the hot-loop test's `Hot` component is such); bulky data
+belongs in components you read on change, not per frame.
 
 What garbage remains (encode buffers, query snapshots, event payloads)
 is collected on a budget: the plugin drives one incremental GC step per

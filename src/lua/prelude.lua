@@ -507,7 +507,23 @@ end
 
 --- Logical length back to zero; capacity and backing survive — O(1),
 --- allocation-free, and the whole point (`buf = {}` would re-shrink).
+--- NOTE: the backing keeps STRONG references to the cleared values until
+--- they are overwritten by later pushes (same contract as the ruby
+--- FrameArray). That is free for the intended per-frame refill loop; if
+--- an array parks HEAVY objects and then shrinks its fill for many
+--- frames, use `release()` to drop them.
 function FrameArray:clear()
+  self.n = 0
+  return self
+end
+
+--- clear() plus dropping every parked reference: the whole backing is
+--- overwritten with `false` (not nil — the array part stays fully sized,
+--- no rehash on refill). O(capacity) and allocation-free; for the
+--- occasional "this held something big" moment, not the per-frame path.
+function FrameArray:release()
+  local buf = self.buf
+  for i = 1, self.cap do buf[i] = false end
   self.n = 0
   return self
 end

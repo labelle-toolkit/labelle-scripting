@@ -52,5 +52,24 @@ function init()
   assert(not pcall(FrameArray.new, 2.5), "float cap must raise")
   assert(not pcall(FrameArray.new, "8"), "string cap must raise")
 
+  -- Reference lifetime, observed through a weak table: clear() PARKS the
+  -- values in the backing (the documented O(1) contract — free when the
+  -- next frame overwrites them), release() actually drops them.
+  local weak = setmetatable({}, { __mode = "v" })
+  local parked = FrameArray.new(4)
+  parked:push({})
+  weak[1] = parked:get(1)
+  parked:clear()
+  collectgarbage("collect")
+  assert(weak[1] ~= nil, "clear() keeps the parked reference alive")
+  parked:release()
+  assert(parked:size() == 0 and parked:capacity() == 4,
+    "release keeps capacity")
+  collectgarbage("collect")
+  assert(weak[1] == nil, "release() drops the parked reference")
+  parked:push(7)
+  assert(parked:get(1) == 7 and parked:growth_count() == 0,
+    "reuse after release, no regrowth")
+
   Entity.new():set("FrameArrayOk", { ok = true })
 end
