@@ -13,15 +13,23 @@
 # opt-in: integer payload tokens parse (in Zig) with wrapping 64-bit
 # arithmetic, landing bit-exact on the same signed bitcast.
 #
-# Hook harvest: mruby has no lua-style per-chunk _ENV, so top-level
-# `def init/update/deinit` land as private methods on Object — shared, and
-# two scripts would collide. __harvest (called by vm.zig after each chunk
-# body) moves any freshly defined hook to a per-script aliased name,
-# removes the original, and records it against a per-script receiver
-# object. Hooks then dispatch as receiver.send(aliased, ...), so scripts
-# never see each other's hooks and each script's @ivars live on its own
+# Method harvest: mruby has no lua-style per-chunk _ENV, so EVERY
+# top-level `def` — the init/update/deinit hooks and any helper — lands as
+# a private method on Object, shared by all scripts: same-named hooks
+# would collide, and a later script's `def helper` would hijack an earlier
+# script's harvested hooks (their receivers inherit from Object).
+# __harvest (called by vm.zig after each chunk body) therefore moves ALL
+# methods the body freshly defined — diffed against the install-time
+# baseline of Object's own method set — onto the script's private record:
+# each is aliased to a per-script name on Object, removed under its
+# original name, and aliased BACK under the original name on the script's
+# receiver's singleton class, so intra-script calls (`helper(...)` from
+# `update`) keep working, invisibly to every other script. Hooks dispatch
+# as receiver.send(aliased, ...); each script's @ivars live on its own
 # receiver (set them in `init`, not at body scope — body-level self is
-# `main`, which hooks do not run against).
+# `main`, which hooks do not run against). Known limit: REdefining a
+# method that existed at baseline (a core method, say) is not harvested
+# and leaks globally — don't.
 #
 # Ownership: Labelle.on and Controller subclassing record WHICH script
 # registered them by reading $__labelle_current_script — the global vm.zig
@@ -32,8 +40,6 @@
 # firing into dead state.
 
 module Labelle
-  HOOK_NAMES = [:init, :update, :deinit]
-
   # ── logging / time / scene / spawn sugar ─────────────────────────────
 
   def self.log(msg)
@@ -137,24 +143,65 @@ module Labelle
     nil
   end
 
-  # ── per-script hook harvest (called by vm.zig) ───────────────────────
+  # ── per-script method harvest (called by vm.zig) ─────────────────────
 
-  # After `name_sym`'s chunk body ran: move any top-level init/update/
-  # deinit it defined onto its private record. Aliased copies keep unique
-  # names, the originals leave Object — the next script starts clean.
+  # Baseline of Object's OWN (public + private) instance methods, taken
+  # once at the end of the prelude chunk (and extended with each alias
+  # __harvest mints). The harvest/evict invariant — every load ends with
+  # all freshly defined methods moved off (or stripped from) Object —
+  # keeps this baseline valid for the whole VM lifetime, so "what did
+  # this body define?" is a plain set diff.
+  def self.__record_baseline
+    @baseline_methods = {}
+    ms = Object.private_instance_methods(false) + Object.instance_methods(false)
+    i = 0
+    while i < ms.size
+      @baseline_methods[ms[i]] = true
+      i += 1
+    end
+    nil
+  end
+
+  # Object's own methods that are NOT in the baseline — i.e. whatever the
+  # chunk body just defined at top level (load-time only, so the
+  # allocations are fine).
+  def self.__new_object_methods
+    now = Object.private_instance_methods(false) + Object.instance_methods(false)
+    added = []
+    i = 0
+    while i < now.size
+      m = now[i]
+      added << m unless @baseline_methods[m]
+      i += 1
+    end
+    added
+  end
+
+  # After `name_sym`'s chunk body ran: move EVERY top-level method it
+  # defined (hooks and helpers alike) onto its private record. The aliased
+  # copy on Object keeps a unique per-script name (how dispatch and
+  # eviction reach it), the original name leaves Object (the next script
+  # starts clean), and the receiver's singleton class gets the original
+  # name back (how the script's own code keeps calling its helpers).
   def self.__harvest(name_sym)
     @scripts ||= {}
-    probe = Object.new
     rec = { r: Object.new, h: {} }
+    added = __new_object_methods
     i = 0
-    while i < HOOK_NAMES.size
-      h = HOOK_NAMES[i]
+    while i < added.size
+      m = added[i]
       i += 1
-      next unless probe.respond_to?(h, true)
-      aliased = :"__labelle_#{name_sym}_#{h}"
-      Object.send(:alias_method, aliased, h)
-      Object.send(:remove_method, h)
-      rec[:h][h] = aliased
+      aliased = :"__labelle_#{name_sym}_#{m}"
+      Object.send(:alias_method, aliased, m)
+      Object.send(:remove_method, m)
+      rec[:r].singleton_class.send(:alias_method, m, aliased)
+      rec[:h][m] = aliased
+      # The alias itself is a NEW Object method — fold it into the
+      # baseline immediately, or the NEXT script's diff would see it as
+      # freshly defined and harvest it away from this script (dead alias
+      # entries after an eviction are harmless: the diff only tests
+      # membership of methods that currently exist).
+      @baseline_methods[aliased] = true
     end
     @scripts[name_sym] = rec
     nil
@@ -177,26 +224,25 @@ module Labelle
     :ok
   end
 
-  # Eviction (body or init failure): drop the script's harvested hooks
-  # (and their Object-level aliases), purge its event handlers, and drop
-  # its controllers — registered classes and live instances both.
+  # Eviction (body or init failure): drop the script's harvested methods
+  # (their Object-level aliases), purge its event handlers, and drop its
+  # controllers — registered classes and live instances both.
   def self.__evict_script(name_sym)
     if @scripts && (rec = @scripts[name_sym])
       rec[:h].each_value { |m| Object.send(:remove_method, m) }
       @scripts.delete(name_sym)
     end
     # A body that raised left its top-level defs sitting RAW on Object
-    # (its harvest never ran). Strip them, or the NEXT script's harvest
-    # would adopt them as its own — a dead script's deinit running under
-    # a live script's name. Every properly loaded script's hooks were
-    # already moved to aliased names, so raw names here can only be the
-    # evictee's.
-    probe = Object.new
+    # (its harvest never ran). Strip everything off-baseline, or the NEXT
+    # script's harvest would adopt the leftovers as its own — a dead
+    # script's deinit running under a live script's name. Every properly
+    # loaded script's methods were already moved to aliased names, so
+    # off-baseline names here can only be the evictee's.
+    leftovers = __new_object_methods
     i = 0
-    while i < HOOK_NAMES.size
-      h = HOOK_NAMES[i]
+    while i < leftovers.size
+      Object.send(:remove_method, leftovers[i])
       i += 1
-      Object.send(:remove_method, h) if probe.respond_to?(h, true)
     end
     __purge_handlers(name_sym)
     @controller_classes = __reject_owned(@controller_classes, name_sym)
@@ -229,6 +275,43 @@ module Labelle
     kept
   end
 
+  # Per-event-name handler counts — the rollback point a controller setup
+  # is bracketed by. Finer than script ownership on purpose: a failed
+  # setup must take out exactly the handlers IT registered, not its
+  # script's other handlers (init-registered ones, or a sibling
+  # controller's from the same script).
+  def self.__handlers_snapshot
+    snap = {}
+    if @handlers
+      keys = @handlers.keys
+      i = 0
+      while i < keys.size
+        k = keys[i]
+        snap[k] = @handlers[k].size
+        i += 1
+      end
+    end
+    snap
+  end
+
+  # Drop every handler registered since `snap` was taken. Registration
+  # only ever APPENDS (Labelle.on), so truncating each list back to its
+  # snapshot length — and deleting lists that didn't exist — is exact.
+  def self.__handlers_rollback(snap)
+    return if @handlers.nil?
+    keys = @handlers.keys
+    i = 0
+    while i < keys.size
+      k = keys[i]
+      i += 1
+      hs = @handlers[k]
+      before = snap[k] || 0
+      hs.pop while hs.size > before
+      @handlers.delete(k) if hs.empty?
+    end
+    nil
+  end
+
   # ── controllers (the structured tier) ────────────────────────────────
 
   # Subclassing Labelle::Controller registers the class (convention over
@@ -241,7 +324,10 @@ module Labelle
 
   # Instantiate + set up every registered controller, registration order.
   # A raising initialize/setup evicts that CONTROLLER (logged; no tick, no
-  # teardown) — its script and sibling controllers keep running.
+  # teardown) — its script and sibling controllers keep running — and
+  # rolls back any `on(...)` handlers the failed setup registered before
+  # raising: without the rollback they would keep firing into the dead
+  # instance on every later dispatch.
   def self.__setup_controllers
     @controllers = []
     cs = @controller_classes || []
@@ -251,11 +337,13 @@ module Labelle
       i += 1
       saved = $__labelle_current_script
       $__labelle_current_script = owner
+      snap = __handlers_snapshot
       begin
         inst = klass.new
         inst.setup
         @controllers << [inst, owner]
       rescue Exception => e
+        __handlers_rollback(snap)
         raw_log("[ruby] controller #{klass} setup failed — controller evicted: #{e.class}: #{e.message}\n  backtrace: #{(e.backtrace || []).join(' | ')}")
       end
       $__labelle_current_script = saved
@@ -553,3 +641,7 @@ module Labelle
     end
   end
 end
+
+# The harvest baseline — taken LAST, so it captures Object's method set
+# exactly as scripts will first see it.
+Labelle.__record_baseline

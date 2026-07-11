@@ -665,3 +665,170 @@ test "FrameArray unit semantics" {
 
     try expectComponent(1, "FrameArrayOk", "{\"ok\":true}");
 }
+
+test "a raising controller setup rolls back its own handlers only" {
+    fresh();
+    // One script, three ownership grains on the SAME event: a handler
+    // registered by init, a handler registered by a sibling controller's
+    // successful setup, and handlers registered by a setup that then
+    // raises. The failed setup's handlers must be rolled back — they
+    // would otherwise keep firing into the dropped instance forever —
+    // while the other two grains (same script! same owner symbol!) keep
+    // firing, which is why the rollback is a snapshot of handler-list
+    // lengths around each setup, not a script-ownership purge.
+    scripting.registerScript("half_ctrl",
+        \\def init
+        \\  @e = Labelle::Entity.create
+        \\  @e.set("Zombie", n: 0)
+        \\  Labelle.on("zombie__ping") do |_ev|
+        \\    s = @e.get("Zombie")
+        \\    s[:n] += 1
+        \\    @e.set("Zombie", s)
+        \\  end
+        \\end
+        \\class GoodController < Labelle::Controller
+        \\  def setup
+        \\    on("zombie__ping") { |_ev| log("good handler ran") }
+        \\  end
+        \\end
+        \\class HalfSetupController < Labelle::Controller
+        \\  def setup
+        \\    on("zombie__ping") { |_ev| log("zombie handler ran") }
+        \\    on("zombie__fresh") { |_ev| log("zombie fresh ran") }
+        \\    raise "half setup boom"
+        \\  end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("half setup boom"));
+    try expect(mock.logsContain("controller evicted"));
+
+    // zombie__fresh IS subscribed host-side (subscription precedes the
+    // raise and the contract has no unsubscribe) — the entry gets
+    // drained, but its rolled-back handler list must not exist.
+    mock.hostEmit("zombie__ping", "{}");
+    mock.hostEmit("zombie__fresh", "{}");
+    scripting.Controller.tick(.{}, 0.016);
+
+    // The init handler and the sibling controller's fired...
+    try expectComponent(1, "Zombie", "{\"n\":1}");
+    try expect(mock.logsContain("good handler ran"));
+    // ...the failed setup's never do: truncation rollback on the shared
+    // name, whole-list removal on the fresh name.
+    try expect(!mock.logsContain("zombie handler ran"));
+    try expect(!mock.logsContain("zombie fresh ran"));
+
+    // And they stay dead on later dispatches.
+    mock.hostEmit("zombie__ping", "{}");
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "Zombie", "{\"n\":2}");
+    try expectEqual(@as(usize, 2), mock.logCount("good handler ran"));
+    try expect(!mock.logsContain("zombie handler ran"));
+}
+
+test "init-failure evictions leave no GC arena residue" {
+    // Baseline: the probe alone — its first update records the absolute
+    // arena index at a fixed point of the tick.
+    fresh();
+    scripting.registerScript("arena_probe", @embedFile("ruby/arena_probe.rb"));
+    try scripting.Controller.setup(.{});
+    scripting.Controller.tick(.{}, 0.016);
+    const baseline = mock.componentJson(1, "ProbeArena") orelse
+        return error.TestExpectedComponent;
+    var saved: [64]u8 = undefined;
+    @memcpy(saved[0..baseline.len], baseline); // survives the reset below
+    const baseline_json = saved[0..baseline.len];
+
+    // Eviction-heavy run, fresh VM: eight scripts whose init raises load
+    // BEFORE the same probe. The pinned invariant: however many eviction
+    // entries ran, the probe reads the SAME absolute arena index — no
+    // per-eviction residue.
+    //
+    // Scope honesty: Vm.evictScript carries the same explicit arena
+    // save/restore as every other entry, but this test alone cannot
+    // distinguish its presence TODAY — mrb_funcall_with_block self-
+    // restores the arena around the callee (vendor/mruby/src/vm.c, the
+    // `int ai = mrb_gc_arena_save` / `mrb_gc_arena_restore(mrb, ai)`
+    // bracket) and re-protects only the RETURN value, and this entry
+    // deals purely in immediates (symbol argument, nil return). The
+    // bracket becomes load-bearing — and this test the tripwire — the
+    // moment the eviction entry materializes any heap value outside the
+    // funcall: a String argument, a diagnostic return, a formatted
+    // exception message. That is exactly the shape loadScript's bracket
+    // already protects against (parse products are top-level heap).
+    fresh();
+    inline for (0..8) |i| {
+        scripting.registerScript(std.fmt.comptimePrint("bad{d}", .{i}),
+            \\def init
+            \\  raise "bad init"
+            \\end
+        );
+    }
+    scripting.registerScript("arena_probe", @embedFile("ruby/arena_probe.rb"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+    scripting.Controller.tick(.{}, 0.016);
+
+    // Premise: all eight evictions actually happened...
+    try expectEqual(@as(usize, 8), mock.logCount("script evicted"));
+    // ...and left zero arena residue: byte-identical probe readings.
+    const got = mock.componentJson(1, "ProbeArena") orelse
+        return error.TestExpectedComponent;
+    try expectEqualStrings(baseline_json, got);
+}
+
+test "top-level helpers are private to their script (no Object hijack)" {
+    fresh();
+    // The lua caller-_ENV ownership test, mirrored: script A's update
+    // calls a helper A defined; script B later defines the same helper
+    // name. Without the generalized harvest both helpers would live on
+    // Object and B's def would hijack A's harvested update (receivers
+    // inherit from Object).
+    scripting.registerScript("helper_a",
+        \\def helper
+        \\  "A"
+        \\end
+        \\def update(dt)
+        \\  @e ||= Labelle::Entity.create
+        \\  @e.set("HelperA", saw: helper)
+        \\end
+    );
+    scripting.registerScript("helper_b",
+        \\def helper
+        \\  "B"
+        \\end
+        \\def update(dt)
+        \\  @e ||= Labelle::Entity.create
+        \\  @e.set("HelperB", saw: helper)
+        \\end
+    );
+    // A third script with NO helper of its own: the name must not resolve
+    // at all — under the leak it would silently get A's or B's.
+    scripting.registerScript("helper_none",
+        \\def init
+        \\  @e = Labelle::Entity.create
+        \\  @e.set("HelperLeak", leaked: Object.new.respond_to?(:helper, true))
+        \\end
+        \\def update(dt)
+        \\  helper
+        \\rescue NameError
+        \\  s = @e.get("HelperLeak")
+        \\  s[:raised] = true
+        \\  @e.set("HelperLeak", s)
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+
+    // helper_none's init ran during setup → entity 1; the two updates
+    // created entities 2 and 3 on the first tick.
+    try expectComponent(2, "HelperA", "{\"saw\":\"A\"}");
+    try expectComponent(3, "HelperB", "{\"saw\":\"B\"}");
+    // No global leak: the name neither enumerates on Object nor resolves
+    // from a script that never defined it.
+    try expectComponent(1, "HelperLeak", "{\"leaked\":false,\"raised\":true}");
+}

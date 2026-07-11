@@ -340,7 +340,14 @@ pub const Vm = struct {
     /// event handlers and controllers (prelude-side `__evict_script`), and
     /// log the eviction once — the init backtrace alone would not explain
     /// why the script went silent afterwards.
+    ///
+    /// This is a VM entry like any other, so it carries the same GC-arena
+    /// save/restore discipline: `__evict_script` allocates (method-set
+    /// diffs, replacement lists), and without the restore every init-fail
+    /// eviction would ratchet the arena index up for the life of the VM.
     pub fn evictScript(self: Vm, name: []const u8) void {
+        const arena = c.labelle_mrb_gc_arena_save(self.mrb);
+        defer c.labelle_mrb_gc_arena_restore(self.mrb, arena);
         const name_sym = c.mrb_intern(self.mrb, name.ptr, name.len);
         _ = self.callLabelleSym(self.sym_evict_script, &.{c.Value.symbol(name_sym)}, name);
         logError(name, "init failed — script evicted; update/deinit will not run");
