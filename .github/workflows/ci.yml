@@ -26,3 +26,161 @@ jobs:
 
       - name: Formatting
         run: zig fmt --check build.zig src tests
+
+  # Ruby example game (labelle-scripting#10) — the ruby counterpart of the
+  # assembler's `examples/scripting-smoke`, living in THIS repo so every
+  # push runs a real ruby game through the real assembler against the real
+  # engine: examples/ruby-game pins its scripting plugin `local:../..`
+  # (the CURRENT checkout), so the vendored mruby, prelude, bindings and
+  # Controller under review are exactly what the generated game embeds.
+  # Ruby's permanent regression net.
+  ruby-example:
+    runs-on: ubuntu-latest
+    # Cold toolkit fetch + engine/mruby compile normally lands well under
+    # 15; bound a wedged runner far below GitHub's 6h default.
+    timeout-minutes: 30
+    env:
+      # The pinned labelle-assembler release the example generates with —
+      # a BINARY release (tag → release.yml assets). Must be a release
+      # whose `scripting_splice.EMBED_LANGUAGES` carries the ruby row
+      # (labelle-assembler#603, `.rb` embedding): v0.81.0 and older warn
+      # "no embeddable-source integration" and embed nothing (the first
+      # registerScript grep below fails loudly). Bump deliberately,
+      # never float.
+      ASSEMBLER_VERSION: v0.82.0
+    steps:
+      # Checkout into a subdir so the example's sibling pins resolve:
+      # examples/ruby-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
+      - uses: actions/checkout@v4
+        with:
+          path: labelle-scripting
+
+      # Sibling checkout for the null backend: the generated main's
+      # `script_contract.bind` touchpoint lives in labelle-null's
+      # `templates/headless.txt` (labelle-null#5, on main) and the latest
+      # release (v0.3.0) predates it — same sibling pattern as the
+      # assembler's own scripting-smoke job (which pins the same repo).
+      # Drop this clone (and the example's `backend_package` sibling pin)
+      # once labelle-null cuts a release with the touchpoint.
+      - name: Checkout labelle-null (bind touchpoint is unreleased)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Download the pinned labelle-assembler release binary
+        run: |
+          curl -fL -o labelle-assembler \
+            "https://github.com/labelle-toolkit/labelle-assembler/releases/download/${ASSEMBLER_VERSION}/labelle-assembler-linux-x86_64"
+          chmod +x labelle-assembler
+
+      # Mirrors the assembler's scripting-smoke CI step (the Lua
+      # end-to-end): generate → codegen greps → build (fingerprint dance)
+      # → bounded headless run → ordered-transcript diff. Frame-by-frame
+      # timeline: ruby/hunger_controller.rb's header.
+      - name: Generate + build + run the ruby example game
+        run: |
+          # Fresh HOME for the whole flow: the assembler keeps its package
+          # cache under ~/.labelle — never let a runner's (or, when run
+          # locally, a developer's) real one leak into the run.
+          export HOME="$RUNNER_TEMP/labelle-home"
+          mkdir -p "$HOME"
+
+          cd labelle-scripting/examples/ruby-game
+          ASM=$GITHUB_WORKSPACE/labelle-assembler
+
+          # Fetch core/engine/gfx releases into the package cache. The
+          # scripting plugin needs no fetch (`local:../..` — this
+          # checkout) and neither does the backend (`backend_package`
+          # pins the sibling labelle-null clone above).
+          $ASM install --project-root .
+          $ASM generate --project-root . 2>&1 | tee generate.log
+
+          # Belt and braces on top of the exit code (runs under
+          # `bash -e -o pipefail`): never trust artifacts past a failed
+          # generate.
+          if grep -q 'generate failed' generate.log; then
+            echo "E: generate reported failure"
+            exit 1
+          fi
+          # Ruby is a non-declare language — generate must SKIP the
+          # declare phase with the pointed note, not run (or silently
+          # drop) it.
+          grep -qF 'script-declared components are lua-only today' generate.log
+
+          # Codegen assertions — each is one link of the chain; fail
+          # loudly if a regression drops it.
+          M=.labelle/null_desktop/main.zig
+          # Splice: both embedded ruby scripts registered (sorted stems)
+          # before the VM boots. THE ruby-row assertion: an assembler
+          # without labelle-assembler#603 embeds nothing and fails here.
+          grep -qF 'scripting.registerScript("hunger_controller", @embedFile("ruby/hunger_controller.rb"));' $M
+          grep -qF 'scripting.registerScript("spawner", @embedFile("ruby/spawner.rb"));' $M
+          # Splice: the generated flag half of the templates' double-gate.
+          grep -qF 'const scripting_enabled = true;' $M
+          # labelle-null template: the bind touchpoint (proves the sibling
+          # checkout — not the stale v0.3.0 release — was staged).
+          grep -qF 'engine.script_contract.bind(&g);' $M
+          # Splice: the VM tick that actually advances the scripts.
+          grep -qF 'scripting.Controller.tick(&g, scaled_dt);' $M
+          # Splice: the event tap between plugin ticks and dispatchEvents.
+          grep -qF 'engine.script_contract.drainEvents(&g);' $M
+          # Build wiring: the plugin's -Dlanguage option selects mruby.
+          grep -qF '.language = .ruby' .labelle/null_desktop/build.zig
+
+          cd .labelle/null_desktop
+
+          # labelle-cli-equivalent fixFingerprint dance — the assembler
+          # emits a placeholder fingerprint.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # Headless bounded run: no window, no GL — the binary runs to
+          # completion (rc=0) or crashes.
+          LABELLE_NULL_FRAMES=5 ./zig-out/bin/ruby_game > run.log 2>&1
+
+          # Pin the exact ordered milestone sequence. Tokens carry
+          # BEHAVIOR, not liveness: every RUBY_LEVEL_* value is the level
+          # the controller wrote through the real ECS that tick (each one
+          # reachable only via the previous tick's persisted write), and
+          # RUBY_FED_LEVEL_0.875 is re-READ after the feed handler's
+          # write — the emitted id and f32 0.5 amount round-tripped the
+          # engine bus bit-exact. The char class includes '.' for exactly
+          # those value-carrying tokens. Timeline:
+          # ruby/hunger_controller.rb.
+          grep -oE 'RUBY_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          RUBY_INIT
+          RUBY_CTRL_READY
+          RUBY_LEVEL_0.625
+          RUBY_FEED_SENT
+          RUBY_LEVEL_0.375
+          RUBY_ENGINE_TICK_SEEN
+          RUBY_FED_LEVEL_0.875
+          RUBY_LEVEL_0.625
+          RUBY_LEVEL_0.375
+          RUBY_LEVEL_0.125
+          RUBY_STARVING
+          RUBY_FRAMEARRAY_OK
+          RUBY_CTRL_DONE
+          RUBY_DEINIT
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: ruby-example RUBY milestone sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: ruby drove the real engine — plain hooks + Component.ref controller + cross-script hunger__feed + FrameArray + engine__tick over 5 headless frames, against this repo's HEAD"
