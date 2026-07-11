@@ -5,7 +5,9 @@
 //! Two deliberate layers:
 //!   1. `labelle.raw_*` — one shim per contract function, 1:1 and dumb:
 //!      strings in, strings out, integer rcs. These stay public so scripts
-//!      can always reach the bare contract.
+//!      can always reach the bare contract. (Plus one small VM-SIDE
+//!      family that never crosses the contract: `raw_gc_*`, the per-tick
+//!      GC pacing seams owned by vm.zig.)
 //!   2. src/lua/prelude.lua (embedded below) — Entity wrapper, game.query
 //!      iterator, labelle.on/emit/dispatch_inbox event sugar, pure-Lua JSON.
 //!      Sugar lives in Lua, not Zig, because it manipulates Lua values —
@@ -31,6 +33,7 @@
 //! grow-and-retries once via a call-scoped userdata when required > cap —
 //! `game.query` always yields ALL matching ids, never a silent prefix.
 
+const std = @import("std");
 const contract = @import("../contract.zig");
 const vm_mod = @import("vm.zig");
 const c = vm_mod.c;
@@ -119,6 +122,10 @@ const shims = [_]Shim{
     .{ .name = "raw_scene_change", .func = rawSceneChange },
     .{ .name = "raw_log", .func = rawLog },
     .{ .name = "raw_time_dt", .func = rawTimeDt },
+    // VM-side (no contract behind them): per-tick GC pacing, vm.zig's.
+    .{ .name = "raw_gc_step", .func = rawGcStep },
+    .{ .name = "raw_gc_set_step_budget", .func = rawGcSetStepBudget },
+    .{ .name = "raw_gc_stats", .func = rawGcStats },
 };
 
 // ── argument helpers ─────────────────────────────────────────────────────
@@ -289,6 +296,45 @@ fn rawEventPoll(L: ?*c.State) callconv(.c) c_int {
     const n = contract.labelle_event_poll(buf, scratch.cap);
     _ = c.lua_pushlstring(L, buf, @min(n, scratch.cap));
     return 1;
+}
+
+// ── gc (VM-side, not contract-side) ──────────────────────────────────────
+// The per-tick GC pacing lives entirely in this plugin — vm.zig owns the
+// budget and the counters; the host game never sees any of it.
+
+/// One budgeted incremental GC step (vm.zig stepGc; a no-op returning 0
+/// when the budget is negative). Returns lua_gc's rc: 1 when this step
+/// finished a collection cycle, 0 otherwise, -1 when the collector
+/// refused (internally stopped). The prelude's `__tick_controllers`
+/// drives this once at the end of every Controller tick.
+fn rawGcStep(L: ?*c.State) callconv(.c) c_int {
+    c.lua_pushinteger(L, vm_mod.stepGc(L));
+    return 1;
+}
+
+/// Set the per-tick GC step budget (KB; 0 = the collector's own basic
+/// step, negative = disabled) and return the PREVIOUS budget — the
+/// save/restore shape tests want. Future plugin params (assembler#591)
+/// land on the same vm.zig seam this writes.
+fn rawGcSetStepBudget(L: ?*c.State) callconv(.c) c_int {
+    var isnum: c_int = 0;
+    const v = c.lua_tointegerx(L, 1, &isnum);
+    if (isnum == 0) argError(L, "labelle: expected an integer KB budget");
+    const budget = std.math.cast(c_int, v) orelse
+        argError(L, "labelle: GC step budget out of range");
+    c.lua_pushinteger(L, vm_mod.gc_step_budget_kb);
+    vm_mod.gc_step_budget_kb = budget;
+    return 1;
+}
+
+/// (steps, cycles): the monotonic counters of budgeted GC steps driven
+/// and of steps that completed a collection cycle. Deltas across a
+/// window are the test seam proving the per-tick step really ran — and
+/// kept finishing cycles incrementally, no full collect involved.
+fn rawGcStats(L: ?*c.State) callconv(.c) c_int {
+    c.lua_pushinteger(L, @intCast(vm_mod.gc_step_count));
+    c.lua_pushinteger(L, @intCast(vm_mod.gc_cycle_count));
+    return 2;
 }
 
 // ── scene / log / time ───────────────────────────────────────────────────

@@ -27,6 +27,16 @@
 -- json.decode tags every array it produces, so get→set round-trips keep
 -- arrayness without re-tagging.
 --
+-- Per-frame allocation rule (RFC-LANGUAGE-PLUGINS revs 14-15): the
+-- component boundary is the real per-frame allocator — a fresh table per
+-- e:get times a thousand entities times sixty frames is the garbage that
+-- matters, not script-local temporaries. Two idioms remove it:
+-- `e:get(name, into)` refills a caller-owned table (json.decode_into
+-- backs it), and FrameArray is the reusable per-frame list (Lua 5.4 has
+-- no table.clear; `t = {}` per frame allocates). What garbage remains is
+-- collected on a budget: labelle.__tick_controllers drives one
+-- incremental GC step per Controller tick (vm.zig owns the budget).
+--
 -- Component-ref rule (RFC-LANGUAGE-PLUGINS revs 6-7, "one DSL, two
 -- consumers"): `local Hunger = labelle.component("Hunger", { level = 1.0 })`
 -- is a SCHEMA DECLARATION at build time (the labelle-declare runner
@@ -175,6 +185,18 @@ local decode_escapes = {
 }
 
 local function decode_string(s, i) -- i sits on the opening quote
+  -- Fast path: no escape before the closing quote → one substring, no
+  -- per-character builder table. Component keys and short values live
+  -- here, and Lua interns short strings (≤ 40 bytes), so a steady-state
+  -- loop re-reading the same keys every tick allocates NOTHING new for
+  -- them — the decode-into zero-allocation story depends on this.
+  local q = s:find('"', i + 1, true)
+  if q == nil then decode_error(s, i, "unterminated string") end
+  local bs = s:find("\\", i + 1, true)
+  if bs == nil or bs > q then
+    return s:sub(i + 1, q - 1), q + 1
+  end
+  -- Slow path (an escape sits inside): the per-character builder.
   local out, j = {}, i + 1
   while true do
     local ch = s:sub(j, j)
@@ -229,33 +251,39 @@ end
 
 local decode_value -- forward declaration (containers recurse through it)
 
+-- Object fields decoded into `obj` — the caller picks the table, which
+-- is what lets decode_into aim the top level at a REUSED table while
+-- decode_value keeps handing it a fresh one. `i` sits on the '{'.
+local function decode_object(s, i, obj)
+  i = skip_ws(s, i + 1)
+  if s:sub(i, i) == "}" then return obj, i + 1 end
+  while true do
+    if s:sub(i, i) ~= '"' then decode_error(s, i, "expected object key") end
+    local k
+    k, i = decode_string(s, i)
+    i = skip_ws(s, i)
+    if s:sub(i, i) ~= ":" then decode_error(s, i, "expected ':'") end
+    local v
+    v, i = decode_value(s, i + 1)
+    obj[k] = v
+    i = skip_ws(s, i)
+    local sep = s:sub(i, i)
+    if sep == "," then
+      i = skip_ws(s, i + 1)
+    elseif sep == "}" then
+      return obj, i + 1
+    else
+      decode_error(s, i, "expected ',' or '}'")
+    end
+  end
+end
+
 decode_value = function(s, i)
   i = skip_ws(s, i)
   local ch = s:sub(i, i)
   if ch == "" then decode_error(s, i, "unexpected end of input") end
   if ch == "{" then
-    local obj = {}
-    i = skip_ws(s, i + 1)
-    if s:sub(i, i) == "}" then return obj, i + 1 end
-    while true do
-      if s:sub(i, i) ~= '"' then decode_error(s, i, "expected object key") end
-      local k
-      k, i = decode_string(s, i)
-      i = skip_ws(s, i)
-      if s:sub(i, i) ~= ":" then decode_error(s, i, "expected ':'") end
-      local v
-      v, i = decode_value(s, i + 1)
-      obj[k] = v
-      i = skip_ws(s, i)
-      local sep = s:sub(i, i)
-      if sep == "," then
-        i = skip_ws(s, i + 1)
-      elseif sep == "}" then
-        return obj, i + 1
-      else
-        decode_error(s, i, "expected ',' or '}'")
-      end
-    end
+    return decode_object(s, i, {})
   elseif ch == "[" then
     -- Tagged at birth: a decoded array re-encodes as an array (empty
     -- included), so get→modify→set round-trips preserve arrayness.
@@ -299,6 +327,44 @@ function json.decode(s)
   return v
 end
 
+--- Decode a top-level JSON OBJECT into `into`, reusing the caller's
+--- table instead of allocating a fresh one per decode — the leg backing
+--- `Entity:get(name, into)`, where the component boundary is the real
+--- per-frame allocator. Returns `into`.
+---
+--- Stale keys are handled clear-all-then-fill: every existing key of
+--- `into` is nilled first (a plain pairs walk assigning nil — it
+--- allocates nothing, and refilling the SAME keys right after revives
+--- their hash slots without a rehash), then the object's fields are
+--- written in. The alternative — mark-and-sweep of unseen keys — would
+--- need a per-call "seen" set, i.e. exactly the allocation this exists
+--- to remove.
+---
+--- NESTED tables (object or array values) still allocate fresh on every
+--- decode — v1 by design: the boundary win is the top-level per-entity
+--- read, so keep hot components FLAT. Anything non-object at the top
+--- level is an error, as is a decode error mid-way — in which case the
+--- contents of `into` are unspecified.
+function json.decode_into(s, into)
+  if type(s) ~= "string" then
+    error("json.decode_into: expected a string, got " .. type(s), 0)
+  end
+  if type(into) ~= "table" then
+    error("json.decode_into: expected a table to fill, got " .. type(into), 0)
+  end
+  local i = skip_ws(s, 1)
+  if s:sub(i, i) ~= "{" then
+    decode_error(s, i, "decode_into needs a top-level object")
+  end
+  for k in pairs(into) do
+    into[k] = nil
+  end
+  local _, j = decode_object(s, i, into)
+  j = skip_ws(s, j)
+  if j <= #s then decode_error(s, j, "trailing garbage") end
+  return into
+end
+
 -- ── component refs ───────────────────────────────────────────────────────
 -- A ref is `{ __labelle_component = "<Name>" }` — what labelle.component
 -- returns in BOTH modes (see the header's component-ref rule; the declare
@@ -340,10 +406,27 @@ function Entity.new()
 end
 
 --- Component as a table, or nil when absent (unknown name / dead entity).
-function Entity:get(name)
+--- With `into`, the read REFILLS that caller-owned table and returns it
+--- instead of allocating a fresh one — the hot-loop form (`name` may be
+--- a string or a labelle.component ref in both spellings):
+---
+---   local h = {}                      -- once, in init()
+---   for e in game.query(Hunger) do
+---     e:get(Hunger, h)                -- refill: no per-read table
+---     h.level = h.level - dt * 0.01
+---     e:set(Hunger, h)
+---   end
+---
+--- Top-level fields are set and stale keys from the previous fill are
+--- cleared; NESTED values still allocate fresh per read (keep hot
+--- components flat — see json.decode_into for both rules). When the
+--- component is absent the call returns nil and leaves `into` untouched,
+--- mirroring the ruby sub-module's get_into.
+function Entity:get(name, into)
   local s = labelle.raw_component_get(self.id, component_name(name))
   if s == "" then return nil end
-  return json.decode(s)
+  if into == nil then return json.decode(s) end
+  return json.decode_into(s, into)
 end
 
 --- Set (REPLACE semantics) a component from a table; nil/{} means "all
@@ -363,6 +446,126 @@ end
 
 function Entity:destroy()
   labelle.raw_entity_destroy(self.id)
+end
+
+-- ── FrameArray ───────────────────────────────────────────────────────────
+-- Per-frame scratch list — Zig's clearRetainingCapacity idiom made
+-- first-class for scripts (RFC-LANGUAGE-PLUGINS revs 14-15). Lua 5.4 has
+-- no table.clear, and a fresh `t = {}` every frame is exactly the
+-- per-frame allocation this exists to remove. A FrameArray preallocates
+-- its backing table once and tracks a LOGICAL length: `push` is an
+-- in-bounds array-part store (no rehash, no allocation), `clear` resets
+-- the length only (the storage — and any object references parked in it —
+-- survive until the next frame's pushes overwrite them), and growth
+-- happens ONLY when a push overflows capacity: the backing doubles, one
+-- deliberate reallocation, visible through growth_count() so a warmed
+-- loop can assert it stays flat. Mirrors the ruby sub-module's
+-- Labelle::FrameArray (same push-past-cap policy: double and count).
+--
+--   local fa                 -- construct in init(), not at chunk scope:
+--   function init()          -- chunk scope also runs in declare mode,
+--     fa = FrameArray.new(64)-- where only the labelle stub exists
+--   end
+--   function update(dt)
+--     fa:clear()
+--     for e in game.query("Enemy") do fa:push(e) end
+--     for i = 1, fa:size() do attack(fa:get(i)) end
+--   end
+
+local FrameArray = {}
+FrameArray.__index = FrameArray
+
+--- A FrameArray with room for `cap` values (a positive integer). The
+--- backing is filled with `false` up front — that one-time fill is what
+--- sizes the table's array part, so in-bounds pushes never reallocate.
+function FrameArray.new(cap)
+  if math.type(cap) ~= "integer" or cap < 1 then
+    error("FrameArray.new: capacity must be a positive integer", 2)
+  end
+  local buf = {}
+  for i = 1, cap do buf[i] = false end
+  return setmetatable({ buf = buf, n = 0, cap = cap, growths = 0 }, FrameArray)
+end
+
+--- Append `v`. In bounds this is a plain store into the preallocated
+--- backing; a push past capacity first DOUBLES the backing (one
+--- deliberate reallocation, counted — the ruby FrameArray's policy).
+--- Returns the FrameArray, so pushes chain.
+function FrameArray:push(v)
+  local n = self.n + 1
+  if n > self.cap then
+    local newcap = self.cap * 2
+    local buf = self.buf
+    for i = self.cap + 1, newcap do buf[i] = false end
+    self.cap = newcap
+    self.growths = self.growths + 1
+  end
+  self.buf[n] = v
+  self.n = n
+  return self
+end
+
+--- Logical length back to zero; capacity and backing survive — O(1),
+--- allocation-free, and the whole point (`buf = {}` would re-shrink).
+--- NOTE: the backing keeps STRONG references to the cleared values until
+--- they are overwritten by later pushes (same contract as the ruby
+--- FrameArray). That is free for the intended per-frame refill loop; if
+--- an array parks HEAVY objects and then shrinks its fill for many
+--- frames, use `release()` to drop them.
+function FrameArray:clear()
+  self.n = 0
+  return self
+end
+
+--- clear() plus dropping every parked reference: the whole backing is
+--- overwritten with `false` (not nil — the array part stays fully sized,
+--- no rehash on refill). O(capacity) and allocation-free; for the
+--- occasional "this held something big" moment, not the per-frame path.
+function FrameArray:release()
+  local buf = self.buf
+  for i = 1, self.cap do buf[i] = false end
+  self.n = 0
+  return self
+end
+
+function FrameArray:size()
+  return self.n
+end
+
+function FrameArray:capacity()
+  return self.cap
+end
+
+--- How many pushes had to grow the backing. A warmed per-frame loop
+--- asserts this stays flat: growth means the capacity guess was wrong,
+--- and the point of a FrameArray is that steady state never reallocates.
+function FrameArray:growth_count()
+  return self.growths
+end
+
+--- Value at 1-based logical index `i`; nil outside 1..size() (the
+--- backing beyond the logical length is invisible, whatever it holds).
+function FrameArray:get(i)
+  if i == nil or i < 1 or i > self.n then return nil end
+  return self.buf[i]
+end
+
+--- Overwrite an EXISTING slot (1..size()); raises out of logical
+--- bounds — extending is push's job.
+function FrameArray:set(i, v)
+  if i == nil or i < 1 or i > self.n then
+    error("FrameArray:set: index out of bounds", 2)
+  end
+  self.buf[i] = v
+end
+
+--- fn(value) over the logical contents, in order. Hoist `fn` out of the
+--- frame loop — a fresh closure per frame is itself the per-frame
+--- allocation this class exists to avoid.
+function FrameArray:each(fn)
+  local buf, n = self.buf, self.n
+  for i = 1, n do fn(buf[i]) end
+  return self
 end
 
 -- ── game ─────────────────────────────────────────────────────────────────
@@ -583,6 +786,21 @@ function labelle.dispatch_inbox()
   end
 end
 
+-- ── per-tick housekeeping ────────────────────────────────────────────────
+-- The Controller's once-per-tick prelude entry, called at the END of
+-- every tick after all script update(dt)s (on the ruby backend this same
+-- slot drives the controller tier; this backend has none, so it does VM
+-- housekeeping instead). One budgeted GC step per tick smears collection
+-- cost across frames — the frame's garbage is collected right after the
+-- frame produces it, instead of debt piling into a mid-frame pause. The
+-- budget model (and its interaction with Lua 5.4's own incremental
+-- pacing, which stays on as the backstop) lives with vm.zig's
+-- gc_step_budget_kb; labelle.raw_gc_set_step_budget tunes it.
+function labelle.__tick_controllers(dt)
+  local _ = dt -- housekeeping is time-independent today
+  labelle.raw_gc_step()
+end
+
 -- Eviction hook — vm.zig calls this (load-fail and init-fail paths) with
 -- the dead script's name: drop every handler that script registered, so
 -- a chunk-scope labelle.on can't keep firing into evicted state.
@@ -604,6 +822,7 @@ end
 _G.json = json
 _G.Entity = Entity
 _G.game = game
+_G.FrameArray = FrameArray
 
 -- name → private _ENV of each registered script; vm.zig fills it in
 -- loadScript and reads it in callScriptHook.
