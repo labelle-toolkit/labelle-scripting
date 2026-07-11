@@ -115,6 +115,24 @@ test "copyBounded: exact fit has no marker; overflow is marked" {
     try expectEqualStrings("12345…", eval.copyBounded("123456789", &buf));
 }
 
+test "copyBounded: buffers smaller than the marker cut clean (release-mode underflow guard)" {
+    // The marker is 3 bytes ("…"); out.len below that used to ride an
+    // assert whose release-mode absence let `out.len - marker.len`
+    // underflow into an out-of-bounds copy. Now: plain codepoint-safe
+    // cut, no marker, never past out.len.
+    var b2: [2]u8 = undefined;
+    try expectEqualStrings("ab", eval.copyBounded("abcdef", &b2));
+    var b1: [1]u8 = undefined;
+    try expectEqualStrings("a", eval.copyBounded("abcdef", &b1));
+    // A multi-byte codepoint that would straddle the tiny cap is dropped
+    // whole rather than split.
+    try expectEqualStrings("", eval.copyBounded("é", &b1));
+    var b0: [0]u8 = undefined;
+    try expectEqualStrings("", eval.copyBounded("abcdef", &b0));
+    // Fits-exactly still copies verbatim below the marker size.
+    try expectEqualStrings("ab", eval.copyBounded("ab", &b2));
+}
+
 // ── extractCode ──────────────────────────────────────────────────────
 
 test "extractCode: plain, escaped, missing, malformed and non-string params" {

@@ -191,6 +191,10 @@ var console_out_len: usize = 0;
 /// `pcallTraceback` because `luaL_tolstring` can raise (a throwing
 /// `__tostring`) — this frame holds no defers, so the longjmp is safe.
 fn renderConsoleResults(L: ?*c.State) callconv(.c) c_int {
+    // console_out is a runtime slice (the caller's buffer; &.{} between
+    // evals) — guard before the subtraction below, which would otherwise
+    // underflow in release builds where an assert vanishes.
+    if (console_out.len < eval_mod.truncation_marker.len) return 0;
     const n = c.lua_gettop(L);
     // The marker's bytes stay reserved throughout, so appending it after
     // ANY truncation can never overflow.

@@ -72,10 +72,18 @@ pub fn utf8SafeLen(bytes: []const u8, limit: usize) usize {
 /// UTF-8 codepoint and append the truncation marker. The shared tail of
 /// every backend's result/error rendering. Returns the written slice.
 pub fn copyBounded(text: []const u8, out: []u8) []const u8 {
-    std.debug.assert(out.len >= truncation_marker.len);
     if (text.len <= out.len) {
         @memcpy(out[0..text.len], text);
         return out[0..text.len];
+    }
+    // Doesn't fit. A buffer too small for even the marker gets a plain
+    // codepoint-safe cut — a runtime guard, not an assert, because in
+    // release builds an assert vanishes and `out.len - marker.len`
+    // would underflow into an out-of-bounds @memcpy.
+    if (out.len < truncation_marker.len) {
+        const cut = utf8SafeLen(text, out.len);
+        @memcpy(out[0..cut], text[0..cut]);
+        return out[0..cut];
     }
     const cut = utf8SafeLen(text, out.len - truncation_marker.len);
     @memcpy(out[0..cut], text[0..cut]);
