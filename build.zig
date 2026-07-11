@@ -137,7 +137,13 @@ const mruby_sources = [_][]const u8{
 ///   MRB_NO_BOXING  — mrb_value as the mirrorable {union, tag} struct
 ///                    (word boxing, mruby's default, is not hand-declarable
 ///                    and demotes bit-63 integers to heap allocations).
-const mruby_defines = [_][]const u8{ "-DMRB_INT64", "-DMRB_NO_BOXING" };
+///   MRB_NO_DEFAULT_RO_DATA_P — on Linux mrbconf.h defaults to the
+///                    etext/edata read-only-data probe, but zig's lld does
+///                    not synthesize those legacy libc symbols, so the link
+///                    fails (undefined: etext/edata). Opting out (the
+///                    mrbconf.h-documented knob) merely makes mruby COPY
+///                    C string literals instead of aliasing them.
+const mruby_defines = [_][]const u8{ "-DMRB_INT64", "-DMRB_NO_BOXING", "-DMRB_NO_DEFAULT_RO_DATA_P" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
