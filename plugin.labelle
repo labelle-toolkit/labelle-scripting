@@ -2,4 +2,10 @@
     .name = "scripting",
     .manifest_version = 1,
     .convention_dirs = .{},
+    // The studio Script Console's eval handler (labelle-scripting#4)
+    // rides a bundled pack: its hooks/console_eval.zig is the assembler-
+    // wired subscription to `engine__editor_plugin_command` (pack hooks
+    // are the plugin→GameHooks seam), while the plugin module itself
+    // stays engine-free. See packs/scripting_console/pack.labelle.
+    .packs = .{"scripting_console"},
 }

@@ -1,0 +1,17 @@
+// The scripting plugin's BUNDLED PACK (Asset-Plugins Phase 2,
+// labelle-assembler#576): plugin.labelle's `.packs = .{ "scripting_console" }`
+// registers this directory through the same machinery as a game-local
+// pack — copied, scanned, wired as the `pack__scripting_console` module.
+//
+// Why the eval handler lives in a pack and not in src/: the assembler
+// folds a pack's `hooks/*.zig` into the generated game's `GameHooks`
+// receiver tuple (Packs RFC §4, labelle-assembler#440) — the ONLY
+// convention through which a plugin can subscribe to an engine event
+// (`engine__editor_plugin_command`) today — and pack modules import both
+// `labelle-engine` and every decl-module plugin, exactly the two things
+// hooks/console_eval.zig needs. The plugin's own src/ module stays
+// engine-free (its tests link only the C contract + mock world).
+.{
+    .name = "scripting_console",
+    .manifest_version = 1,
+}

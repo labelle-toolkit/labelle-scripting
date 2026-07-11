@@ -41,3 +41,12 @@ test {
 comptime {
     if (scripting.language == .lua) _ = @import("declare_tool.zig");
 }
+
+// The console-eval SHARED-code suite (response builder, params decoding,
+// hook-shim AstGen check — labelle-scripting#4) also rides the lua binary
+// only: the code under test is language-independent, so one mirror is the
+// whole coverage. Each language's eval CORE (Vm.evalConsole) is tested in
+// its own suite.
+comptime {
+    if (scripting.language == .lua) _ = @import("eval_shared_suite.zig");
+}

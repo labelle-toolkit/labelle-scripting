@@ -3,7 +3,10 @@
 //! This module is the SHARED plugin glue: the plugin `Controller`
 //! (RFC-plugin-controllers shape — `setup`/`tick`/`deinit`, wired by the
 //! assembler like any other plugin) plus `registerScript`, the seam the
-//! generated game feeds embedded script sources through. Everything
+//! generated game feeds embedded script sources through, plus the studio
+//! Script Console's eval core (`Controller.evalCommand` /
+//! `handleEvalCommand` — labelle-scripting#4; the engine-coupled hook
+//! shim rides the bundled `scripting_console` pack). Everything
 //! game-facing goes through the Script Runtime Contract
 //! (labelle-engine/contract/labelle_script.h, declared once in
 //! src/contract.zig): the host game exports ~15 flat C symbols in its own
@@ -28,6 +31,11 @@ const std = @import("std");
 const build_options = @import("scripting_options");
 
 pub const contract = @import("contract.zig");
+
+/// Console-eval shared pieces (labelle-scripting#4): result shape, params
+/// decoding, bounded response-JSON builder. Engine-free — see
+/// `Controller.evalCommand` / `handleEvalCommand` below for the seams.
+pub const eval = @import("eval.zig");
 
 /// The selected language (introspection/tests — the test root switches
 /// its suite on this).
@@ -113,6 +121,39 @@ pub fn clearScripts() void {
     script_count = 0;
 }
 
+// ── Console eval (labelle-scripting#4) ──────────────────────────────────
+//
+// The studio Script Console dispatches `{plugin: "scripting", command:
+// "eval", params: {code}}` through the engine's editor-plugin-command
+// channel; the pack hook shim (packs/scripting_console/hooks/
+// console_eval.zig — compiled only inside generated games) routes it to
+// `handleEvalCommand` below. The eval CORE lives here + in each
+// backend's `Vm.evalConsole` so it is fully covered by this repo's
+// mock-world suites with zero engine coupling.
+//
+// Buffer model: like the VM itself, eval state is module-level and
+// main-thread-only — one rendered-text buffer, one params scratch. A
+// result slice is valid until the next eval.
+
+/// Rendered result/error text of the most recent eval.
+var eval_text_buf: [eval.max_text_len]u8 = undefined;
+/// Backs `eval.extractCode`'s params parse (json nesting stack + the
+/// unescaped code). 2× the code cap always suffices.
+var eval_params_scratch: [eval.max_code_len * 2]u8 = undefined;
+
+/// The full studio-command path, shaped for the hook shim: decode
+/// `params_json` (`{"code": "..."}`), evaluate in the active language
+/// VM's persistent console environment, and build the bounded response
+/// JSON (`{"ok":true,"value":…}` / `{"ok":false,"error":…}`) into `out`.
+/// Callers pass a response-cap-sized buffer (the engine channel's
+/// `max_response_len`); the returned slice points into `out`.
+pub fn handleEvalCommand(params_json: []const u8, out: []u8) []const u8 {
+    const code = eval.extractCode(params_json, &eval_params_scratch) orelse
+        return eval.buildResponse(false, "invalid eval params — expected {\"code\":\"…\"}", out);
+    const result = Controller.evalCommand(code);
+    return eval.buildResponse(result.ok, result.text, out);
+}
+
 /// The plugin controller (assembler-wired):
 ///   setup  → boot the VM, install bindings + prelude, load registered
 ///            scripts, run each script's `init()`;
@@ -187,6 +228,32 @@ pub const Controller = struct {
             _ = vm.callScriptHook(s.name, "update", dt);
         }
         vm.callLabelleFn("__tick_controllers", dt);
+    }
+
+    /// Evaluate one console `code` string in the ACTIVE language VM
+    /// (labelle-scripting#4 — the studio Script Console's eval core).
+    ///
+    /// Every backend gives the console a PERSISTENT environment that
+    /// inherits the full labelle script API, so `x = 5` on one eval and
+    /// `x` on the next behave like a REPL session: lua uses a dedicated
+    /// registry-kept `_ENV` (`__index = _G`), ruby a reused compile
+    /// context (mruby's mirb-style top-level locals keep), typescript
+    /// the shared globals of QuickJS global-mode eval.
+    ///
+    /// Standard error isolation: an eval that throws NEVER kills the VM
+    /// or the tick — the error text (message + traceback, each
+    /// language's own machinery) comes back in `EvalResult.text` with
+    /// `ok = false`, and the next eval / next tick proceed untouched.
+    ///
+    /// `text` is a bounded render (result value via the language's
+    /// inspect/tostring, `eval.max_text_len` cap, truncation-marked) in
+    /// a module buffer — valid until the next eval, main thread only.
+    pub fn evalCommand(code: []const u8) eval.EvalResult {
+        const vm = active_vm orelse return .{
+            .ok = false,
+            .text = "scripting VM is not running (eval before setup or after deinit)",
+        };
+        return vm.evalConsole(code, &eval_text_buf);
     }
 
     /// Teardown, LIFO against setup: controller `teardown`s in reverse

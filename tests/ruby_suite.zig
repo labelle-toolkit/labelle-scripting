@@ -832,3 +832,135 @@ test "top-level helpers are private to their script (no Object hijack)" {
     // from a script that never defined it.
     try expectComponent(1, "HelperLeak", "{\"leaked\":false,\"raised\":true}");
 }
+
+// ── Console eval (labelle-scripting#4) ──────────────────────────────────
+
+test "console eval renders expression results via inspect" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    const r = scripting.Controller.evalCommand("1+2");
+    try expect(r.ok);
+    try expectEqualStrings("3", r.text);
+
+    // inspect, not to_s: strings come back quoted, like irb/mirb.
+    const s = scripting.Controller.evalCommand("\"hi\".upcase");
+    try expect(s.ok);
+    try expectEqualStrings("\"HI\"", s.text);
+}
+
+test "console eval persists top-level locals across evals (mirb keep)" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // One reused compile context = mruby's own REPL persistence: the
+    // local's NAME survives in cxt->syms and its VALUE in the kept
+    // top-level stack slots.
+    const set = scripting.Controller.evalCommand("x = 5");
+    try expect(set.ok);
+    try expectEqualStrings("5", set.text); // assignments yield their value
+
+    const get = scripting.Controller.evalCommand("x");
+    try expect(get.ok);
+    try expectEqualStrings("5", get.text);
+}
+
+test "console eval errors carry class, message and backtrace; VM and tick survive" {
+    fresh();
+    scripting.registerScript("counter", @embedFile("ruby/counter.rb"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.125);
+
+    const err = scripting.Controller.evalCommand("raise \"console boom\"");
+    try expect(!err.ok);
+    try expect(std.mem.indexOf(u8, err.text, "RuntimeError") != null);
+    try expect(std.mem.indexOf(u8, err.text, "console boom") != null);
+    try expect(std.mem.indexOf(u8, err.text, "console:1") != null);
+
+    // Parse errors surface the same isolated way (capture_errors →
+    // SyntaxError with the line prefix)...
+    const bad = scripting.Controller.evalCommand("def (");
+    try expect(!bad.ok);
+    try expect(std.mem.indexOf(u8, bad.text, "SyntaxError") != null);
+
+    // ...the VM survived: the next eval works...
+    const again = scripting.Controller.evalCommand("1+1");
+    try expect(again.ok);
+    try expectEqualStrings("2", again.text);
+
+    // ...and the tick keeps driving the registered scripts.
+    scripting.Controller.tick(.{}, 0.125);
+    try expectComponent(1, "Counter", "{\"dt\":0.125,\"n\":2}");
+}
+
+test "console eval reaches the game world through the Labelle API" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    const r = scripting.Controller.evalCommand(
+        "Labelle::Entity.create.set(\"FromEval\", {a: 1})",
+    );
+    try expect(r.ok);
+    try expectEqualStrings("true", r.text); // Entity#set returns rc == 0
+    try expectComponent(1, "FromEval", "{\"a\":1}");
+}
+
+test "console eval bounds oversized results into valid truncated response JSON" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    var buf: [scripting.eval.max_response_len]u8 = undefined;
+    const response = scripting.handleEvalCommand(
+        "{\"code\":\"\\\"x\\\" * 9000\"}",
+        &buf,
+    );
+    try expect(response.len <= scripting.eval.max_response_len);
+    const parsed = try std.json.parseFromSlice(
+        struct { ok: bool, value: []const u8 },
+        std.testing.allocator,
+        response,
+        .{},
+    );
+    defer parsed.deinit();
+    try expect(parsed.value.ok);
+    // inspect renders the string QUOTED: the value opens with `"` + x's.
+    try expect(std.mem.startsWith(u8, parsed.value.value, "\"xxx"));
+    try expect(std.mem.endsWith(u8, parsed.value.value, scripting.eval.truncation_marker));
+}
+
+test "console eval during ticking leaves registered scripts undisturbed" {
+    fresh();
+    scripting.registerScript("counter", @embedFile("ruby/counter.rb"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.125);
+    const r = scripting.Controller.evalCommand("session_note = \"between ticks\"");
+    try expect(r.ok);
+    scripting.Controller.tick(.{}, 0.125);
+
+    // The counter advanced exactly twice — the eval neither consumed a
+    // tick nor disturbed the script registry.
+    try expectComponent(1, "Counter", "{\"dt\":0.125,\"n\":2}");
+}
+
+test "console eval: mruby inspect hex-escapes invalid bytes (already JSON-safe)" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // The ruby render path is `#inspect`, and mruby's String#inspect
+    // hex-escapes non-UTF-8 bytes — so invalid bytes never reach the
+    // response builder raw from here (the builder's U+FFFD replacement
+    // is pinned language-independently in the shared suite and by the
+    // lua suite, whose tostring DOES pass raw bytes).
+    const r = scripting.Controller.evalCommand("255.chr");
+    try expect(r.ok);
+    try expectEqualStrings("\"\\xff\"", r.text);
+}

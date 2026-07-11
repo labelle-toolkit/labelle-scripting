@@ -40,5 +40,11 @@
         // The ruby sub-module's vendored mruby snapshot (upstream sources
         // + generated presym/bytecode C); compiled only for -Dlanguage=ruby.
         "vendor",
+        // Bundled packs plugin.labelle's `.packs` references (the studio
+        // console's eval-handler hook rides packs/scripting_console/) —
+        // the assembler resolves them from the consuming game's FETCHED
+        // copy, so they MUST ship in the package. tests/eval_shared_suite
+        // pins this list against plugin.labelle.
+        "packs",
     },
 }

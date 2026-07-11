@@ -56,6 +56,7 @@
 
 const std = @import("std");
 const contract = @import("../contract.zig");
+const eval_mod = @import("../eval.zig");
 
 /// Hand-declared mruby 3.4 C API — just the slice this plugin uses.
 /// Real MRB_API functions only; macro-shaped APIs come from shim.c.
@@ -223,6 +224,18 @@ const FILENAME_CAP = 128;
 /// truncation beats a heap allocation inside the error path.
 const ERROR_LOG_CAP = 2048;
 
+/// The console's persistent compile context (labelle-scripting#4),
+/// created on first `evalConsole` and freed in `close`. Reusing ONE
+/// mrbc context across `mrb_load_nstring_cxt` calls is mruby's own
+/// REPL-persistence mechanism (mrb_load_exec: the first load flips
+/// `keep_lv`, every later load runs with `stack_keep = slen + 1`), so
+/// top-level locals keep both their NAMES (parser restores them from
+/// `cxt->syms`) and their VALUES (the kept top-level stack slots) across
+/// evals — `x = 5` then `x` behaves like mirb. Module-level like the VM
+/// itself: contexts are allocator-owned, NOT GC-owned, so `mrb_close`
+/// alone would leak it.
+var console_cxt: ?*c.Context = null;
+
 /// Format + route one error line through the host's log sink.
 fn logError(context: []const u8, text: []const u8) void {
     var buf: [ERROR_LOG_CAP]u8 = undefined;
@@ -266,8 +279,13 @@ pub const Vm = struct {
     }
 
     /// Close the VM. mruby's GC releases every script, receiver, handler
-    /// and binding — this is the whole teardown story.
+    /// and binding; the console's compile context is the one
+    /// allocator-owned (not GC-owned) piece and is freed explicitly.
     pub fn close(self: Vm) void {
+        if (console_cxt) |cxt| {
+            c.mrb_ccontext_free(self.mrb, cxt);
+            console_cxt = null;
+        }
         c.mrb_close(self.mrb);
     }
 
@@ -422,9 +440,7 @@ pub const Vm = struct {
 
     /// If mrb->exc holds a parked exception: format "<class>: <message>"
     /// plus its backtrace, route it through labelle_log, clear the slot,
-    /// and return true. The formatting funcalls (message/backtrace) are
-    /// themselves entries — a pathological exception object that raises
-    /// from #message degrades to the class name alone rather than looping.
+    /// and return true.
     fn logPendingException(self: Vm, context: []const u8) bool {
         const mrb = self.mrb;
         const exc = c.labelle_mrb_exc_get(mrb);
@@ -437,6 +453,23 @@ pub const Vm = struct {
             w.print("[ruby] {s}: ", .{context}) catch {}
         else
             w.print("[ruby] ", .{}) catch {};
+        self.renderExceptionValue(&w, exc);
+
+        const line = w.buffered();
+        contract.labelle_log(line.ptr, line.len);
+        return true;
+    }
+
+    /// Render one (already TAKEN — slot cleared) exception value as
+    /// "<class>: <message>\n  backtrace: name:3:in update | name:1" into
+    /// `w` — the shared body behind `logPendingException` (log flavor)
+    /// and `evalConsole` (capture flavor). The formatting funcalls
+    /// (message/backtrace) are themselves entries — a pathological
+    /// exception object that raises from #message degrades to the class
+    /// name alone rather than looping. Writer overflow = truncation, by
+    /// design on both paths.
+    fn renderExceptionValue(self: Vm, w: *std.Io.Writer, exc: c.Value) void {
+        const mrb = self.mrb;
         w.print("{s}: ", .{c.mrb_obj_classname(mrb, exc)}) catch {};
 
         const msg = c.mrb_funcall_argv(mrb, exc, self.sym_message, 0, null);
@@ -447,8 +480,8 @@ pub const Vm = struct {
             w.print("{s}", .{strSlice(msg)}) catch {};
         }
 
-        // "\n  backtrace: name:3:in update | name:1" — the mruby analog of
-        // lua's "stack traceback:" block, flattened to one log line.
+        // The mruby analog of lua's "stack traceback:" block, flattened
+        // to one line.
         const bt = c.mrb_funcall_argv(mrb, exc, self.sym_backtrace, 0, null);
         if (!c.labelle_mrb_exc_get(mrb).isNil()) {
             c.labelle_mrb_exc_clear(mrb);
@@ -463,10 +496,74 @@ pub const Vm = struct {
                 w.print("{s}", .{strSlice(entry)}) catch {};
             }
         }
+    }
 
-        const line = w.buffered();
-        contract.labelle_log(line.ptr, line.len);
-        return true;
+    /// Evaluate one console `code` string (labelle-scripting#4 — the ruby
+    /// half of `Controller.evalCommand`; see root.zig for the shared
+    /// contract). REPL semantics:
+    ///
+    ///   - PERSISTENT top level: every eval loads through ONE reused
+    ///     compile context (see `console_cxt`) — mruby's built-in
+    ///     mirb-style keep means `x = 5` then `x` works across evals; no
+    ///     expression/statement split is needed, ruby chunks already
+    ///     yield their last expression's value;
+    ///   - the console shares the scripts' top-level world: the Labelle
+    ///     API, prelude classes and globals are all reachable;
+    ///   - results render via `#inspect` (guarded — a raising inspect
+    ///     degrades to the class name), truncation-marked at the cap;
+    ///   - error isolation: parse errors (capture_errors → SyntaxError)
+    ///     and raises land in mrb->exc exactly like script errors; the
+    ///     text comes back as `ok = false` with class, message and
+    ///     backtrace — the VM and the tick survive, always.
+    pub fn evalConsole(self: Vm, code: []const u8, out: []u8) eval_mod.EvalResult {
+        const mrb = self.mrb;
+        if (code.len > eval_mod.max_code_len) return .{
+            .ok = false,
+            .text = "console code too long (8 KiB cap)",
+        };
+        const arena = c.labelle_mrb_gc_arena_save(mrb);
+        defer c.labelle_mrb_gc_arena_restore(mrb, arena);
+
+        const cxt = console_cxt orelse blk: {
+            const cx = c.mrb_ccontext_new(mrb) orelse return .{
+                .ok = false,
+                .text = "console compile context allocation failed",
+            };
+            // Backtrace lines read "console:<line>"; parse errors park a
+            // SyntaxError in mrb->exc instead of printing to stderr.
+            _ = c.mrb_ccontext_filename(mrb, cx, "console");
+            c.labelle_mrbc_capture_errors(cx, 1);
+            console_cxt = cx;
+            break :blk cx;
+        };
+
+        const ret = c.mrb_load_nstring_cxt(mrb, code.ptr, code.len, cxt);
+
+        // Error leg: parse error or raise — render class/message/backtrace.
+        const exc = c.labelle_mrb_exc_get(mrb);
+        if (!exc.isNil()) {
+            c.labelle_mrb_exc_clear(mrb);
+            var w = std.Io.Writer.fixed(out);
+            self.renderExceptionValue(&w, exc);
+            return .{ .ok = false, .text = w.buffered() };
+        }
+
+        // Result leg: `#inspect`, class-name fallback when inspect itself
+        // raises or returns a non-string (pathological but survivable).
+        const insp_sym = c.mrb_intern(mrb, "inspect", "inspect".len);
+        const insp = c.mrb_funcall_argv(mrb, ret, insp_sym, 0, null);
+        if (!c.labelle_mrb_exc_get(mrb).isNil()) {
+            c.labelle_mrb_exc_clear(mrb);
+            return .{ .ok = true, .text = eval_mod.copyBounded(
+                std.mem.span(c.mrb_obj_classname(mrb, ret)),
+                out,
+            ) };
+        }
+        if (insp.tt != .string) return .{ .ok = true, .text = eval_mod.copyBounded(
+            std.mem.span(c.mrb_obj_classname(mrb, ret)),
+            out,
+        ) };
+        return .{ .ok = true, .text = eval_mod.copyBounded(strSlice(insp), out) };
     }
 };
 

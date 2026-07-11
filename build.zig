@@ -252,17 +252,37 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         configureLanguage(b, lang_mod, lang, lua_dep_opt, quickjs_dep_opt);
+        const tests_root_mod = b.createModule(.{
+            .root_source_file = b.path("tests/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "labelle_scripting", .module = lang_mod },
+                .{ .name = "declare_core", .module = declare_core_mod },
+            },
+        });
+        // The pack hook shim's SOURCE, for the eval shared suite's AstGen
+        // compile check (tests/eval_shared_suite.zig): the file itself can
+        // only compile inside a generated game (it imports labelle-engine),
+        // so the suite `@embedFile`s it through this anonymous import and
+        // runs parse + AstGen — the strongest engine-free verification.
+        tests_root_mod.addAnonymousImport("console_eval_shim_src", .{
+            .root_source_file = b.path("packs/scripting_console/hooks/console_eval.zig"),
+        });
+        // Both manifests, for the shared suite's packaging-consistency pin:
+        // every unit plugin.labelle references (bundled packs, convention
+        // dirs) must be covered by build.zig.zon's `.paths` whitelist — a
+        // referenced-but-unshipped directory would hand consumers a
+        // manifest pointing at content their fetched copy doesn't have.
+        tests_root_mod.addAnonymousImport("plugin_labelle_src", .{
+            .root_source_file = b.path("plugin.labelle"),
+        });
+        tests_root_mod.addAnonymousImport("build_zig_zon_src", .{
+            .root_source_file = b.path("build.zig.zon"),
+        });
         const tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tests/root.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-                .imports = &.{
-                    .{ .name = "labelle_scripting", .module = lang_mod },
-                    .{ .name = "declare_core", .module = declare_core_mod },
-                },
-            }),
+            .root_module = tests_root_mod,
         });
         const run_tests = b.addRunArtifact(tests);
         test_step.dependOn(&run_tests.step);

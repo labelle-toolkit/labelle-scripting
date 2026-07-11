@@ -581,6 +581,125 @@ test "e:get(name, into) refills the caller's table and clears stale keys" {
     try expectComponent(2, "GetIntoOk", "{\"ok\":true}");
 }
 
+// ── Console eval (labelle-scripting#4) ──────────────────────────────────
+
+test "console eval renders expression results" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    const r = scripting.Controller.evalCommand("1+2");
+    try expect(r.ok);
+    try expectEqualStrings("3", r.text);
+
+    // Multiple return values render print-style (tab-separated) — the
+    // expression-first compile (`return <code>;`) keeps them all.
+    const multi = scripting.Controller.evalCommand("1, \"two\"");
+    try expect(multi.ok);
+    try expectEqualStrings("1\ttwo", multi.text);
+}
+
+test "console eval persists state across evals in a session env that shadows _G" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Statement (the `return` wrap doesn't parse → statement fallback):
+    // the assignment lands in the persistent console _ENV.
+    const set = scripting.Controller.evalCommand("x = 5");
+    try expect(set.ok);
+    try expectEqualStrings("", set.text); // statements yield no results
+
+    const get = scripting.Controller.evalCommand("x");
+    try expect(get.ok);
+    try expectEqualStrings("5", get.text);
+
+    // The session env SHADOWS the real globals (loadScript's isolation
+    // shape): console writes never leak into _G where scripts would see
+    // them.
+    const raw = scripting.Controller.evalCommand("rawget(_G, \"x\")");
+    try expect(raw.ok);
+    try expectEqualStrings("nil", raw.text);
+}
+
+test "console eval errors carry the traceback and never kill the VM or the tick" {
+    fresh();
+    scripting.registerScript("counter", @embedFile("lua/counter.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.125);
+
+    const err = scripting.Controller.evalCommand("error(\"console boom\")");
+    try expect(!err.ok);
+    try expect(std.mem.indexOf(u8, err.text, "console boom") != null);
+    try expect(std.mem.indexOf(u8, err.text, "console:1") != null);
+    try expect(std.mem.indexOf(u8, err.text, "stack traceback:") != null);
+
+    // Compile errors surface the same way (location included)...
+    const bad = scripting.Controller.evalCommand("function (");
+    try expect(!bad.ok);
+    try expect(std.mem.indexOf(u8, bad.text, "console:1") != null);
+
+    // ...the VM survived: the next eval works...
+    const again = scripting.Controller.evalCommand("1+1");
+    try expect(again.ok);
+    try expectEqualStrings("2", again.text);
+
+    // ...and the tick keeps driving the registered scripts.
+    scripting.Controller.tick(.{}, 0.125);
+    try expectComponent(1, "Counter", "{\"dt\":0.125,\"n\":2}");
+}
+
+test "console eval reaches the game world through the labelle API" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    const r = scripting.Controller.evalCommand("Entity.new():set(\"FromEval\", { a = 1 })");
+    try expect(r.ok);
+    try expectComponent(1, "FromEval", "{\"a\":1}");
+}
+
+test "console eval bounds oversized results into valid truncated response JSON" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    var buf: [scripting.eval.max_response_len]u8 = undefined;
+    const response = scripting.handleEvalCommand(
+        "{\"code\":\"return string.rep(\\\"x\\\", 9000)\"}",
+        &buf,
+    );
+    try expect(response.len <= scripting.eval.max_response_len);
+    const parsed = try std.json.parseFromSlice(
+        struct { ok: bool, value: []const u8 },
+        std.testing.allocator,
+        response,
+        .{},
+    );
+    defer parsed.deinit();
+    try expect(parsed.value.ok);
+    try expect(std.mem.startsWith(u8, parsed.value.value, "xxxx"));
+    try expect(std.mem.endsWith(u8, parsed.value.value, scripting.eval.truncation_marker));
+}
+
+test "console eval during ticking leaves registered scripts undisturbed" {
+    fresh();
+    scripting.registerScript("counter", @embedFile("lua/counter.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.125);
+    const r = scripting.Controller.evalCommand("session_note = \"between ticks\"");
+    try expect(r.ok);
+    scripting.Controller.tick(.{}, 0.125);
+
+    // The counter advanced exactly twice — the eval neither consumed a
+    // tick nor disturbed the script registry.
+    try expectComponent(1, "Counter", "{\"dt\":0.125,\"n\":2}");
+}
+
 test "hot loop: 1k entities of get-into + FrameArray hold steady-state memory flat" {
     fresh();
     scripting.registerScript("hot_loop", @embedFile("lua/hot_loop.lua"));
@@ -606,4 +725,46 @@ test "hot loop: 1k entities of get-into + FrameArray hold steady-state memory fl
     // (level 1000 - 110 * 0.25, count 110 — both exact in binary).
     try expectComponent(2, "Hot", "{\"count\":110,\"level\":972.5}");
     try expectComponent(1001, "Hot", "{\"count\":110,\"level\":972.5}");
+}
+
+test "console eval: invalid UTF-8 result bytes become replacement chars in valid response JSON" {
+    fresh();
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // lua strings are arbitrary bytes; JSON is UTF-8 by definition — a
+    // raw 0xFF passed through would make the WHOLE response unparseable
+    // on the studio side even though the eval succeeded.
+    var buf: [scripting.eval.max_response_len]u8 = undefined;
+    const response = scripting.handleEvalCommand(
+        "{\"code\":\"return string.char(255)\"}",
+        &buf,
+    );
+    try expect(std.unicode.utf8ValidateSlice(response));
+    const parsed = try std.json.parseFromSlice(
+        struct { ok: bool, value: []const u8 },
+        std.testing.allocator,
+        response,
+        .{},
+    );
+    defer parsed.deinit();
+    try expect(parsed.value.ok);
+    try expectEqualStrings(scripting.eval.replacement_char, parsed.value.value);
+
+    // Mixed: the VALID multi-byte é passes through whole — only the raw
+    // invalid byte is replaced.
+    const mixed = scripting.handleEvalCommand(
+        "{\"code\":\"return \\\"é\\\" .. string.char(255) .. \\\"z\\\"\"}",
+        &buf,
+    );
+    try expect(std.unicode.utf8ValidateSlice(mixed));
+    const p2 = try std.json.parseFromSlice(
+        struct { ok: bool, value: []const u8 },
+        std.testing.allocator,
+        mixed,
+        .{},
+    );
+    defer p2.deinit();
+    try expect(p2.value.ok);
+    try expectEqualStrings("é" ++ scripting.eval.replacement_char ++ "z", p2.value.value);
 }
