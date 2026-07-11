@@ -318,3 +318,52 @@ test "pack hook shim parses, AstGen-compiles and keeps its wired names" {
     try expect(std.mem.indexOf(u8, src, "pub const ConsoleEval = struct") != null);
     try expect(std.mem.indexOf(u8, src, "pub fn engine__editor_plugin_command(") != null);
 }
+
+test "packaging: the language schema vocabulary IS build.zig's Language enum" {
+    // plugin.labelle's .params_schema declares the assembler-facing
+    // language vocabulary (labelle-assembler#591 validates projects
+    // against it at generate); build.zig's Language enum — reflected
+    // here through @TypeOf(scripting.language) — is what the package
+    // actually builds. They must be the SAME set: adding a sub-module
+    // without widening the schema (or vice versa) fails this suite
+    // instead of surfacing as a consumer's generate-time vocabulary
+    // error.
+    const gpa = std.testing.allocator;
+
+    const Manifest = struct {
+        params_schema: []const struct {
+            name: []const u8,
+            type: enum { str, i64, f64, bool, @"enum" },
+            values: []const []const u8 = &.{},
+            required: bool = false,
+        } = &.{},
+    };
+    const plugin_src: [:0]const u8 = @embedFile("plugin_labelle_src");
+    const pm = try std.zon.parse.fromSliceAlloc(
+        Manifest,
+        gpa,
+        plugin_src,
+        null,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer std.zon.parse.free(gpa, pm);
+
+    const lang_fields = @typeInfo(@TypeOf(scripting.language)).@"enum".fields;
+    var found = false;
+    for (pm.params_schema) |entry| {
+        if (!std.mem.eql(u8, entry.name, "language")) continue;
+        found = true;
+        try expect(entry.type == .@"enum");
+        try expect(entry.required);
+        // Set equality: same count + every enum tag present in the vocab.
+        try expectEqual(lang_fields.len, entry.values.len);
+        inline for (lang_fields) |lf| {
+            var present = false;
+            for (entry.values) |v| {
+                if (std.mem.eql(u8, v, lf.name)) present = true;
+            }
+            try expect(present);
+        }
+    }
+    try expect(found);
+}

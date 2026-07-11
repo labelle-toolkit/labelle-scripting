@@ -8,4 +8,16 @@
     // are the plugin→GameHooks seam), while the plugin module itself
     // stays engine-free. See packs/scripting_console/pack.labelle.
     .packs = .{"scripting_console"},
+    // The language choice, schema-declared (labelle-assembler#591): the
+    // assembler validates the project's `.params = .{ .language = ... }`
+    // against this vocabulary at generate (string or enum-literal
+    // spelling) and supersedes its schema-less `{language}` fast-path.
+    // The vocabulary is EXACTLY the languages this plugin implements —
+    // tests/eval_shared_suite.zig pins it against build.zig's Language
+    // enum, so adding a sub-module without widening this list fails the
+    // suite (and vice versa). Assemblers older than v0.83.0 ignore this
+    // key and keep the fast-path.
+    .params_schema = .{
+        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript" }, .required = true },
+    },
 }
