@@ -381,3 +381,20 @@ The plugin handles the studio Script Console's
   without the response channel the `@hasDecl` gate degrades to the
   script log. Compiled only inside generated games — this repo's tests
   parse + AstGen-check it and pin its convention-facing names.
+
+## Examples
+
+- **`examples/ruby-game/`** — a headless (null-backend) game whose
+  `ruby/` scripts drive the real engine end-to-end through the Script
+  Runtime Contract: the `#742` HungerController pattern
+  (`Component.ref` + `get(…, into:)` + `set`), a cross-script
+  `hunger__feed` command-event, an `engine__tick` builtin subscription,
+  `FrameArray` in the hot loop, and plain top-level hooks. Pins: the
+  scripting plugin `local:../..` (THIS checkout — every CI run
+  exercises the current tree), core/engine/gfx registry releases, a
+  sibling `labelle-null` clone (its bind touchpoint is unreleased), and
+  a pinned labelle-assembler release binary. CI generates, builds, runs
+  `LABELLE_NULL_FRAMES=5` and diffs the ordered `RUBY_*` transcript —
+  ruby's permanent regression net (labelle-scripting#10). Recipe +
+  assertions: `.github/workflows/ci.yml` → `ruby-example`; timeline:
+  `examples/ruby-game/ruby/hunger_controller.rb`.
