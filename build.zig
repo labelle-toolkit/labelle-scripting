@@ -1,8 +1,9 @@
 //! labelle-scripting build: the shared plugin glue plus exactly ONE
 //! language sub-module, selected at build time.
 //!
-//! Language selection is a build option (`-Dlanguage=lua|ruby|typescript`)
-//! rather than N sibling packages because every language binds the same
+//! Language selection is a build option (`-Dlanguage=lua|ruby|typescript|
+//! rust|crystal`) rather than N sibling packages because every language
+//! binds the same
 //! Script Runtime Contract and exposes the same Controller — one module
 //! name (`labelle_scripting`), one plugin entry in project.labelle, N
 //! interchangeable VMs behind it. Unchosen languages must not be
@@ -29,7 +30,15 @@ const std = @import("std");
 /// cargo in consumer games, this build.zig's test wiring runs it for
 /// the repo's own suite) and the selected sub-module is a thin
 /// dispatcher onto the crate's exported entry points.
-const Language = enum { lua, ruby, typescript, rust };
+///
+/// `crystal` is the second native entry, on rust's exact skeleton with
+/// one extra build step: crystal has no `--no-main`, so the object
+/// `crystal build --cross-compile` emits still carries a `main` that
+/// would collide with the game's — a localization pass (`ld -r
+/// -exported_symbols_list` on macOS, `objcopy --keep-global-symbols`
+/// on linux) demotes every symbol but the labelle_cr_* entries before
+/// the object links in (the labelle-engine#734 POC's recipe).
+const Language = enum { lua, ruby, typescript, rust, crystal };
 
 /// Lua 5.4.8 sources, minus the `lua.c`/`luac.c` executable mains
 /// (interpreter core + auxlib + all standard libraries).
@@ -328,6 +337,102 @@ pub fn build(b: *std.Build) void {
             }
         }
 
+        // The crystal binary's script object (labelle-engine#741, second
+        // native language): the SHIPPED glue + labelle module recomposed
+        // around tests/crystal/game/'s scenario scripts by relative
+        // `require`s (tests/crystal/main.cr — crystal's spelling of the
+        // rust suite's #[path] recomposition). Two chained steps, the
+        // POC-proven recipe: `crystal build --cross-compile` emits an
+        // object (crystal has no --no-main, so it carries a `main`), then
+        // a localization pass demotes every symbol except the entry
+        // points so nothing collides with the test binary's own `main`.
+        // Objects land under the zig cache; crystal's own source cache
+        // (CRYSTAL_CACHE_DIR) plays cargo's staleness-check role.
+        if (lang == .crystal) {
+            const crystal_cache = b.cache_root.join(
+                b.allocator,
+                &.{"crystal-suite-target"},
+            ) catch @panic("OOM");
+            b.cache_root.handle.createDirPath(b.graph.io, "crystal-suite-target") catch @panic("mkdir crystal-suite-target");
+            const obj_base = b.fmt("{s}/labelle_crystal_scripts_test", .{crystal_cache});
+            const obj_path = b.fmt("{s}.o", .{obj_base});
+            const lib_obj_path = b.fmt("{s}_lib.o", .{obj_base});
+
+            const crystal_build = b.addSystemCommand(&.{
+                "crystal",                       "build",
+                "--cross-compile",               "--target",
+                crystalTriple(b, target.result),
+            });
+            crystal_build.addFileArg(b.path("tests/crystal/main.cr"));
+            crystal_build.addArgs(&.{ "-o", obj_base });
+
+            // Localize `main` (and every other non-entry symbol): the
+            // per-OS tools differ but the semantics are identical — the
+            // listed labelle_cr_* symbols stay global, everything else
+            // (main, the whole crystal runtime) goes local; UNDEFINED
+            // symbols (the contract externs, the suite's test-scenario
+            // export) stay linkable on both tools. The SHIPPED lists
+            // are used on purpose — the suite proving them sufficient
+            // is part of the coverage. The two files differ only in
+            // macOS's leading-underscore mangling.
+            const localize = switch (target.result.os.tag) {
+                .macos => blk: {
+                    const step = b.addSystemCommand(&.{
+                        "ld",         "-r",
+                        obj_path,     "-o",
+                        lib_obj_path, "-exported_symbols_list",
+                    });
+                    step.addFileArg(b.path("native-crystal/exported_symbols_macos.txt"));
+                    break :blk step;
+                },
+                .linux => blk: {
+                    const step = b.addSystemCommand(&.{"objcopy"});
+                    step.addPrefixedFileArg(
+                        "--keep-global-symbols=",
+                        b.path("native-crystal/exported_symbols_linux.txt"),
+                    );
+                    step.addArgs(&.{ obj_path, lib_obj_path });
+                    break :blk step;
+                },
+                else => @panic("crystal language tests: unsupported host OS (desktop-only, macOS/linux)"),
+            };
+            localize.step.dependOn(&crystal_build.step);
+            tests.step.dependOn(&localize.step);
+            tests_root_mod.addObjectFile(.{ .cwd_relative = lib_obj_path });
+
+            // The crystal runtime's system libraries — mirror of
+            // plugin.labelle's crystal `.system_libs` (what the assembler
+            // row will link in consumer games): bdw-gc always, pcre2
+            // because game scripts may use Regex, iconv on macOS only
+            // (String encodings; glibc builds it in). crystal 1.15+'s
+            // event loop is kqueue/epoll-native — no libevent. The search
+            // path comes from `crystal env CRYSTAL_LIBRARY_PATH`, exactly
+            // where `crystal build` itself points its link line (brew's
+            // /opt/homebrew/lib, the official linux tarball's bundled
+            // lib/crystal/); resolved only when crystal exists so a
+            // crystal-less `zig build --help` still configures — the
+            // crystal_build step above is what fails loudly then.
+            if (b.findProgram(&.{"crystal"}, &.{}) catch null) |crystal_exe| {
+                const lib_path_raw = b.run(&.{ crystal_exe, "env", "CRYSTAL_LIBRARY_PATH" });
+                const lib_path = std.mem.trim(u8, lib_path_raw, " \n\r\t");
+                if (lib_path.len > 0)
+                    tests_root_mod.addLibraryPath(.{ .cwd_relative = lib_path });
+            }
+            tests_root_mod.linkSystemLibrary("gc", .{});
+            tests_root_mod.linkSystemLibrary("pcre2-8", .{});
+            switch (target.result.os.tag) {
+                .macos => tests_root_mod.linkSystemLibrary("iconv", .{}),
+                else => {
+                    // glibc-hosted: crystal's own link line adds these
+                    // (modern glibc folds most in, the stubs stay safe).
+                    tests_root_mod.linkSystemLibrary("pthread", .{});
+                    tests_root_mod.linkSystemLibrary("dl", .{});
+                    tests_root_mod.linkSystemLibrary("rt", .{});
+                    tests_root_mod.linkSystemLibrary("m", .{});
+                },
+            }
+        }
+
         const run_tests = b.addRunArtifact(tests);
         test_step.dependOn(&run_tests.step);
     }
@@ -452,5 +557,31 @@ fn configureLanguage(
             // the module means a consumer's `b.dependency` never shells
             // out — external builds stay declared, auditable steps.
         },
+        .crystal => {
+            // Native-compiled, rust's twin: src/crystal/vm.zig declares
+            // the glue's labelle_cr_* externs; the object that defines
+            // them (native-crystal/'s sources carrying the GAME's
+            // crystal/ dir as its `game` module) is built by the two
+            // declared steps — crystal build, then main-localization —
+            // and linked onto the final binary the same two ways (the
+            // assembler's `.language_builds` steps in consumer games,
+            // the test-loop wiring in this repo's suite).
+        },
     }
+}
+
+/// The `--target` triple `crystal build --cross-compile` needs, from the
+/// zig target — desktop-only, matching the crystal `.language_builds`
+/// entry's platform allowlist in plugin.labelle.
+fn crystalTriple(b: *std.Build, t: std.Target) []const u8 {
+    const arch = switch (t.cpu.arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+        else => @panic("crystal language tests: unsupported host arch"),
+    };
+    return switch (t.os.tag) {
+        .macos => b.fmt("{s}-apple-darwin", .{arch}),
+        .linux => b.fmt("{s}-linux-gnu", .{arch}),
+        else => @panic("crystal language tests: unsupported host OS (desktop-only, macOS/linux)"),
+    };
 }

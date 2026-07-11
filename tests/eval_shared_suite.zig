@@ -287,6 +287,27 @@ test "packaging: build.zig.zon ships every directory plugin.labelle references" 
     for (pm.convention_dirs) |cd| {
         if (cd.mode == .ship_from_plugin) try expect(ships(bz.paths, cd.name));
     }
+    // Every `{package}/<dir>/…` reference in the manifest (the
+    // `.language_builds` steps' commands and symbol lists — rust's
+    // native/, crystal's native-crystal/) runs against the CONSUMER's
+    // fetched copy too. A raw-source scan beats modeling the whole step
+    // schema here: any first path segment after a {package}/ marker
+    // must be shipped — this catches the "declared a build step,
+    // forgot the tarball" gap for every current and future language.
+    {
+        var found_package_refs: usize = 0;
+        var search: []const u8 = plugin_src;
+        while (std.mem.indexOf(u8, search, "{package}/")) |at| {
+            const rest = search[at + "{package}/".len ..];
+            const seg_end = std.mem.indexOfAny(u8, rest, "/\"") orelse rest.len;
+            try expect(ships(bz.paths, rest[0..seg_end]));
+            found_package_refs += 1;
+            search = rest;
+        }
+        // The manifest DOES declare package-relative build inputs today
+        // (rust + crystal) — keeps the scan meaningful.
+        try expect(found_package_refs >= 2);
+    }
 
     // And the manifest DOES reference the console pack today — keeps the
     // cross-check meaningful (deleting `.packs` should revisit this test).

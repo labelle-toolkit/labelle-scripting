@@ -31,6 +31,7 @@ test {
         .ruby => @import("ruby_suite.zig"),
         .typescript => @import("ts_suite.zig"),
         .rust => @import("rust_suite.zig"),
+        .crystal => @import("crystal_suite.zig"),
     };
 }
 

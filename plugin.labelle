@@ -18,7 +18,7 @@
     // suite (and vice versa). Assemblers older than v0.83.0 ignore this
     // key and keep the fast-path.
     .params_schema = .{
-        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript", "rust" }, .required = true },
+        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript", "rust", "crystal" }, .required = true },
     },
     // Per-LANGUAGE build steps (labelle-engine#741, native-compiled
     // family) — the #586 `.build` Step schema, applied only when the
@@ -30,14 +30,17 @@
     // manifest-LEVEL key rides the documented forward-compat instead
     // (old assemblers ignore it — they can't splice rust anyway).
     //
-    // Consumed by the assembler's native-language splice row (the #741
-    // follow-up), which also stages the game's rust/ dir over the staged
-    // package's native/src/game/ so cargo compiles the game's scripts
-    // into liblabelle_rust_scripts.a — linked into the game binary,
-    // where its labelle_* externs resolve against the host's exports.
-    // Desktop-first: cross-target cargo (android/ios/wasm rust triples)
-    // is future work, so the step declares a platform allowlist and a
-    // non-desktop rust generate fails up front, not at link time.
+    // Consumed by the assembler's native-language splice rows (the #741
+    // follow-ups), which also stage the game's language dir over the
+    // staged package's game-module root — rust/ over native/src/game/
+    // (cargo compiles the game's scripts into liblabelle_rust_scripts.a),
+    // crystal/ over native-crystal/src/game/ (crystal compiles them into
+    // labelle_crystal_scripts_lib.o) — linked into the game binary,
+    // where the labelle_* externs resolve against the host's exports.
+    // Desktop-first: cross-target builds (android/ios/wasm triples)
+    // are future work, so the steps declare a platform allowlist and a
+    // non-desktop native-language generate fails up front, not at link
+    // time.
     .language_builds = .{
         .{
             .language = "rust",
@@ -62,6 +65,73 @@
                     .system_libs = .{
                         .linux = .{ "gcc_s", "util", "rt", "pthread", "m", "dl" },
                     },
+                },
+            },
+        },
+        // Crystal (labelle-engine#741, second native language): TWO
+        // chained steps — the schema's steps run in order — because
+        // crystal has no `--no-main`: `crystal build --cross-compile`
+        // emits an object still carrying a `main` that would collide
+        // with the game's, so a localization pass demotes every symbol
+        // except the labelle_cr_* entries (the #734 POC's recipe). The
+        // localization tool differs per OS (ld64's -exported_symbols_list
+        // on macOS, binutils objcopy --keep-global-symbols on linux —
+        // same semantics, underscore-mangled vs plain symbol lists), so
+        // the second step carries a per-OS `.os` allowlist and the
+        // assembler emits exactly one of the pair for the generate's
+        // target OS. `.link = .object` (not .static_lib): the terminal
+        // artifact IS a single relocatable object — archiving it would
+        // add an `ar` step and a per-OS naming scheme for zero benefit;
+        // addObjectFile takes it as-is.
+        //
+        // {crystal_target} = the target triple crystal spells the zig
+        // target as (aarch64-apple-darwin / x86_64-linux-gnu / …);
+        // .library_paths' {crystal_env:CRYSTAL_LIBRARY_PATH} = `crystal
+        // env CRYSTAL_LIBRARY_PATH`, resolved at generate — where
+        // crystal's own link line points (brew's /opt/homebrew/lib, the
+        // official linux tarball's bundled lib/crystal/). Both are new
+        // splice vocabulary specified for the #741 crystal follow-up;
+        // this repo's build.zig test wiring implements the identical
+        // recipe natively for the suite. Desktop-first, like rust.
+        .{
+            .language = "crystal",
+            .steps = .{
+                .{
+                    .name = "crystal-scripts",
+                    // No .artifact: intermediate step — the object it
+                    // emits still carries crystal's `main`.
+                    .command = .{ "crystal", "build", "--cross-compile", "--target", "{crystal_target}", "{package}/native-crystal/src/main.cr", "-o", "{cache}/labelle_crystal_scripts" },
+                    .platforms = .{"desktop"},
+                },
+                .{
+                    .name = "localize-main",
+                    .os = .{"macos"},
+                    .command = .{ "ld", "-r", "{cache}/labelle_crystal_scripts.o", "-o", "{cache}/labelle_crystal_scripts_lib.o", "-exported_symbols_list", "{package}/native-crystal/exported_symbols_macos.txt" },
+                    .artifact = "{cache}/labelle_crystal_scripts_lib.o",
+                    .link = .object,
+                    .platforms = .{"desktop"},
+                    // The crystal runtime's system libraries, exactly
+                    // what `crystal build`'s printed link line carries:
+                    // bdw-gc always; pcre2 because game scripts may use
+                    // Regex; iconv (String encodings) is macOS-only —
+                    // glibc builds it in. No libevent: crystal 1.15+'s
+                    // event loop is kqueue/epoll-native.
+                    .system_libs = .{
+                        .macos = .{ "gc", "iconv", "pcre2-8" },
+                    },
+                    .library_paths = .{"{crystal_env:CRYSTAL_LIBRARY_PATH}"},
+                },
+                .{
+                    .name = "localize-main",
+                    .os = .{"linux"},
+                    .command = .{ "objcopy", "--keep-global-symbols={package}/native-crystal/exported_symbols_linux.txt", "{cache}/labelle_crystal_scripts.o", "{cache}/labelle_crystal_scripts_lib.o" },
+                    .artifact = "{cache}/labelle_crystal_scripts_lib.o",
+                    .link = .object,
+                    .platforms = .{"desktop"},
+                    .system_libs = .{
+                        .linux = .{ "gc", "pcre2-8", "pthread", "dl", "rt", "m" },
+                    },
+                    .library_paths = .{"{crystal_env:CRYSTAL_LIBRARY_PATH}"},
                 },
             },
         },

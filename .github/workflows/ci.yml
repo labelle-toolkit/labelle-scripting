@@ -28,6 +28,19 @@ jobs:
         with:
           components: rustfmt
 
+      # The crystal sub-module's suite (labelle-engine#741): `zig build
+      # test` crystal-builds tests/crystal's script object and localizes
+      # its `main` — the linux leg exercises the objcopy branch (binutils
+      # is preinstalled on ubuntu runners) and the linux `.system_libs`
+      # set (gc/pcre2 resolve via `crystal env CRYSTAL_LIBRARY_PATH`).
+      # Pinned minor: the embedding recipe relies on ≥ 1.16 runtime facts
+      # (Crystal.init_runtime, Slice.literal constants); bump
+      # deliberately, never float.
+      - name: Setup Crystal
+        uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: "1.17"
+
       # The lua dep is lazy — `zig build test` fetches it on demand
       # (network needed once; hash-pinned in build.zig.zon).
       #
@@ -57,6 +70,9 @@ jobs:
         run: |
           cargo fmt --check --manifest-path native/Cargo.toml
           cargo fmt --check --manifest-path tests/rust/Cargo.toml
+
+      - name: Crystal formatting
+        run: crystal tool format --check native-crystal tests/crystal
 
   # Ruby example game (labelle-scripting#10) — the ruby counterpart of the
   # assembler's `examples/scripting-smoke`, living in THIS repo so every

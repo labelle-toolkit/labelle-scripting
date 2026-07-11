@@ -46,6 +46,11 @@
         // `.language_builds`). Must ship — the step's cargo runs against
         // the consumer's staged copy of this directory.
         "native",
+        // Its crystal twin: the Labelle module + glue + exported-symbols
+        // lists the declared crystal build/localize steps run against —
+        // same must-ship reasoning (the eval_shared_suite {package}/ scan
+        // pins both).
+        "native-crystal",
         // Bundled packs plugin.labelle's `.packs` references (the studio
         // console's eval-handler hook rides packs/scripting_console/) —
         // the assembler resolves them from the consuming game's FETCHED
