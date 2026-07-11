@@ -59,7 +59,10 @@ class HungerController < Labelle::Controller
     @fa = Labelle::FrameArray.new(8) # hot per-frame scratch; backing survives clear
     @tick = 0
     @was_starving = false
-    on("hunger__feed") { |ev| feed(ev[:entity], ev[:amount] || FEED_DEFAULT) }
+    # Guard the payload: a malformed hunger__feed without :entity would
+    # raise in the binding (isolated + logged, but noisy) — exemplar code
+    # shows the guard.
+    on("hunger__feed") { |ev| feed(ev[:entity], ev[:amount] || FEED_DEFAULT) if ev[:entity] }
     log("RUBY_CTRL_READY")
   end
 
@@ -75,19 +78,25 @@ class HungerController < Labelle::Controller
     i = 0
     while i < @fa.size
       e = entity(@fa[i])
-      e.get(Hunger, into: @h) # REFILLS the cached instance
-      @h.level -= DECAY_PER_TICK
-      @h.starving = @h.level <= STARVE_AT
-      e.set(@h) # instance knows its component; writes to THIS entity
+      # get returns false when the component vanished between the query
+      # and this read (entity destroyed / component removed mid-tick) —
+      # guard it, or a stale @h from the PREVIOUS iteration would be
+      # written to THIS entity. (Plain `if`, not `next unless`: this is
+      # a while loop, and skipping past `i += 1` would spin forever.)
+      if e.get(Hunger, into: @h) # REFILLS the cached instance
+        @h.level -= DECAY_PER_TICK
+        @h.starving = @h.level <= STARVE_AT
+        e.set(@h) # instance knows its component; writes to THIS entity
 
-      # The token carries the written value — each tick's number is only
-      # reachable through the PREVIOUS tick's persisted write, so the
-      # sequence pins ECS persistence transitively.
-      log("RUBY_LEVEL_#{@h.level}")
+        # The token carries the written value — each tick's number is
+        # only reachable through the PREVIOUS tick's persisted write, so
+        # the sequence pins ECS persistence transitively.
+        log("RUBY_LEVEL_#{@h.level}")
 
-      if @h.starving && !@was_starving
-        @was_starving = true
-        log("RUBY_STARVING")
+        if @h.starving && !@was_starving
+          @was_starving = true
+          log("RUBY_STARVING")
+        end
       end
       i += 1
     end
