@@ -1,0 +1,48 @@
+// Ruby example game (labelle-scripting#10) — the ruby counterpart of the
+// assembler's `examples/scripting-smoke`: ruby/ scripts drive the REAL
+// engine through the Script Runtime Contract from the assembler's
+// generated main, headless over the null backend.
+//
+// The scripting plugin is pinned `local:../..` — THIS repo's checkout —
+// so every CI run exercises the CURRENT tree, not a release: the example
+// doubles as ruby's permanent regression net. CI downloads the pinned
+// labelle-assembler release binary, generates + builds + runs a bounded
+// `LABELLE_NULL_FRAMES=5` pass and asserts the ordered `RUBY_*` milestone
+// lines (see `.github/workflows/ci.yml` → `ruby-example`).
+.{
+    .name = "ruby_game",
+    .title = "LaBelle — Ruby Example Game (null backend)",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    // Headless: no window, no GPU, no input. The built binary runs a
+    // fixed-dt tick loop bounded by LABELLE_NULL_FRAMES and exits cleanly.
+    // Pinned as an EXPLICIT external `backend_package` to a SIBLING
+    // checkout rather than the registry `.backend = .null` shorthand: the
+    // generated main's `script_contract.bind` touchpoint lives in
+    // labelle-null's `templates/headless.txt` (labelle-null#5, on main),
+    // and the latest release (v0.3.0) predates it. CI clones labelle-null
+    // beside this repo — the same pattern as the assembler's own
+    // scripting-smoke. Switch to a registry pin once labelle-null cuts a
+    // release carrying the touchpoint.
+    .backend_package = .{ .name = "null", .repo = "local:../../../labelle-null" },
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    // THE point of the example: the scripting plugin resolved from the
+    // repo root two levels up — the working tree under test — with the
+    // one-language-per-project param selecting ruby.
+    .plugins = .{
+        .{
+            .name = "scripting",
+            .repo = "local:../..",
+            .params = .{ .language = "ruby" },
+        },
+    },
+    // Registry-resolved toolkit releases (this repo has no local
+    // siblings to pin — the one `local:` dep is the plugin itself).
+    .core_version = "1.26.0",
+    .engine_version = "2.5.0",
+    .gfx_version = "1.28.1",
+}
