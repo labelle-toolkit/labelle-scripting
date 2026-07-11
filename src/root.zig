@@ -159,6 +159,23 @@ pub fn handleEvalCommand(params_json: []const u8, out: []u8) []const u8 {
 ///            scripts, run each script's `init()`;
 ///   tick   → stamp dt, drain the event inbox, run each `update(dt)`;
 ///   deinit → run each `deinit()`, close the VM.
+///
+/// ## The dispatch contract (labelle-scripting#3 — pinned; coordinate
+/// before changing)
+///
+/// The assembler's scripting splice (labelle-assembler#596) drives this
+/// Controller EXPLICITLY: generated mains call `setup` from the plugin
+/// block, emit `scripting.Controller.tick(&g, scaled_dt)` inside the
+/// frame loop, and arity-dispatch `deinit` as ZERO-ARG. Two consequences
+/// this module must honor until a coordinated assembler release says
+/// otherwise (tests/root.zig pins both, in every language binary):
+///
+///   - NO `Systems` decl, ever, on this module or the Controller: the
+///     engine auto-ticks plugin `Systems`, so growing one would DOUBLE-
+///     TICK the VM in every generated game. Explicit-tick-only is the
+///     contract, not a v0.1 accident.
+///   - `deinit` stays zero-parameter: the generated PluginControllers
+///     deinit block selects the zero-arg arm by arity.
 pub const Controller = struct {
     /// Boot the scripting VM. Refuses a Script Runtime Contract version
     /// mismatch (fail loudly at boot, not as garbled JSON mid-game) and a
