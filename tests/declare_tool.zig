@@ -103,8 +103,8 @@ test "golden: a field-less marker component and a declaration-free script" {
 test "only the chunk body runs: hooks never fire, other labelle.* are silent no-ops" {
     // init() would blow up at runtime (error + Entity/game references) —
     // declare mode never calls it. Chunk-scope labelle.on/log/array run
-    // against the shared no-op stub. The declaration BELOW the no-ops
-    // still records: the whole body executes.
+    // against the sentinel-returning no-op (results discarded here). The
+    // declaration BELOW the no-ops still records: the whole body executes.
     try expectSchema(&.{
         .{
             .path = "spiky.lua",
@@ -176,6 +176,86 @@ test "malformed specs fail with file-, component- and field-bearing errors" {
     try expectFailure(
         &.{.{ .path = "bad.lua", .source = "labelle.component(\"Hunger\", {}, { presist = \"transient\" })" }},
         &.{ "bad.lua:1", "'Hunger'", "unknown option 'presist'" },
+    );
+}
+
+test "labelle.* helper results in a spec fail the build instead of silently dropping the field" {
+    // `waypoints = labelle.array({})`: were the no-op to return nil, the
+    // table constructor would silently DROP the key and Path would
+    // validate WITHOUT the field. The no-ops return a sentinel that
+    // declare_component rejects with a pointed message instead.
+    try expectFailure(
+        &.{.{
+            .path = "lua/path.lua",
+            .source = "labelle.component(\"Path\", { waypoints = labelle.array({}) })",
+        }},
+        &.{
+            "lua/path.lua:1",
+            "component 'Path' field 'waypoints'",
+            "labelle.* helpers cannot be used in component specs — declare-mode fields are literals",
+        },
+    );
+    // The sentinel is a table, so it would otherwise slip past the
+    // "expects a spec table" / "options must be a table" guards that
+    // catch nil — the spec and opts positions are scanned too.
+    try expectFailure(
+        &.{.{ .path = "lua/path.lua", .source = "labelle.component(\"Path\", labelle.array({}))" }},
+        &.{ "lua/path.lua:1", "component 'Path' spec", "declare-mode fields are literals" },
+    );
+    try expectFailure(
+        &.{.{ .path = "lua/path.lua", .source = "labelle.component(\"Path\", {}, labelle.array({}))" }},
+        &.{ "lua/path.lua:1", "component 'Path' options", "declare-mode fields are literals" },
+    );
+}
+
+test "float defaults must fit f32: finite-but-huge fails alongside NaN/inf; the edge passes" {
+    // 1e100 / -1e100 are FINITE doubles no f32 can hold — accepting them
+    // would emit impossible "f32" defaults for the assembler to codegen.
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.component(\"Big\", { v = 1e100 })" }},
+        &.{ "bad.lua:1", "component 'Big' field 'v'", "out of f32 range" },
+    );
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.component(\"Big\", { v = -1e100 })" }},
+        &.{ "bad.lua:1", "component 'Big' field 'v'", "out of f32 range" },
+    );
+    // Non-finite values keep their own error class (no math.huge in a
+    // chunk — scripts have no stdlib; arithmetic reaches the same values).
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.component(\"Bad\", { v = 0/0 })" }},
+        &.{ "bad.lua:1", "component 'Bad' field 'v'", "non-finite" },
+    );
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.component(\"Bad\", { v = 1/0 })" }},
+        &.{ "bad.lua:1", "component 'Bad' field 'v'", "non-finite" },
+    );
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.component(\"Bad\", { v = -1/0 })" }},
+        &.{ "bad.lua:1", "component 'Bad' field 'v'", "non-finite" },
+    );
+    // 3.4e38 sits just under f32 max (3.4028235e38): still a legal
+    // default, and %.14g keeps it exact.
+    try expectSchema(
+        &.{.{ .path = "edge.lua", .source = "labelle.component(\"Edge\", { v = 3.4e38 })" }},
+        \\{"components":[{"name":"Edge","persist":"persistent","fields":[{"name":"v","type":"f32","default":3.4e+38}]}]}
+    );
+    // vec2 axes ride the same range check.
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.component(\"Bad\", { home = { x = 1e100, y = 0 } })" }},
+        &.{ "bad.lua:1", "component 'Bad' field 'home'", "out of f32 range" },
+    );
+}
+
+test "a chunk clobbering labelle.component cannot poison later chunks (fresh stub per chunk)" {
+    // clobber.lua nils out `component` — on ITS private stub copy only.
+    // With one shared stub table the assignment stripped the key for
+    // every later chunk, whose declarations then fell through __index to
+    // the silent no-op and vanished from the schema.
+    try expectSchema(&.{
+        .{ .path = "clobber.lua", .source = "labelle.component = nil" },
+        .{ .path = "after.lua", .source = "labelle.component(\"Survivor\", { hp = 3 })" },
+    },
+        \\{"components":[{"name":"Survivor","persist":"persistent","fields":[{"name":"hp","type":"i32","default":3}]}]}
     );
 }
 

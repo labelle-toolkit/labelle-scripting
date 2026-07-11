@@ -5,8 +5,9 @@
 -- `labelle.component("Hunger", { level = 1.0 })` line that hands a script a
 -- lightweight component ref at runtime (src/lua/prelude.lua) is, here, a
 -- schema declaration. Each script chunk runs under a private _ENV whose
--- ONLY entry is the stub `labelle` table below — `component` records the
--- declaration, every other `labelle.*` is a shared silent no-op, and no
+-- ONLY entry is its own FRESH stub `labelle` table — `component` records
+-- the declaration, every other `labelle.*` is a silent no-op (returning a
+-- sentinel that declare_component rejects if it lands in a spec), and no
 -- other global (not even the stdlib) is visible. Scripts' init/update are
 -- merely DEFINED by the chunk body, never called, so only chunk-scope code
 -- executes — exactly where declarations sit.
@@ -15,8 +16,9 @@
 -- script loads; extract.zig drives it through three seams:
 --   __DECLARE_FILE    global — the path of the chunk about to run (error
 --                     attribution; the vm.zig current-script pattern)
---   __declare_stub    global — the stub `labelle` table extract.zig plants
---                     into each chunk's fresh private _ENV
+--   __declare_stub()  global — a FACTORY returning a fresh stub `labelle`
+--                     table; extract.zig calls it once per chunk and
+--                     plants the result into that chunk's private _ENV
 --   __declare_emit()  global — returns the accumulated schema as one
 --                     compact JSON line after every chunk ran
 --
@@ -66,6 +68,12 @@ local function is_identifier(s)
   return type(s) == "string" and s:match("^[A-Za-z_][A-Za-z0-9_]*$") ~= nil
 end
 
+-- Largest finite f32, as a Lua number (f64). Lua floats are doubles: a
+-- FINITE value beyond this (1e100, say) would still narrow to ±inf in the
+-- emitted f32 default — an impossible schema value, so classify rejects
+-- it up front just like the non-finite it would become.
+local F32_MAX = 3.4028235e38
+
 -- Classify one spec value into { type = <schema type>, json = <default as
 -- JSON> }, or raise with `where` naming the component and field. Error
 -- level 3 = classify(1) → declare_component(2) → the SCRIPT's
@@ -86,6 +94,9 @@ local function classify(where, v)
       end
       return { type = "i32", json = number_json(v) }
     end
+    if v > F32_MAX or v < -F32_MAX then
+      error(where .. ": float default out of f32 range (f32 max is 3.4028235e38)", 3)
+    end
     return { type = "f32", json = number_json(v) }
   end
   if t == "string" then
@@ -100,6 +111,9 @@ local function classify(where, v)
         or v.y == math.huge or v.y == -math.huge then
         error(where .. ": non-finite vec2 default", 3)
       end
+      if v.x > F32_MAX or v.x < -F32_MAX or v.y > F32_MAX or v.y < -F32_MAX then
+        error(where .. ": vec2 default out of f32 range (f32 max is 3.4028235e38)", 3)
+      end
       return {
         type = "vec2",
         json = '{"x":' .. number_json(v.x) .. ',"y":' .. number_json(v.y) .. "}",
@@ -109,6 +123,26 @@ local function classify(where, v)
   end
   error(where .. ": unsupported default of type " .. t ..
     " (v1 supports number, boolean, string, and {x=,y=} vec2 tables)", 3)
+end
+
+-- What every non-`component` labelle.* returns in declare mode. NOT nil:
+-- in `labelle.component("Path", { waypoints = labelle.array({}) })` a
+-- nil-returning no-op makes the table constructor silently DROP the key,
+-- and the declaration would validate WITHOUT the field. Returning this
+-- distinctive sentinel instead lets declare_component spot helper results
+-- used as data and fail the build. (The marker key is for debuggability;
+-- recognition is by identity, and a sentinel nested deeper inside a table
+-- default still errors through classify's vec2-shape check.)
+local noop_result = { ["labelle declare-mode no-op result"] = true }
+local function noop() return noop_result end
+
+-- The pointed rejection for a helper result where a literal belongs.
+-- Level 3: reject_noop(1) → declare_component(2) → the script's line (3).
+local function reject_noop(v, ctx)
+  if rawequal(v, noop_result) then
+    error("labelle.component: " .. ctx .. ": labelle.* helpers cannot be " ..
+      "used in component specs — declare-mode fields are literals", 3)
+  end
 end
 
 -- The declare-mode `labelle.component(name, spec[, opts])`. Validates,
@@ -128,6 +162,7 @@ local function declare_component(name, spec, opts)
     error("labelle.component: component '" .. name ..
       "' expects a spec table of field defaults", 2)
   end
+  reject_noop(spec, "component '" .. name .. "' spec")
   if by_name[name] ~= nil then
     error("labelle.component: duplicate component '" .. name ..
       "' (first declared in " .. by_name[name] .. ")", 2)
@@ -139,6 +174,7 @@ local function declare_component(name, spec, opts)
       error("labelle.component: component '" .. name ..
         "' options must be a table", 2)
     end
+    reject_noop(opts, "component '" .. name .. "' options")
     for k, v in pairs(opts) do
       if k ~= "persist" then
         error("labelle.component: component '" .. name ..
@@ -159,6 +195,7 @@ local function declare_component(name, spec, opts)
       error("labelle.component: component '" .. name .. "' field '" ..
         tostring(k) .. "' is not a valid identifier", 2)
     end
+    reject_noop(v, "component '" .. name .. "' field '" .. k .. "'")
     local c = classify("component '" .. name .. "' field '" .. k .. "'", v)
     fields[#fields + 1] = { name = k, type = c.type, json = c.json }
   end
@@ -170,15 +207,24 @@ local function declare_component(name, spec, opts)
   return { __labelle_component = name }
 end
 
--- The stub `labelle`: `component` is live, EVERY other key resolves to one
--- shared silent no-op (returning nothing) — `labelle.on`/`log`/`emit`/...
--- at chunk scope neither run nor error, mirroring "only declarations
--- matter at build time".
-local noop = function() end
-_G.__declare_stub = setmetatable(
-  { component = declare_component },
-  { __index = function() return noop end }
-)
+-- The stub `labelle`: `component` is live, EVERY other key resolves to the
+-- shared sentinel-returning no-op — `labelle.on`/`log`/`emit`/... at chunk
+-- scope neither run nor error, mirroring "only declarations matter at
+-- build time".
+--
+-- __declare_stub is a FACTORY, not one table: extract.zig calls it once
+-- per chunk, so each chunk's env gets its OWN stub. With a single shared
+-- table, one script assigning `labelle.component = nil` stripped the key
+-- for every LATER file — whose declarations then fell through __index to
+-- the no-op and vanished silently. Mutations now land on the mutating
+-- chunk's private copy only. The recorder closure and the metatable stay
+-- shared internally: declarations must accumulate across chunks, and
+-- scripts cannot reach the metatable (their env has no stdlib — no
+-- getmetatable/setmetatable/rawset).
+local stub_mt = { __index = function() return noop end }
+function _G.__declare_stub()
+  return setmetatable({ component = declare_component }, stub_mt)
+end
 
 -- The schema, as one compact JSON line (the runner↔assembler contract):
 -- {"components":[{"name":…,"persist":…,"fields":[{"name":…,"type":…,"default":…},…]},…]}
