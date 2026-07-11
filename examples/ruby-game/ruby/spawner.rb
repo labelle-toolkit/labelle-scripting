@@ -6,16 +6,21 @@
 # hooks').
 #
 # Each observable milestone logs ONE `RUBY_<TOKEN>` line so CI can
-# `grep -oE 'RUBY_[A-Z0-9_.]+'` and diff the exact ordered sequence.
-# This script's slice of the 5-frame timeline (LABELLE_NULL_FRAMES=5;
-# hunger_controller.rb documents the full interleaving):
+# `grep -oE '(RUBY|ZIG)_[A-Z0-9_.]+'` and diff the exact ordered
+# sequence. This script's slice of the 5-frame timeline
+# (LABELLE_NULL_FRAMES=5; hunger_controller.rb documents the full
+# interleaving):
 #
 #   setup   RUBY_INIT              init(): Worker entity created,
 #                                   Hunger{level: 0.875} written
 #   tick 2  RUBY_FEED_SENT         emit hunger__feed{entity, amount: 0.5}
 #                                   (script updates run BEFORE controller
 #                                   ticks, so this precedes tick 2's
-#                                   RUBY_LEVEL_* token)
+#                                   RUBY_LEVEL_* token; the emit reaches
+#                                   TWO subscribers off one bus — the
+#                                   native hooks/feed_watcher.zig at this
+#                                   frame's dispatchEvents, the ruby
+#                                   handler on tick 3's inbox)
 #   tick 3  RUBY_ENGINE_TICK_SEEN  first engine__tick arrives (emitted by
 #                                   g.tick AFTER the tick-1 drain, drained
 #                                   at tick 2's boundary, inbox-dispatched

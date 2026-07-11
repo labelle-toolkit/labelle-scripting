@@ -128,6 +128,10 @@ jobs:
           grep -qF 'scripting.Controller.tick(&g, scaled_dt);' $M
           # Splice: the event tap between plugin ticks and dispatchEvents.
           grep -qF 'engine.script_contract.drainEvents(&g);' $M
+          # Game-root hooks scan: the native hunger__feed subscriber
+          # (hooks/feed_watcher.zig) folded into the GameHooks receiver
+          # tuple — the Zig half of the cross-layer events interop.
+          grep -qF 'feed_u_watcher.FeedWatcher' $M
           # Build wiring: the plugin's -Dlanguage option selects mruby.
           grep -qF '.language = .ruby' .labelle/null_desktop/build.zig
 
@@ -153,19 +157,24 @@ jobs:
           # Pin the exact ordered milestone sequence. Tokens carry
           # BEHAVIOR, not liveness: every RUBY_LEVEL_* value is the level
           # the controller wrote through the real ECS that tick (each one
-          # reachable only via the previous tick's persisted write), and
+          # reachable only via the previous tick's persisted write),
           # RUBY_FED_LEVEL_0.875 is re-READ after the feed handler's
           # write — the emitted id and f32 0.5 amount round-tripped the
-          # engine bus bit-exact. The char class includes '.' for exactly
-          # those value-carrying tokens. Timeline:
+          # engine bus bit-exact — and ZIG_FEED_SEEN_0.5 is the NATIVE
+          # game-root hook consuming the same emit with the parsed
+          # payload amount, at tick 2's dispatchEvents (frame end, one
+          # tick BEFORE the ruby handler's inbox — the cross-layer
+          # latency is part of the pin). The char class includes '.' for
+          # exactly those value-carrying tokens. Timeline:
           # ruby/hunger_controller.rb.
-          grep -oE 'RUBY_[A-Z0-9_.]+' run.log > actual.txt || true
+          grep -oE '(RUBY|ZIG)_[A-Z0-9_.]+' run.log > actual.txt || true
           cat > expected.txt <<'END'
           RUBY_INIT
           RUBY_CTRL_READY
           RUBY_LEVEL_0.625
           RUBY_FEED_SENT
           RUBY_LEVEL_0.375
+          ZIG_FEED_SEEN_0.5
           RUBY_ENGINE_TICK_SEEN
           RUBY_FED_LEVEL_0.875
           RUBY_LEVEL_0.625
@@ -178,9 +187,9 @@ jobs:
           END
           sed -i 's/^          //' expected.txt
           if ! diff -u expected.txt actual.txt; then
-            echo "E: ruby-example RUBY milestone sequence mismatch"
+            echo "E: ruby-example milestone sequence mismatch"
             echo "--- full captured output ---"
             cat run.log
             exit 1
           fi
-          echo "PASS: ruby drove the real engine — plain hooks + Component.ref controller + cross-script hunger__feed + FrameArray + engine__tick over 5 headless frames, against this repo's HEAD"
+          echo "PASS: ruby drove the real engine — plain hooks + Component.ref controller + cross-script hunger__feed (ruby AND native Zig hook off one bus) + FrameArray + engine__tick over 5 headless frames, against this repo's HEAD"
