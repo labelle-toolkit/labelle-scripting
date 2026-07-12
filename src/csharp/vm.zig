@@ -386,7 +386,7 @@ fn newestVersionDir(dir_utf8: []const u8, out: []u8) ?[]const u8 {
         var d = std.fs.cwd().openDir(dir_utf8, .{ .iterate = true }) catch return null;
         defer d.close();
         var it = d.iterate();
-        while (it.next() catch break) |ent| {
+        while (it.next() catch null) |ent| {
             const name = ent.name;
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
             if ((best_len == 0 or versionLess(out[0..best_len], name)) and name.len <= out.len) {
