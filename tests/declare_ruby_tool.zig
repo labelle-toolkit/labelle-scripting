@@ -222,7 +222,7 @@ test "Labelle.* helper results in a spec fail the build instead of silently misd
         &.{
             "scripts/path.rb:1",
             "component 'Path' field 'waypoints'",
-            "Labelle.* helpers and cross-file constants cannot be used in component specs — declare-mode fields are literals",
+            "Labelle.* helpers and non-primitive cross-file constants cannot be used in component specs — declare-mode fields are literals",
         },
     );
     // The spec and opts positions are scanned too — a nil-returning no-op
@@ -239,20 +239,23 @@ test "Labelle.* helper results in a spec fail the build instead of silently misd
     );
 }
 
-test "chunk-scope use of a cross-file constant is declare-safe (the ledger seeds the sentinel)" {
+test "chunk-scope use of a cross-file constant is declare-safe (the ledger seeds the real name)" {
     // THE labelle-engine#772 pattern: events/hunger__feed.rb binds
     // `HungerFeed`, and a script subscribes AT FILE SCOPE with the
     // constant. At runtime one shared VM registers components → events →
     // scripts, so the constant exists before any script chunk loads; this
     // runner gives every chunk a fresh state, so `HungerFeed` cannot
-    // resolve by itself — the driver harvests the constant names each
-    // clean chunk defines and re-binds them into every LATER chunk as the
-    // inert sentinel (input order = the assembler's collection order =
-    // the runtime registration order, so "earlier" means exactly what it
-    // means at runtime), and `Labelle.on(sentinel)` no-ops through
-    // method_missing. The declare phase must neither run the handler nor
-    // fail the build. (A constant NO earlier file defined gets no seed —
-    // the typo test below pins the NameError.)
+    // resolve by itself — the driver harvests the constants each clean
+    // chunk defines WITH their values and re-binds them into every LATER
+    // chunk (input order = the assembler's collection order = the runtime
+    // registration order, so "earlier" means exactly what it means at
+    // runtime). Labelle.event returns the frozen NAME STRING in declare
+    // mode too, so `HungerFeed` is a primitive and seeds VERBATIM —
+    // the on/emit shims see the real name, exactly like the runtime VM
+    // (kwargs and blocks are swallowed, handlers never run). The declare
+    // phase must neither run the handler nor fail the build. (A constant
+    // NO earlier file defined gets no seed — the typo test below pins the
+    // NameError.)
     try expectSchema(&.{
         .{
             .path = "events/hunger__feed.rb",
@@ -266,6 +269,9 @@ test "chunk-scope use of a cross-file constant is declare-safe (the ledger seeds
             \\Labelle.on(HungerFeed) do |ev|
             \\  Labelle.log("RUBY_WATCHER_SAW_#{ev[:amount]}")
             \\end
+            \\Labelle.emit(HungerFeed, amount: 1.0)
+            \\Labelle.emit(HungerFeed)
+            \\raise "not the real name" unless HungerFeed == "hunger__feed"
             ,
         },
     },
@@ -301,29 +307,110 @@ test "a typo'd constant fails at generate naming the file and line (no silent ex
     );
 }
 
-test "a cross-file constant in a spec position is rejected pointedly (sentinel, not a guessed schema)" {
+test "a NON-PRIMITIVE cross-file constant in a spec position is rejected pointedly (sentinel, not a guessed schema)" {
     // The seeded sentinel is legal in CALL positions only (the test
     // above); as a field default it must fail the build naming the field
-    // — declare-mode fields are literals, whatever constant they hide
-    // behind. (At runtime the constant may hold a perfectly usable value
-    // — the frozen event-name string here — but a declaration the
-    // extractor cannot see through is a declaration the build must
-    // reject, the same posture as Labelle.* helper results.)
+    // — declare-mode fields are literals or the primitives that mirror
+    // them, and a view class is neither. (At runtime the constant holds
+    // a Class the schema cannot express; a declaration the extractor
+    // cannot see through is a declaration the build must reject, the
+    // same posture as Labelle.* helper results.)
     try expectFailure(&.{
-        .{ .path = "events/hunger__feed.rb", .source = "HungerFeed = Labelle.event \"hunger__feed\", {}" },
-        .{ .path = "scripts/bad.rb", .source = "Labelle.component(\"Bad\", level: HungerFeed)" },
+        .{ .path = "components/worker.rb", .source = "Worker = Labelle.component \"Worker\", hp: 1" },
+        .{ .path = "scripts/bad.rb", .source = "Labelle.component(\"Bad\", level: Worker)" },
     }, &.{
         "scripts/bad.rb:1",
         "component 'Bad' field 'level'",
-        "Labelle.* helpers and cross-file constants cannot be used in component specs",
+        "Labelle.* helpers and non-primitive cross-file constants cannot be used in component specs",
     });
     try expectFailure(&.{
-        .{ .path = "events/hunger__feed.rb", .source = "HungerFeed = Labelle.event \"hunger__feed\", {}" },
-        .{ .path = "events/bad.rb", .source = "Labelle.event(\"bad__event\", entity: HungerFeed)" },
+        .{ .path = "components/worker.rb", .source = "Worker = Labelle.component \"Worker\", hp: 1" },
+        .{ .path = "events/bad.rb", .source = "Labelle.event(\"bad__event\", entity: Worker)" },
     }, &.{
         "events/bad.rb:1",
         "event 'bad__event' field 'entity'",
-        "Labelle.* helpers and cross-file constants cannot be used in event specs",
+        "Labelle.* helpers and non-primitive cross-file constants cannot be used in event specs",
+    });
+}
+
+test "cross-file PRIMITIVE constants classify in spec positions, mirroring the runtime VM" {
+    // The tagged ledger's embraced consequence: a primitive an earlier
+    // file bound is genuinely visible at runtime (one shared VM), so
+    // rejecting `speed: SPEED_DEFAULT` was a FALSE failure — the value
+    // seeds verbatim and classifies exactly like the literal it holds
+    // (int, string and float here; the event-name string rides the same
+    // rule — at runtime HungerFeed IS that string).
+    try expectSchema(&.{
+        .{
+            .path = "scripts/shared.rb",
+            .source =
+            \\SPEED_DEFAULT = 12.5
+            \\LABEL_DEFAULT = "guard"
+            \\COIN_DEFAULT = 250
+            ,
+        },
+        .{ .path = "events/hunger__feed.rb", .source = "HungerFeed = Labelle.event \"hunger__feed\", {}" },
+        .{
+            .path = "scripts/consumer.rb",
+            .source =
+            \\Labelle.component "Guard", speed: SPEED_DEFAULT, label: LABEL_DEFAULT,
+            \\                           coins: COIN_DEFAULT, feed_event: HungerFeed
+            ,
+        },
+    },
+        \\{"components":[{"name":"Guard","persist":"persistent","fields":[{"name":"coins","type":"i32","default":250},{"name":"feed_event","type":"str","default":"hunger__feed"},{"name":"label","type":"str","default":"guard"},{"name":"speed","type":"f32","default":12.5}]}],"events":[{"name":"hunger__feed","fields":[]}]}
+    );
+}
+
+test "a component constant where an event name belongs fails at generate (the on/emit shims)" {
+    // The codex finding on #28: `Labelle.on(Worker)` — a real constant of
+    // the WRONG KIND (a component, not an event) — used to extract clean
+    // (every seeded constant was the call-safe sentinel, and on/emit were
+    // blind method_missing no-ops) and only die at RUNTIME:
+    // raw_event_subscribe reads the name with mrb_get_args "s", so the
+    // Class raised and the script was evicted. The shims validate the
+    // name at generate, both across files (Worker arrives as the seeded
+    // sentinel)...
+    try expectFailure(&.{
+        .{ .path = "components/worker.rb", .source = "Worker = Labelle.component \"Worker\", hp: 1" },
+        .{ .path = "scripts/bad.rb", .source = "Labelle.on(Worker) { |ev| }" },
+    }, &.{
+        "scripts/bad.rb:1",
+        "Labelle.on: expected an event-name String",
+        "non-primitive cross-file constant",
+    });
+    // ...and in the SAME file, where Worker is the real view class the
+    // stub returned — the message can name the component itself.
+    try expectFailure(&.{.{
+        .path = "scripts/bad.rb",
+        .source =
+        \\Worker = Labelle.component "Worker", hp: 1
+        \\Labelle.on(Worker) { |ev| }
+        ,
+    }}, &.{
+        "scripts/bad.rb:2",
+        "Labelle.on: expected an event-name String",
+        "the component 'Worker'",
+    });
+    // Labelle.emit rides the same check, same pair of spellings.
+    try expectFailure(&.{
+        .{ .path = "components/worker.rb", .source = "Worker = Labelle.component \"Worker\", hp: 1" },
+        .{ .path = "scripts/bad.rb", .source = "Labelle.emit(Worker, amount: 1.0)" },
+    }, &.{
+        "scripts/bad.rb:1",
+        "Labelle.emit: expected an event-name String",
+        "non-primitive cross-file constant",
+    });
+    try expectFailure(&.{.{
+        .path = "scripts/bad.rb",
+        .source =
+        \\Worker = Labelle.component "Worker", hp: 1
+        \\Labelle.emit(Worker, amount: 1.0)
+        ,
+    }}, &.{
+        "scripts/bad.rb:2",
+        "Labelle.emit: expected an event-name String",
+        "the component 'Worker'",
     });
 }
 
@@ -597,6 +684,23 @@ test "a tampered take seam cannot silently truncate the harvest" {
     try testing.expectError(error.DeclarePrelude, extract.run(testing.allocator, &.{.{
         .path = "events/evil.rb",
         .source = "def Labelle.__declare_take_events; [\"only_a_name\"]; end",
+    }}));
+}
+
+test "a tampered consts seam cannot slip a non-vocabulary value into the ledger" {
+    // The constant ledger's value channel accepts exactly the tag
+    // vocabulary — primitives verbatim plus the sentinel Symbol; a
+    // shadowed __declare_take_consts handing back anything else (an
+    // Array here) or an odd-length flat is the same prelude-integrity
+    // class as the truncation test above: hard error.DeclarePrelude,
+    // never a lying seed into later chunks.
+    try testing.expectError(error.DeclarePrelude, extract.run(testing.allocator, &.{.{
+        .path = "scripts/evil.rb",
+        .source = "def Labelle.__declare_take_consts; [\"X\", [1, 2]]; end",
+    }}));
+    try testing.expectError(error.DeclarePrelude, extract.run(testing.allocator, &.{.{
+        .path = "scripts/evil.rb",
+        .source = "def Labelle.__declare_take_consts; [\"name_without_a_value\"]; end",
     }}));
 }
 
