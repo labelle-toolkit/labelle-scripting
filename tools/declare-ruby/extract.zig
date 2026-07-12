@@ -19,7 +19,9 @@
 //! chunk environments (top-level defs, constants and module mutations are
 //! process-global), so this extractor opens a FRESH mrb_state PER CHUNK.
 //! A chunk clobbering `Labelle.component`, defining helpers, or binding
-//! constants dies with its interpreter — later files never see it. That
+//! constants dies with its interpreter — later files never see any of
+//! its VALUES (constant names alone travel, as inert sentinels — the
+//! ledger below). That
 //! is affordable precisely because extraction is a BUILD step (an
 //! mrb_open is sub-millisecond; scripts are dozens, not millions) and it
 //! buys a stronger guarantee than the lua factory-stub: NOTHING survives
@@ -27,6 +29,27 @@
 //! duplicate detection, emitted fragments for the final schema) lives on
 //! THIS side and is threaded into each fresh state through the prelude's
 //! __declare_seed/__declare_begin/__declare_take seams.
+//!
+//! Constant ledger — the one deliberate softening of that isolation
+//! (labelle-engine#772): at runtime ONE shared VM loads every file, so a
+//! later file legally references an earlier file's top-level constants
+//! at chunk scope (`Labelle.on(HungerFeed)` in a script, HungerFeed
+//! declared in an events file). After each clean chunk the driver
+//! harvests the constant names the chunk defined (__declare_take_consts,
+//! a baseline diff of that state's Object) and re-binds them into every
+//! LATER chunk's fresh state as the inert sentinel
+//! (__declare_seed_const) — resolvable in call positions, rejected in
+//! spec positions, answering no methods (isolation holds). A constant NO
+//! earlier input defined (a typo) stays unresolved and NameErrors at
+//! extract with the chunk's file:line, and a reference to a LATER file's
+//! constant fails the same way — both matching the runtime, where
+//! file-scope code runs before later files load. "Earlier" is meaningful
+//! because argv order IS the runtime registration order: the assembler
+//! collects `components/*.<ext>`, then `events/*.<ext>`, then the script
+//! dir, and hands this tool that exact list (verified against
+//! labelle-assembler v0.87.0 — root.zig's concatEmbeds3 builds the
+//! components → events → scripts slice and scripting_declare.zig's
+//! runDeclareTool appends opts.script_files to the argv verbatim).
 //!
 //! Separate from src/ruby/vm.zig on purpose (the lua extract.zig rule):
 //! vm.zig's error paths log through the Script Runtime Contract's
@@ -223,8 +246,19 @@ pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
         decls.deinit(allocator);
     }
 
+    // The constant ledger: top-level constant names earlier chunks
+    // defined, in input (= argv = runtime registration) order. Seeded
+    // into each later chunk's fresh state before its body runs — see the
+    // module doc. Dedup is on the ruby side: a chunk's own take excludes
+    // the names we seeded, so a redefinition never re-enters the ledger.
+    var consts: std.ArrayList([]u8) = .empty;
+    defer {
+        for (consts.items) |n| allocator.free(n);
+        consts.deinit(allocator);
+    }
+
     for (inputs) |input| {
-        if (try runChunk(allocator, input, &decls)) |failure|
+        if (try runChunk(allocator, input, &decls, &consts)) |failure|
             return .{ .failure = failure };
     }
 
@@ -260,10 +294,17 @@ pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
 }
 
 /// One chunk, one interpreter: open, install the prelude, seed the
-/// accumulated recorder state, run the body, harvest. Returns a failure
-/// message (allocator-owned) when the chunk itself misbehaved, null when
-/// it ran clean (its declarations appended to `decls`).
-fn runChunk(allocator: std.mem.Allocator, input: Input, decls: *std.ArrayList(Decl)) Error!?[]u8 {
+/// accumulated recorder state (declarations AND the constant ledger),
+/// run the body, harvest. Returns a failure message (allocator-owned)
+/// when the chunk itself misbehaved, null when it ran clean (its
+/// declarations appended to `decls`, its top-level constant names to
+/// `consts`).
+fn runChunk(
+    allocator: std.mem.Allocator,
+    input: Input,
+    decls: *std.ArrayList(Decl),
+    consts: *std.ArrayList([]u8),
+) Error!?[]u8 {
     const mrb = c.mrb_open() orelse return error.RubyStateInit;
     defer c.mrb_close(mrb);
 
@@ -285,9 +326,11 @@ fn runChunk(allocator: std.mem.Allocator, input: Input, decls: *std.ArrayList(De
     // Fresh state, fresh symbols (syms are per-state).
     const sym_seed = c.mrb_intern(mrb, "__declare_seed", "__declare_seed".len);
     const sym_seed_event = c.mrb_intern(mrb, "__declare_seed_event", "__declare_seed_event".len);
+    const sym_seed_const = c.mrb_intern(mrb, "__declare_seed_const", "__declare_seed_const".len);
     const sym_begin = c.mrb_intern(mrb, "__declare_begin", "__declare_begin".len);
     const sym_take = c.mrb_intern(mrb, "__declare_take", "__declare_take".len);
     const sym_take_events = c.mrb_intern(mrb, "__declare_take_events", "__declare_take_events".len);
+    const sym_take_consts = c.mrb_intern(mrb, "__declare_take_consts", "__declare_take_consts".len);
 
     // Replay earlier files' declarations into this state's duplicate
     // detectors (per kind — separate namespaces), then stamp the current
@@ -306,6 +349,25 @@ fn runChunk(allocator: std.mem.Allocator, input: Input, decls: *std.ArrayList(De
             .event => sym_seed_event,
         };
         _ = c.mrb_funcall_argv(mrb, modv, sym, args.len, &args);
+        if (excPending(mrb)) return error.DeclarePrelude;
+    }
+    // Replay the constant ledger: every top-level constant name an
+    // EARLIER file defined, re-bound as the inert sentinel so the legal
+    // cross-file reference (labelle-engine#772: file-scope
+    // `Labelle.on(HungerFeed)` with HungerFeed declared in an events
+    // file) resolves in this fresh state. Strictly forward — a constant
+    // only a LATER file defines stays unresolved and NameErrors like the
+    // runtime, where file-scope code runs before later files load; a
+    // constant NO file defines (a typo) NameErrors at extract with this
+    // chunk's file:line instead of extracting silently. Argv order makes
+    // "earlier" mean what it means at runtime — see the module doc.
+    for (consts.items) |name| {
+        const arena = c.labelle_mrb_gc_arena_save(mrb);
+        defer c.labelle_mrb_gc_arena_restore(mrb, arena);
+        const args = [_]c.Value{
+            c.mrb_str_new(mrb, name.ptr, @intCast(name.len)),
+        };
+        _ = c.mrb_funcall_argv(mrb, modv, sym_seed_const, args.len, &args);
         if (excPending(mrb)) return error.DeclarePrelude;
     }
     {
@@ -342,10 +404,42 @@ fn runChunk(allocator: std.mem.Allocator, input: Input, decls: *std.ArrayList(De
 
     // Harvest this chunk's declarations — the component channel, then the
     // event channel: each a flat [name, fragment, ...] array, copied out
-    // before the state closes.
+    // before the state closes — and the top-level constant names it
+    // defined, appended to the ledger later chunks are seeded from.
     try harvestChannel(allocator, mrb, modv, sym_take, .component, input.path, decls);
     try harvestChannel(allocator, mrb, modv, sym_take_events, .event, input.path, decls);
+    try harvestConsts(allocator, mrb, modv, sym_take_consts, consts);
     return null;
+}
+
+/// Pull the chunk's freshly defined top-level constant NAMES (the
+/// __declare_take_consts seam — a flat array of name strings) out of its
+/// interpreter into the driver's cross-chunk ledger, copied before the
+/// state closes. The ruby side already excluded everything the
+/// interpreter and the prelude booted with (the baseline) and everything
+/// WE seeded (so a chunk redefining a seeded name never re-enters the
+/// ledger); a non-string entry means a tampered/shadowed seam — the same
+/// prelude-integrity class as harvestChannel's odd-length rejection.
+fn harvestConsts(
+    allocator: std.mem.Allocator,
+    mrb: ?*c.State,
+    modv: c.Value,
+    sym: c.Sym,
+    consts: *std.ArrayList([]u8),
+) Error!void {
+    const arena = c.labelle_mrb_gc_arena_save(mrb);
+    defer c.labelle_mrb_gc_arena_restore(mrb, arena);
+    const flat = c.mrb_funcall_argv(mrb, modv, sym, 0, null);
+    if (excPending(mrb) or flat.tt != .array) return error.DeclarePrelude;
+    const len = c.labelle_mrb_ary_len(flat);
+    var i: c.Int = 0;
+    while (i < len) : (i += 1) {
+        const nv = c.mrb_ary_entry(flat, i);
+        if (nv.tt != .string) return error.DeclarePrelude;
+        const name = try allocator.dupe(u8, strSlice(nv));
+        errdefer allocator.free(name);
+        try consts.append(allocator, name);
+    }
 }
 
 /// Pull one flat [name, fragment, ...] declaration channel (the

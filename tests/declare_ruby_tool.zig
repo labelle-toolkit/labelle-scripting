@@ -222,7 +222,7 @@ test "Labelle.* helper results in a spec fail the build instead of silently misd
         &.{
             "scripts/path.rb:1",
             "component 'Path' field 'waypoints'",
-            "Labelle.* helpers and unresolved constants cannot be used in component specs — declare-mode fields are literals",
+            "Labelle.* helpers and cross-file constants cannot be used in component specs — declare-mode fields are literals",
         },
     );
     // The spec and opts positions are scanned too — a nil-returning no-op
@@ -239,16 +239,20 @@ test "Labelle.* helper results in a spec fail the build instead of silently misd
     );
 }
 
-test "chunk-scope use of a cross-file constant is declare-safe (const_missing yields the sentinel)" {
+test "chunk-scope use of a cross-file constant is declare-safe (the ledger seeds the sentinel)" {
     // THE labelle-engine#772 pattern: events/hunger__feed.rb binds
     // `HungerFeed`, and a script subscribes AT FILE SCOPE with the
     // constant. At runtime one shared VM registers components → events →
     // scripts, so the constant exists before any script chunk loads; this
     // runner gives every chunk a fresh state, so `HungerFeed` cannot
-    // resolve here — Module#const_missing hands back the inert sentinel
-    // and `Labelle.on(sentinel)` no-ops through method_missing (the lua
-    // stub tolerates the same chunk through _ENV's unknown-global noop).
-    // The declare phase must neither run the handler nor fail the build.
+    // resolve by itself — the driver harvests the constant names each
+    // clean chunk defines and re-binds them into every LATER chunk as the
+    // inert sentinel (input order = the assembler's collection order =
+    // the runtime registration order, so "earlier" means exactly what it
+    // means at runtime), and `Labelle.on(sentinel)` no-ops through
+    // method_missing. The declare phase must neither run the handler nor
+    // fail the build. (A constant NO earlier file defined gets no seed —
+    // the typo test below pins the NameError.)
     try expectSchema(&.{
         .{
             .path = "events/hunger__feed.rb",
@@ -269,27 +273,70 @@ test "chunk-scope use of a cross-file constant is declare-safe (const_missing yi
     );
 }
 
-test "an unresolved constant in a spec position still fails the build pointedly" {
-    // const_missing must not let a typo'd constant SILENTLY declare a
-    // field: the sentinel it returns is rejected exactly like a helper
-    // result, naming the field. (At runtime the same typo would NameError
-    // in the real VM — declare keeps the failure at generate time.)
+test "a typo'd constant fails at generate naming the file and line (no silent extract)" {
+    // The hazard a blanket Module#const_missing had: with EVERY
+    // unresolved constant resolving to the sentinel, `Labelle.on(
+    // HngerFeed)` — a typo of the declared HungerFeed — extracted
+    // silently and only died at RUNTIME as a script eviction. The ledger
+    // seeds only constants an EARLIER file really defined, so a typo
+    // stays unresolved and NameErrors at extract with the chunk's
+    // file:line, exactly like the runtime VM (and like v0.10.0).
+    try expectFailure(&.{
+        .{
+            .path = "events/hunger__feed.rb",
+            .source = "HungerFeed = Labelle.event \"hunger__feed\", entity: Labelle.id, amount: 0.5",
+        },
+        .{ .path = "scripts/feed_watcher.rb", .source = "Labelle.on(HngerFeed) { |ev| }" },
+    }, &.{
+        "scripts/feed_watcher.rb:1",
+        "NameError",
+        "uninitialized constant HngerFeed",
+    });
+    // Spec positions ride the same rule — the typo never resolves far
+    // enough to reach the field classifier, so the failure names the
+    // CONSTANT (the mistake), not the field.
     try expectFailure(
         &.{.{ .path = "scripts/bad.rb", .source = "Labelle.component(\"Bad\", level: STARTING_LEVEL)" }},
-        &.{
-            "scripts/bad.rb:1",
-            "component 'Bad' field 'level'",
-            "Labelle.* helpers and unresolved constants cannot be used in component specs",
-        },
+        &.{ "scripts/bad.rb:1", "NameError", "uninitialized constant STARTING_LEVEL" },
     );
-    try expectFailure(
-        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"bad__event\", entity: EntityId)" }},
-        &.{
-            "events/bad.rb:1",
-            "event 'bad__event' field 'entity'",
-            "Labelle.* helpers and unresolved constants cannot be used in event specs",
-        },
-    );
+}
+
+test "a cross-file constant in a spec position is rejected pointedly (sentinel, not a guessed schema)" {
+    // The seeded sentinel is legal in CALL positions only (the test
+    // above); as a field default it must fail the build naming the field
+    // — declare-mode fields are literals, whatever constant they hide
+    // behind. (At runtime the constant may hold a perfectly usable value
+    // — the frozen event-name string here — but a declaration the
+    // extractor cannot see through is a declaration the build must
+    // reject, the same posture as Labelle.* helper results.)
+    try expectFailure(&.{
+        .{ .path = "events/hunger__feed.rb", .source = "HungerFeed = Labelle.event \"hunger__feed\", {}" },
+        .{ .path = "scripts/bad.rb", .source = "Labelle.component(\"Bad\", level: HungerFeed)" },
+    }, &.{
+        "scripts/bad.rb:1",
+        "component 'Bad' field 'level'",
+        "Labelle.* helpers and cross-file constants cannot be used in component specs",
+    });
+    try expectFailure(&.{
+        .{ .path = "events/hunger__feed.rb", .source = "HungerFeed = Labelle.event \"hunger__feed\", {}" },
+        .{ .path = "events/bad.rb", .source = "Labelle.event(\"bad__event\", entity: HungerFeed)" },
+    }, &.{
+        "events/bad.rb:1",
+        "event 'bad__event' field 'entity'",
+        "Labelle.* helpers and cross-file constants cannot be used in event specs",
+    });
+}
+
+test "a constant only a LATER file defines fails at generate, matching the runtime load order" {
+    // At runtime file-scope code runs when ITS file loads, before later
+    // files exist — the reference NameErrors there, so it must NameError
+    // here: the ledger seeds strictly forward (input order = collection
+    // order = registration order). A blanket const_missing would have
+    // extracted this cleanly and shipped the surprise to runtime.
+    try expectFailure(&.{
+        .{ .path = "scripts/early.rb", .source = "Labelle.on(DefinedLater) { |ev| }" },
+        .{ .path = "scripts/late.rb", .source = "DefinedLater = Labelle.event \"defined__later\", {}" },
+    }, &.{ "scripts/early.rb:1", "uninitialized constant DefinedLater" });
 }
 
 test "float defaults must fit f32: finite-but-huge fails alongside NaN/inf; the edge passes" {
@@ -382,13 +429,14 @@ test "chunks are isolated: one script's top-level defs and constants never leak 
         .{ .path = "scripts/b.rb", .source = "helper()" },
     }, &.{ "scripts/b.rb:1", "helper" });
     // Constants too — ruby's extra leak surface lua locals never had: the
-    // view class a.rb bound to `Hunger` must be invisible to b.rb. Since
-    // Module#const_missing joined the stub (cross-file constants resolve
-    // to the inert sentinel so file-scope `Labelle.on(HungerFeed)` is
-    // declare-safe), b.rb sees the SENTINEL here, not a NameError — and
-    // instantiating it still fails the build with b.rb's file:line,
-    // because the sentinel answers no methods. Had the class leaked,
-    // `Hunger.new` would succeed and this expectFailure would fail.
+    // view class a.rb bound to `Hunger` must be invisible to b.rb. The
+    // constant LEDGER re-binds the NAME into b.rb's fresh state (that is
+    // what keeps file-scope `Labelle.on(HungerFeed)` declare-safe) — but
+    // as the inert SENTINEL, never the class — so b.rb sees a resolvable
+    // name whose use beyond a call position still fails the build with
+    // b.rb's file:line, because seeded sentinels answer no methods. Had
+    // the class itself leaked, `Hunger.new` would succeed and this
+    // expectFailure would fail.
     try expectFailure(&.{
         .{ .path = "scripts/a.rb", .source = "Hunger = Labelle.component(\"Hunger\", hp: 1)" },
         .{ .path = "scripts/b.rb", .source = "Hunger.new" },
