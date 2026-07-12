@@ -359,6 +359,38 @@ pub fn build(b: *std.Build) void {
     );
     declare_crystal_step.dependOn(&b.addInstallArtifact(declare_crystal_exe, .{}).step);
 
+    // ── labelle-declare-csharp: the C# declare-mode schema extractor ────────
+    // rust's / crystal's CoreCLR-family TWIN (labelle-scripting#27,
+    // labelle-engine#743). C# is compiled, so this exe is the SAME
+    // COMPILE-AND-RUN PROBE: given `--cache-dir <dir>` + declaration files, it
+    // stages a C# console program under <dir> carrying the SHIPPED Labelle
+    // declare surface around those files, `dotnet build`s + runs it, and prints
+    // the schema JSON. Same SHAPE as the declare-rs/declare-crystal steps above —
+    // host-targeted, Debug-pinned, reached only through its named step (or the
+    // csharp test wiring, which drives THIS exe for the byte-parity pin). It
+    // carries no vendored runtime (the compile machinery is `dotnet`, shelled at
+    // runtime), only one build-time artifact its extract.zig `@embedFile`s: the
+    // SHIPPED native-csharp/src/Declare.cs (the exact declare surface/emitter it
+    // was built against). Created ONCE here so the named step and the test wiring
+    // share the artifact.
+    const declare_csharp_mod = b.createModule(.{
+        .root_source_file = b.path("tools/declare-csharp/main.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    declare_csharp_mod.addAnonymousImport("csharp_declare_src", .{
+        .root_source_file = b.path("native-csharp/src/Declare.cs"),
+    });
+    const declare_csharp_exe = b.addExecutable(.{
+        .name = "labelle-declare-csharp",
+        .root_module = declare_csharp_mod,
+    });
+    const declare_csharp_step = b.step(
+        "labelle-declare-csharp",
+        "Build the C# declare-mode schema extractor (zig-out/bin/labelle-declare-csharp)",
+    );
+    declare_csharp_step.dependOn(&b.addInstallArtifact(declare_csharp_exe, .{}).step);
+
     // Tests: the contract symbols are `extern` in src/contract.zig and the
     // test root provides them (tests/mock_world.zig `export`s a toy world),
     // mirroring production exactly — there the assembled game binary is the
@@ -707,6 +739,43 @@ pub fn build(b: *std.Build) void {
                 // Export the mock-world contract symbols so the managed
                 // assembly can bind them against the host process.
                 tests.rdynamic = true;
+
+                // The declare tool (labelle-scripting#27, labelle-engine#743) —
+                // the C# member of the cross-runner byte-parity contract, rust's
+                // / crystal's CoreCLR-family twin. C# is compiled, so — unlike
+                // lua/ruby, RUN in-process — the runner is the
+                // labelle-declare-csharp exe (built above), which `dotnet build`s
+                // a probe INTERNALLY. The test drives the SHIPPED tool exactly as
+                // the assembler will: `labelle-declare-csharp --cache-dir
+                // <persistent> <components.cs> <events.cs>` over the GAME-SHAPED
+                // fixtures (bare attributed records, NO `using` lines — a green
+                // run proves the tool needs no prelude injection). Its captured
+                // stdout is `@embedFile`d by tests/declare_csharp_tool.zig and
+                // pinned byte-identical to the lua/ruby/rust/crystal/ts runners'
+                // schema. The --cache-dir is a persistent dir under the zig cache
+                // the tool reuses as dotnet's build workspace (obj/), so a
+                // re-extract is warm. Host-targeted: the tool runs at build time
+                // on the dev/CI machine, whatever the game targets. Rides the
+                // dotnet-present wiring (this block), so a dotnet-less host never
+                // reaches it.
+                const declare_csharp_cache = b.cache_root.join(
+                    b.allocator,
+                    &.{"csharp-declare-target"},
+                ) catch @panic("OOM");
+                const run_csharp_tool = b.addRunArtifact(declare_csharp_exe);
+                run_csharp_tool.addArgs(&.{ "--cache-dir", declare_csharp_cache });
+                run_csharp_tool.addFileArg(b.path("tools/declare-csharp/testdata/components.cs"));
+                run_csharp_tool.addFileArg(b.path("tools/declare-csharp/testdata/events.cs"));
+                const csharp_tool_out = run_csharp_tool.captureStdOut(.{});
+                tests_root_mod.addAnonymousImport("csharp_declare_schema_out", .{
+                    .root_source_file = csharp_tool_out,
+                });
+                tests_root_mod.addAnonymousImport("declare_cs_components_src", .{
+                    .root_source_file = b.path("tools/declare-csharp/testdata/components.cs"),
+                });
+                tests_root_mod.addAnonymousImport("declare_cs_events_src", .{
+                    .root_source_file = b.path("tools/declare-csharp/testdata/events.cs"),
+                });
             }
 
             const run_tests = b.addRunArtifact(tests);
