@@ -64,6 +64,16 @@ comptime {
     if (scripting.language == .rust) _ = @import("declare_rust_tool.zig");
 }
 
+// The CRYSTAL declare runner's golden (labelle-engine#775) rides the CRYSTAL
+// binary only — rust's twin. Like rust it needs no in-process externs (the
+// runner is an out-of-process probe build.zig `crystal build`s and RUNS,
+// `@embedFile`ing its stdout), and build.zig wires the three anonymous imports
+// (captured output + the two compiled fixtures) only where crystal exists and
+// the target has a crystal story (lang == .crystal, crystalTriple != null).
+comptime {
+    if (scripting.language == .crystal) _ = @import("declare_crystal_tool.zig");
+}
+
 // The console-eval SHARED-code suite (response builder, params decoding,
 // hook-shim AstGen check — labelle-scripting#4) also rides the lua binary
 // only: the code under test is language-independent, so one mirror is the

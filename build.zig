@@ -315,6 +315,38 @@ pub fn build(b: *std.Build) void {
     );
     declare_rs_step.dependOn(&b.addInstallArtifact(declare_rs_exe, .{}).step);
 
+    // ── labelle-declare-crystal: the crystal declare-mode schema extractor ──
+    // rust's native-family TWIN (labelle-engine#775). Crystal has no
+    // interpreter either, so this exe is the SAME COMPILE-AND-RUN PROBE: given
+    // `--cache-dir <dir>` + declaration files, it stages a crystal program
+    // under <dir> carrying the SHIPPED Labelle module's macros around those
+    // files, `crystal build -Ddeclare`s + runs it, and prints the schema JSON.
+    // Same SHAPE as the declare-rs step above — host-targeted, Debug-pinned,
+    // reached only through its named step (or the crystal test wiring, which
+    // drives THIS exe for the byte-parity pin). It carries no vendored runtime
+    // (the compile machinery is `crystal`, shelled at runtime), only one
+    // build-time artifact its extract.zig `@embedFile`s: the SHIPPED
+    // native-crystal/src/labelle.cr (the exact macro/emitter surface it was
+    // built against). Created ONCE here so the named step and the test wiring
+    // share the artifact.
+    const declare_crystal_mod = b.createModule(.{
+        .root_source_file = b.path("tools/declare-crystal/main.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    declare_crystal_mod.addAnonymousImport("labelle_cr_src", .{
+        .root_source_file = b.path("native-crystal/src/labelle.cr"),
+    });
+    const declare_crystal_exe = b.addExecutable(.{
+        .name = "labelle-declare-crystal",
+        .root_module = declare_crystal_mod,
+    });
+    const declare_crystal_step = b.step(
+        "labelle-declare-crystal",
+        "Build the crystal declare-mode schema extractor (zig-out/bin/labelle-declare-crystal)",
+    );
+    declare_crystal_step.dependOn(&b.addInstallArtifact(declare_crystal_exe, .{}).step);
+
     // Tests: the contract symbols are `extern` in src/contract.zig and the
     // test root provides them (tests/mock_world.zig `export`s a toy world),
     // mirroring production exactly — there the assembled game binary is the
@@ -594,6 +626,43 @@ pub fn build(b: *std.Build) void {
                 boot_tests.step.dependOn(&localize.step);
                 const run_boot_tests = b.addRunArtifact(boot_tests);
                 test_step.dependOn(&run_boot_tests.step);
+
+                // The declare tool (labelle-engine#775) — the crystal member of
+                // the cross-runner byte-parity contract, rust's twin. Crystal
+                // has no interpreter, so — unlike lua/ruby, RUN in-process — the
+                // runner is the labelle-declare-crystal exe (built above), which
+                // `crystal build`s a probe INTERNALLY. The test drives the
+                // SHIPPED tool exactly as the assembler will:
+                // `labelle-declare-crystal --cache-dir <persistent>
+                // <components.cr> <events.cr>` over the GAME-SHAPED fixtures
+                // (bare macros, NO `require` lines — a green run proves the
+                // tool's injected prelude). Its captured stdout is `@embedFile`d
+                // by tests/declare_crystal_tool.zig and pinned byte-identical to
+                // the lua/ruby/rust runners' schema. The --cache-dir is a
+                // persistent dir under the zig cache the tool uses as the
+                // crystal compile cache (CRYSTAL_CACHE_DIR), so a re-extract is
+                // warm — crystal's whole-program compile is slow. Host-targeted:
+                // the tool runs at build time on the dev/CI machine, whatever
+                // the game targets. Rides the crystal-present wiring (this
+                // block), so a crystal-less host never reaches it.
+                const declare_crystal_cache = b.cache_root.join(
+                    b.allocator,
+                    &.{"crystal-declare-target"},
+                ) catch @panic("OOM");
+                const run_crystal_tool = b.addRunArtifact(declare_crystal_exe);
+                run_crystal_tool.addArgs(&.{ "--cache-dir", declare_crystal_cache });
+                run_crystal_tool.addFileArg(b.path("tools/declare-crystal/testdata/components.cr"));
+                run_crystal_tool.addFileArg(b.path("tools/declare-crystal/testdata/events.cr"));
+                const crystal_tool_out = run_crystal_tool.captureStdOut(.{});
+                tests_root_mod.addAnonymousImport("crystal_declare_schema_out", .{
+                    .root_source_file = crystal_tool_out,
+                });
+                tests_root_mod.addAnonymousImport("declare_cr_components_src", .{
+                    .root_source_file = b.path("tools/declare-crystal/testdata/components.cr"),
+                });
+                tests_root_mod.addAnonymousImport("declare_cr_events_src", .{
+                    .root_source_file = b.path("tools/declare-crystal/testdata/events.cr"),
+                });
             }
 
             // The csharp binary's managed test assembly (labelle-engine

@@ -22,9 +22,10 @@
 #   - a NATIVE game-root Zig hook (hooks/feed_watcher.zig) consumes the
 #     SAME hunger__feed from the same bus — the two-layer interop.
 #
-# `Hunger` is a real engine component (components/hunger.zig) — crystal
-# has no declare mode, so every call addresses it by name over the
-# contract at runtime. Timeline: scripts/game.cr's header.
+# `Hunger` is a crystal-DECLARED component (components/hunger.cr) — only
+# its schema travels at generate (nothing compiles into the game), so
+# every call addresses it by name over the contract at runtime. Timeline:
+# scripts/game.cr's header.
 
 class HungerSystem < Labelle::Script
   DECAY_PER_TICK = 0.25_f32 # exact in binary fp — see game.cr

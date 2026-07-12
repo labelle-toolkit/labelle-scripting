@@ -14,9 +14,9 @@
 #
 # The game mirrors examples/rust-game token-for-token (which mirrors
 # examples/ruby-game) so the cross-language story is visible by eye:
-# same Hunger/Worker component shapes (Zig files here — crystal has no
-# declare mode; the ruby game declares Hunger in ruby), same
-# command-event (events/hunger__feed.zig), same native Zig hook
+# same Hunger/Worker component shapes (crystal-DECLARED here —
+# components/*.cr, like the ruby game declares them in ruby), same
+# command-event (events/hunger__feed.cr), same native Zig hook
 # (hooks/feed_watcher.zig) — only the script layer swaps rust for
 # crystal (and ruby's transcript carries one extra token, its pure-ruby
 # feed-watcher's). Registration order stands in for ruby's two tiers: the
