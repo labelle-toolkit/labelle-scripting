@@ -1,17 +1,22 @@
-//! rust/mod.rs — the game's crate-module root (labelle-engine#741,
-//! native-compiled family): at `labelle generate` the assembler LINKS
-//! this whole `rust/` dir over the scripting plugin's staged
-//! `native/src/game/`, cargo compiles it into
-//! `liblabelle_rust_scripts.a`, and the game binary links it — the
-//! `labelle_*` contract symbols resolve against the host's exports in
-//! the same binary. No VM, nothing embeds; `pub fn register` below is
-//! the one convention entry point.
+//! scripts/mod.rs — the game's crate-module root (labelle-engine#741,
+//! native-compiled family; `scripts/` is the shared convention dir every
+//! script language uses since labelle-engine#237 / assembler v0.86.0):
+//! at `labelle generate` the assembler LINKS this whole `scripts/` dir
+//! over the scripting plugin's staged `native/src/game/`, cargo compiles
+//! it into `liblabelle_rust_scripts.a`, and the game binary links it —
+//! the `labelle_*` contract symbols resolve against the host's exports
+//! in the same binary. No VM, nothing embeds; `pub fn register` below is
+//! the one convention entry point (`scripts/mod.rs` IS the module root —
+//! the native family's fixed name, where ruby uses ordering prefixes).
 //!
 //! The game mirrors examples/ruby-game's hunger sawtooth so the
-//! cross-language story is visible token-for-token: same components
-//! (components/hunger.zig + worker.zig), same command-event
+//! cross-language story is visible token-for-token: same Hunger/Worker
+//! component shapes (Zig files here — rust has no declare mode; the ruby
+//! game declares Hunger in ruby), same command-event
 //! (events/hunger__feed.zig), same native Zig hook
-//! (hooks/feed_watcher.zig) — only the script layer swaps ruby for rust.
+//! (hooks/feed_watcher.zig) — only the script layer swaps ruby for rust
+//! (ruby's transcript carries one extra token, its pure-ruby
+//! feed-watcher's).
 //! Registration order stands in for ruby's two tiers: the spawner
 //! registers FIRST (its `init` seeds the world before the system's, its
 //! `update` runs before the system's each tick) and `deinit` runs in
@@ -66,9 +71,9 @@ use crate::labelle::Scripts;
 mod hunger;
 mod spawner;
 
-/// The game registration entry point (the `native/src/game/mod.rs`
-/// convention — see the plugin README's rust section). Registration
-/// order is hook order; `deinit` runs reversed.
+/// The game registration entry point (the game's `scripts/mod.rs`,
+/// staged as `native/src/game/mod.rs` — see the plugin README's rust
+/// section). Registration order is hook order; `deinit` runs reversed.
 pub fn register(scripts: &mut Scripts) {
     scripts.add("spawner", Box::new(spawner::Spawner::default()));
     scripts.add("hunger", Box::new(hunger::HungerSystem::default()));

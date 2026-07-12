@@ -1,38 +1,46 @@
-# hunger_controller.rb — the structured tier: the labelle-engine#742
-# acceptance pattern, verbatim ergonomics, against the REAL engine —
+# scripts/20_hunger_controller.rb — the structured tier: the
+# labelle-engine#742 acceptance pattern, verbatim ergonomics, against
+# the REAL engine —
 #
-#   - `Labelle::Component.ref` builds the Struct-backed view class,
+#   - `Hunger` is the view class components/hunger.rb DECLARES (the
+#     labelle-engine#237 refinement, assembler v0.86.0): components-dir
+#     declarations register BEFORE scripts/, so the constant exists by
+#     the time this chunk loads — no `Component.ref` line here anymore
+#     (`Component.ref` stays the explicit-fields spelling of the same
+#     class; the two are interchangeable),
 #   - the controller caches ONE instance in setup (`@h = Hunger.new`),
 #   - tick refills it per entity via `e.get(Hunger, into: @h)`, mutates
 #     fields, writes back with `e.set(@h)`,
 #   - command-as-event feeding (`hunger__feed`, events/hunger__feed.zig)
-#     subscribed in setup — emitted by ruby/spawner.rb on tick 2, so the
-#     cross-script round-trip over the engine bus is part of the pinned
-#     transcript,
+#     subscribed in setup — emitted by scripts/10_spawner.rb on tick 2,
+#     so the cross-script round-trip over the engine bus is part of the
+#     pinned transcript,
 #   - `Labelle::FrameArray` is the per-frame HOT scratch (collect ids,
 #     then process — mruby's Array#clear would FREE the backing every
 #     tick), asserted flat via growth_count at tick 5,
-#   - plain hooks coexist: ruby/spawner.rb seeds the worker,
-#   - a NATIVE game-root Zig hook (hooks/feed_watcher.zig) consumes the
-#     SAME hunger__feed from the same bus — the two-layer interop.
-#
-# `Hunger` is a real engine component (components/hunger.zig) — ruby has
-# no declare mode (the assembler's declare phase SKIPS for ruby), so the
-# ref resolves against it by name at runtime.
+#   - plain hooks coexist: scripts/10_spawner.rb seeds the worker,
+#   - the SAME hunger__feed reaches two more subscribers off the same
+#     bus: a NATIVE game-root Zig hook (hooks/feed_watcher.zig — the
+#     two-layer interop) and a pure-ruby top-level watcher
+#     (scripts/feed_watcher.rb).
 #
 # Tokens carry BEHAVIOR: every tick logs the freshly written level, so
 # the pinned sequence encodes the whole decay-feed-decay sawtooth through
 # the real ECS. All values are exact in binary floating point at every
 # width en route (0.875 start, 0.25 steps, 0.5 feed), so the interpolated
-# decimals are deterministic. One deliberate delta from the #742 fixture:
-# decay is 0.25 PER TICK, not `DECAY * dt` — the null backend's fixed dt
-# is f32(1.0/60.0), which no decimal-exact multiple survives, and exact
-# values in the tokens are the point.
+# decimals are deterministic. The 0.875 seed is the DECLARED default from
+# components/hunger.rb (the spawner attaches Hunger bare), so the chain
+# also proves the ruby declaration traveled through codegen into the real
+# ECS. One deliberate delta from the #742 fixture: decay is 0.25 PER
+# TICK, not `DECAY * dt` — the null backend's fixed dt is f32(1.0/60.0),
+# which no decimal-exact multiple survives, and exact values in the
+# tokens are the point.
 #
 # Frame-by-frame (LABELLE_NULL_FRAMES=5; per frame the plugin Controller
 # runs: event inbox → script `update`s → controller `tick`s):
 #
-#   setup   RUBY_INIT             (spawner init: worker seeded at 0.875)
+#   setup   RUBY_INIT             (spawner init: worker seeded with the
+#                                  declared default, 0.875)
 #           RUBY_CTRL_READY       controller setup ran (after ALL inits)
 #   tick 1  RUBY_LEVEL_0.625      0.875 - 0.25 decay, written back
 #   tick 2  RUBY_FEED_SENT        (spawner update: emits hunger__feed)
@@ -41,8 +49,14 @@
 #                                  subscriber, at THIS frame's
 #                                  dispatchEvents: frame end, after the
 #                                  controller ticks, one tick BEFORE the
-#                                  ruby handler's inbox dispatch)
+#                                  ruby handlers' inbox dispatch)
 #   tick 3  RUBY_ENGINE_TICK_SEEN (spawner's builtin sub, same inbox)
+#           RUBY_WATCHER_SAW_0.5  (scripts/feed_watcher.rb — the THIRD
+#                                  subscriber, same inbox dispatch;
+#                                  per-event handlers run in SUBSCRIPTION
+#                                  order and its file-scope sub happened
+#                                  at chunk load, before this
+#                                  controller's setup-time `on`)
 #           RUBY_FED_LEVEL_0.875  inbox: feed handler ran — id + exact
 #                                  f32 0.5 amount round-tripped the bus;
 #                                  0.375 + 0.5 re-read AFTER the write
@@ -53,8 +67,6 @@
 #           RUBY_FRAMEARRAY_OK    warmed hot scratch never grew
 #                                  (growth_count == 0 across all 5 ticks)
 #   deinit  RUBY_CTRL_DONE        teardown (before per-script deinits)
-
-Hunger = Labelle::Component.ref("Hunger", :level, :starving)
 
 class HungerController < Labelle::Controller
   DECAY_PER_TICK = 0.25 # exact in binary fp — see the header

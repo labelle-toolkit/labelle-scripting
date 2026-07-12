@@ -77,15 +77,16 @@ jobs:
           cargo fmt --check --manifest-path native/Cargo.toml
           cargo fmt --check --manifest-path tests/rust/Cargo.toml
           # The rust example game's sources have no manifest of their own
-          # (they compile as the plugin crate's game module) — check them
-          # file-wise.
-          rustfmt --check --edition 2021 examples/rust-game/rust/*.rs
+          # (they compile as the plugin crate's game module out of the
+          # game's scripts/ dir) — check them file-wise.
+          rustfmt --check --edition 2021 examples/rust-game/scripts/*.rs
 
       - name: Crystal formatting
         # The crystal example game's sources ride along: like the rust
         # example's, they have no build manifest of their own (they
-        # compile as the plugin package's game module) — check the dir.
-        run: crystal tool format --check native-crystal tests/crystal examples/crystal-game/crystal
+        # compile as the plugin package's game module out of the game's
+        # scripts/ dir) — check the dir.
+        run: crystal tool format --check native-crystal tests/crystal examples/crystal-game/scripts
 
   # Ruby example game (labelle-scripting#10) — the ruby counterpart of the
   # assembler's `examples/scripting-smoke`, living in THIS repo so every
@@ -101,15 +102,16 @@ jobs:
     timeout-minutes: 30
     env:
       # The pinned labelle-assembler release the example generates with —
-      # a BINARY release (tag → release.yml assets). Must be a release
-      # whose `scripting_splice.EMBED_LANGUAGES` carries the ruby row
-      # (labelle-assembler#603, `.rb` embedding): v0.81.0 and older warn
-      # "no embeddable-source integration" and embed nothing (the first
-      # registerScript grep below fails loudly). Pinned to v0.85.0 —
-      # ONE floor for every example job (crystal's is the binding one;
-      # v0.85 is additive over ruby's old v0.83 pin). Bump deliberately,
-      # never float.
-      ASSEMBLER_VERSION: v0.85.0
+      # a BINARY release (tag → release.yml assets). v0.86.0 is the HARD
+      # floor for this example's layout (labelle-engine#237's two
+      # convention refinements): the shared `scripts/` dir with ordering
+      # prefixes (labelle-assembler#614) and ruby component DECLARATIONS
+      # in `components/*.rb` (labelle-assembler#615's DECLARE_RUNNERS row,
+      # wiring this repo's tools/declare-ruby, v0.9.0+). Older releases
+      # read only the legacy ruby/ dir (empty here — nothing embeds, the
+      # registerScript greps fail loudly) and skip the declare phase.
+      # Bump deliberately, never float.
+      ASSEMBLER_VERSION: v0.86.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/ruby-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
@@ -144,7 +146,7 @@ jobs:
       # Mirrors the assembler's scripting-smoke CI step (the Lua
       # end-to-end): generate → codegen greps → build (fingerprint dance)
       # → bounded headless run → ordered-transcript diff. Frame-by-frame
-      # timeline: ruby/hunger_controller.rb's header.
+      # timeline: scripts/20_hunger_controller.rb's header.
       - name: Generate + build + run the ruby example game
         run: |
           # Fresh HOME for the whole flow: the assembler keeps its package
@@ -174,19 +176,48 @@ jobs:
             echo "E: generate reported failure"
             exit 1
           fi
-          # Ruby is a non-declare language — generate must SKIP the
-          # declare phase with the pointed note, not run (or silently
-          # drop) it.
-          grep -qF 'script-declared components are lua-only today' generate.log
+          # Ruby DECLARES components now (v0.86.0 DECLARE_RUNNERS + this
+          # repo's tools/declare-ruby): NO declare-phase skip note may
+          # appear — its presence means the runner row or the in-package
+          # tool probe regressed (the pre-v0.86.0 assertion was the
+          # inverse: ruby was a non-declare language and CI pinned the
+          # pointed skip note).
+          if grep -q 'script-declared components' generate.log; then
+            echo "E: declare-phase skip note printed — ruby declares since v0.86.0"
+            exit 1
+          fi
+          # This example is MIGRATED to scripts/ — the legacy-dir grace
+          # note must not appear (its presence means a ruby/ dir leaked
+          # back in, or the resolve probe regressed).
+          if grep -q 'keeps working for one release of grace' generate.log; then
+            echo "E: legacy script-dir deprecation note printed for a migrated example"
+            exit 1
+          fi
+          # THE declare assertion: components/hunger.rb's schema landed
+          # as a real generated registry component (field defaults
+          # included — the transcript's 0.875 seed comes from HERE).
+          grep -qF 'pub const Hunger' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'level: f32 = 0.875,' .labelle/null_desktop/scripting_components.zig
 
           # Codegen assertions — each is one link of the chain; fail
           # loudly if a regression drops it.
           M=.labelle/null_desktop/main.zig
-          # Splice: both embedded ruby scripts registered (sorted stems)
-          # before the VM boots. THE ruby-row assertion: an assembler
-          # without labelle-assembler#603 embeds nothing and fails here.
-          grep -qF 'scripting.registerScript("hunger_controller", @embedFile("ruby/hunger_controller.rb"));' $M
-          grep -qF 'scripting.registerScript("spawner", @embedFile("ruby/spawner.rb"));' $M
+          # The declared component wired into the game's component
+          # registry — scenes/saves/typed queries reach it like any
+          # components/*.zig file.
+          grep -qF '.Hunger = @import("scripting_components.zig").Hunger,' $M
+          # Splice: all four ruby chunks registered before the VM boots —
+          # the components/ DECLARATION first (its view constant must
+          # exist when scripts load), then scripts/ in ordering-prefix
+          # order (stems stripped: 10_spawner → "spawner"), unnumbered
+          # last. The ORDER is the contract, so diff it, don't just grep.
+          grep -qF 'scripting.registerScript("hunger", @embedFile("components/hunger.rb"));' $M
+          grep -qF 'scripting.registerScript("spawner", @embedFile("scripts/10_spawner.rb"));' $M
+          grep -qF 'scripting.registerScript("hunger_controller", @embedFile("scripts/20_hunger_controller.rb"));' $M
+          grep -qF 'scripting.registerScript("feed_watcher", @embedFile("scripts/feed_watcher.rb"));' $M
+          grep -oE 'registerScript\("[a-z_0-9]+"' $M | cut -d'"' -f2 > .labelle/reg_order.txt
+          printf '%s\n' hunger spawner hunger_controller feed_watcher > .labelle/reg_expected.txt
+          diff .labelle/reg_expected.txt .labelle/reg_order.txt
           # Splice: the generated flag half of the templates' double-gate.
           grep -qF 'const scripting_enabled = true;' $M
           # labelle-null template: the bind touchpoint (proves the sibling
@@ -227,18 +258,26 @@ jobs:
           LABELLE_NULL_FRAMES=5 ./zig-out/bin/ruby_game > run.log 2>&1
 
           # Pin the exact ordered milestone sequence. Tokens carry
-          # BEHAVIOR, not liveness: every RUBY_LEVEL_* value is the level
-          # the controller wrote through the real ECS that tick (each one
-          # reachable only via the previous tick's persisted write),
+          # BEHAVIOR, not liveness: the 0.875 the chain starts from is
+          # the DECLARED default out of components/hunger.rb (the spawner
+          # attaches Hunger bare), so tick 1's RUBY_LEVEL_0.625 proves
+          # the ruby declaration traveled schema → codegen → registry →
+          # ECS; every RUBY_LEVEL_* value is the level the controller
+          # wrote through the real ECS that tick (each one reachable
+          # only via the previous tick's persisted write),
           # RUBY_FED_LEVEL_0.875 is re-READ after the feed handler's
           # write — the emitted id and f32 0.5 amount round-tripped the
-          # engine bus bit-exact — and ZIG_FEED_SEEN_0.5 is the NATIVE
+          # engine bus bit-exact — ZIG_FEED_SEEN_0.5 is the NATIVE
           # game-root hook consuming the same emit with the parsed
           # payload amount, at tick 2's dispatchEvents (frame end, one
-          # tick BEFORE the ruby handler's inbox — the cross-layer
-          # latency is part of the pin). The char class includes '.' for
-          # exactly those value-carrying tokens. Timeline:
-          # ruby/hunger_controller.rb.
+          # tick BEFORE the ruby handlers' inbox — the cross-layer
+          # latency is part of the pin), and RUBY_WATCHER_SAW_0.5 is the
+          # THIRD subscriber (scripts/feed_watcher.rb, a top-level
+          # file-scope sub) on tick 3's inbox, BEFORE the controller's
+          # handler — per-event handlers run in subscription order and
+          # the chunk-load sub predates the setup-time one. The char
+          # class includes '.' for exactly the value-carrying tokens.
+          # Timeline: scripts/20_hunger_controller.rb.
           grep -oE '(RUBY|ZIG)_[A-Z0-9_.]+' run.log > actual.txt || true
           cat > expected.txt <<'END'
           RUBY_INIT
@@ -248,6 +287,7 @@ jobs:
           RUBY_LEVEL_0.375
           ZIG_FEED_SEEN_0.5
           RUBY_ENGINE_TICK_SEEN
+          RUBY_WATCHER_SAW_0.5
           RUBY_FED_LEVEL_0.875
           RUBY_LEVEL_0.625
           RUBY_LEVEL_0.375
@@ -264,7 +304,7 @@ jobs:
             cat run.log
             exit 1
           fi
-          echo "PASS: ruby drove the real engine — plain hooks + Component.ref controller + cross-script hunger__feed (ruby AND native Zig hook off one bus) + FrameArray + engine__tick over 5 headless frames, against this repo's HEAD"
+          echo "PASS: ruby drove the real engine — ruby-DECLARED Hunger component (components/hunger.rb, defaults through the ECS) + plain hooks + controller + cross-script hunger__feed (controller, pure-ruby watcher AND native Zig hook off one bus) + FrameArray + engine__tick over 5 headless frames, against this repo's HEAD"
 
   # Rust example game (labelle-engine#741) — the NATIVE-COMPILED counterpart
   # of ruby-example, living in THIS repo so every push runs a real rust game
@@ -282,21 +322,18 @@ jobs:
     timeout-minutes: 30
     env:
       # The pinned labelle-assembler release the example generates with —
-      # a BINARY release (tag → release.yml assets). Must carry the
-      # native-language splice (labelle-assembler#608): v0.84.0 is the
-      # FIRST release that recognizes rust (`NATIVE_LANGUAGES` row),
-      # stages the game's rust/ as a live link over the staged package's
-      # native/src/game/, and consumes plugin.labelle's `.language_builds`
-      # cargo step. v0.83.0 and older warn "no scripting integration yet"
-      # and wire nothing (the no-registerScript grep below would pass
-      # vacuously, but the Controller.tick grep fails loudly). Pinned to
-      # v0.85.0 — ONE floor for every example job, and the HARD floor for
-      # this repo's plugin.labelle since the crystal `.language_builds`
-      # entry landed: v0.84.0's strict step-schema validation covered
-      # non-selected entries too, so it rejects the manifest for EVERY
-      # language (v0.85.0 added the forward-compat that ends that class
-      # of break). Bump deliberately, never float.
-      ASSEMBLER_VERSION: v0.85.0
+      # a BINARY release (tag → release.yml assets). v0.86.0 is the HARD
+      # floor for this example's layout: the shared `scripts/` dir
+      # (labelle-assembler#614) replaces the legacy rust/ dir for the
+      # native family too — the splice links the game's scripts/ over the
+      # staged package's native/src/game/ with `scripts/mod.rs` as the
+      # crate-module root. (The native splice itself is older: #608 in
+      # v0.84.0 recognized rust and consumes plugin.labelle's
+      # `.language_builds` cargo step; v0.85.0 added the step-schema
+      # forward-compat the crystal entry needs.) Older releases read only
+      # the legacy rust/ dir — absent here, so nothing stages and the
+      # greps below fail loudly. Bump deliberately, never float.
+      ASSEMBLER_VERSION: v0.86.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/rust-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
@@ -333,7 +370,7 @@ jobs:
       # Mirrors ruby-example's flow: generate → codegen greps → build
       # (fingerprint dance) → bounded headless run → ordered-transcript
       # diff. The native-family deltas are the point of every grep below.
-      # Frame-by-frame timeline: rust/mod.rs's header.
+      # Frame-by-frame timeline: scripts/mod.rs's header.
       - name: Generate + build + run the rust example game
         run: |
           # Actions' default shell has no pipefail — without it the tee
@@ -375,10 +412,17 @@ jobs:
           fi
           # Native splices skip the declare phase SILENTLY (zero embedded
           # scripts — the phase no-ops before its language gate), unlike
-          # ruby's pointed skip note. Its presence would mean the splice
-          # got misclassified as an embed family.
+          # the embed family's pointed notes. Its presence would mean the
+          # splice got misclassified as an embed family.
           if grep -q 'script-declared components' generate.log; then
             echo "E: declare-phase note printed for a native splice"
+            exit 1
+          fi
+          # This example is MIGRATED to scripts/ — the legacy-dir grace
+          # note must not appear (its presence means a rust/ dir leaked
+          # back in, or the resolve probe regressed).
+          if grep -q 'keeps working for one release of grace' generate.log; then
+            echo "E: legacy script-dir deprecation note printed for a migrated example"
             exit 1
           fi
 
@@ -426,13 +470,14 @@ jobs:
           # libs at the final link on linux).
           grep -qF 'exe.root_module.linkSystemLibrary("gcc_s", .{});' $B
           # Staging is a LIVE LINK, not a copy (deps are shared across
-          # targets — .labelle/deps/): the game's rust/ IS the staged
-          # crate's game module, so edits flow into the next `zig build`
-          # without a re-generate. One symlink test + one read-through
-          # beats a second full build.
+          # targets — .labelle/deps/): the game's scripts/ IS the staged
+          # crate's game module (module root scripts/mod.rs — the #614
+          # native-staging shape), so edits flow into the next
+          # `zig build` without a re-generate. One symlink test + one
+          # read-through beats a second full build.
           STAGED=.labelle/deps/labelle-scripting/native/src/game
           test -L "$STAGED"
-          cmp rust/mod.rs "$STAGED/mod.rs"
+          cmp scripts/mod.rs "$STAGED/mod.rs"
 
           cd .labelle/null_desktop
 
@@ -471,7 +516,7 @@ jobs:
           # RUST_BUFFERS_OK pins the Vec clear-retains-capacity idiom
           # flat (rust's FrameArray equivalent). The char class includes
           # '.' for exactly the value-carrying tokens. Timeline:
-          # rust/mod.rs.
+          # scripts/mod.rs.
           grep -oE '(RUST|ZIG)_[A-Z0-9_.]+' run.log > actual.txt || true
           cat > expected.txt <<'END'
           RUST_INIT
@@ -517,15 +562,19 @@ jobs:
     timeout-minutes: 30
     env:
       # The pinned labelle-assembler release the example generates with —
-      # a BINARY release (tag → release.yml assets). v0.85.0 is the FIRST
-      # release that recognizes crystal (`NATIVE_LANGUAGES` row) AND
-      # parses the crystal `.language_builds` entry's step schema
-      # (per-step `.os` allowlists, artifact-less intermediates,
-      # {crystal_target}, `.library_paths` + {crystal_env:…} — all
-      # labelle-assembler#612): v0.84.0 hard-fails generate on the entry
-      # for every language, older releases wire nothing. Bump
-      # deliberately, never float.
-      ASSEMBLER_VERSION: v0.85.0
+      # a BINARY release (tag → release.yml assets). v0.86.0 is the HARD
+      # floor for this example's layout: the shared `scripts/` dir
+      # (labelle-assembler#614) replaces the legacy crystal/ dir for the
+      # native family too — the splice links the game's scripts/ over the
+      # staged package's native-crystal/src/game/ with `scripts/game.cr`
+      # as the module root. (The crystal splice itself is v0.85.0 —
+      # `NATIVE_LANGUAGES` row + the `.language_builds` step schema:
+      # per-step `.os` allowlists, artifact-less intermediates,
+      # {crystal_target}, `.library_paths` + {crystal_env:…}, all
+      # labelle-assembler#612.) Older releases read only the legacy
+      # crystal/ dir — absent here, so nothing stages and the greps below
+      # fail loudly. Bump deliberately, never float.
+      ASSEMBLER_VERSION: v0.86.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/crystal-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
@@ -574,7 +623,7 @@ jobs:
       # Mirrors rust-example's flow: generate → codegen greps → build
       # (fingerprint dance) → bounded headless run → ordered-transcript
       # diff. The crystal-family deltas are the point of every grep below.
-      # Frame-by-frame timeline: crystal/game.cr's header.
+      # Frame-by-frame timeline: scripts/game.cr's header.
       - name: Generate + build + run the crystal example game
         run: |
           # Actions' default shell has no pipefail — without it the tee
@@ -614,10 +663,17 @@ jobs:
           fi
           # Native splices skip the declare phase SILENTLY (zero embedded
           # scripts — the phase no-ops before its language gate), unlike
-          # ruby's pointed skip note. Its presence would mean the splice
-          # got misclassified as an embed family.
+          # the embed family's pointed notes. Its presence would mean the
+          # splice got misclassified as an embed family.
           if grep -q 'script-declared components' generate.log; then
             echo "E: declare-phase note printed for a native splice"
+            exit 1
+          fi
+          # This example is MIGRATED to scripts/ — the legacy-dir grace
+          # note must not appear (its presence means a crystal/ dir
+          # leaked back in, or the resolve probe regressed).
+          if grep -q 'keeps working for one release of grace' generate.log; then
+            echo "E: legacy script-dir deprecation note printed for a migrated example"
             exit 1
           fi
 
@@ -686,13 +742,14 @@ jobs:
           LIBDIR=$(crystal env CRYSTAL_LIBRARY_PATH | cut -d: -f1)
           grep -qF "$LIBDIR" $B
           # Staging is a LIVE LINK, not a copy (deps are shared across
-          # targets — .labelle/deps/): the game's crystal/ IS the staged
-          # package's game module, so edits flow into the next `zig
-          # build` without a re-generate. One symlink test + one
+          # targets — .labelle/deps/): the game's scripts/ IS the staged
+          # package's game module (module root scripts/game.cr — the
+          # #614 native-staging shape), so edits flow into the next
+          # `zig build` without a re-generate. One symlink test + one
           # read-through beats a second full build.
           STAGED=.labelle/deps/labelle-scripting/native-crystal/src/game
           test -L "$STAGED"
-          cmp crystal/game.cr "$STAGED/game.cr"
+          cmp scripts/game.cr "$STAGED/game.cr"
 
           cd .labelle/null_desktop
 
@@ -732,7 +789,7 @@ jobs:
           # pair settled (grow-once wrappers + capacity-retaining clears
           # — crystal's FrameArray equivalent). The char class includes
           # '.' for exactly the value-carrying tokens. Timeline:
-          # crystal/game.cr.
+          # scripts/game.cr.
           grep -oE '(CRYSTAL|ZIG)_[A-Z0-9_.]+' run.log > actual.txt || true
           cat > expected.txt <<'END'
           CRYSTAL_INIT

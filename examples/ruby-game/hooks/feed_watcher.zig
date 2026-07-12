@@ -8,12 +8,14 @@
 //! receiver tuple, and `g.dispatchEvents()` calls every method named
 //! after a `GameEvents` variant.
 //!
-//! So one `Labelle.emit("hunger__feed", …)` in ruby/spawner.rb reaches
-//! BOTH subscribers, one bus, no glue:
+//! So one `Labelle.emit("hunger__feed", …)` in scripts/10_spawner.rb
+//! reaches THREE subscribers, one bus, no glue:
 //!   - THIS hook, natively, at the SAME frame's `dispatchEvents` (tick 2
 //!     — after the scripts' Controller.tick, at frame end), and
-//!   - the ruby `on("hunger__feed")` handler in hunger_controller.rb on
-//!     the NEXT tick's inbox dispatch (drain-boundary latency, tick 3).
+//!   - the ruby `on("hunger__feed")` handler in
+//!     scripts/20_hunger_controller.rb plus the pure-ruby top-level
+//!     watcher in scripts/feed_watcher.rb on the NEXT tick's inbox
+//!     dispatch (drain-boundary latency, tick 3).
 //!
 //! The token carries the payload amount (`ZIG_FEED_SEEN_0.5` — f32 0.5
 //! is exact in binary floating point), proving the JSON-emitted ruby

@@ -1,13 +1,13 @@
-//! spawner.rs — the plain-script tier (rust twin of ruby-game's
-//! spawner.rb): seeds the world in `init` and commands a feeding over
-//! the engine bus on tick 2. State lives in the struct's fields — the
-//! native family's isolation is the type system itself (no per-script
-//! receiver tricks: two scripts are two structs).
+//! scripts/spawner.rs — the plain-script tier (rust twin of ruby-game's
+//! scripts/10_spawner.rb): seeds the world in `init` and commands a
+//! feeding over the engine bus on tick 2. State lives in the struct's
+//! fields — the native family's isolation is the type system itself (no
+//! per-script receiver tricks: two scripts are two structs).
 //!
 //! Each observable milestone logs ONE `RUST_<TOKEN>` line so CI can
 //! `grep -oE '(RUST|ZIG)_[A-Z0-9_.]+'` and diff the exact ordered
-//! sequence. This script's slice of the 5-frame timeline (mod.rs's
-//! header documents the full interleaving):
+//! sequence. This script's slice of the 5-frame timeline
+//! (scripts/mod.rs's header documents the full interleaving):
 //!
 //!   setup   RUST_INIT              init(): Worker entity created,
 //!                                   Hunger{level: 0.875} written

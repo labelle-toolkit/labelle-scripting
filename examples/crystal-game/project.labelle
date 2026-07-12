@@ -1,10 +1,11 @@
 // Crystal example game (labelle-engine#741) — the SECOND native-compiled
-// example, examples/rust-game's crystal twin: crystal/ sources drive the
+// example, examples/rust-game's crystal twin: scripts/*.cr drive the
 // REAL engine through the Script Runtime Contract from the assembler's
-// generated main, headless over the null backend. No VM and nothing
-// embeds — the assembler's native-language splice (labelle-assembler
-// v0.85.0, the crystal row) LINKS the game's crystal/ dir over the
-// staged plugin package's native-crystal/src/game/ and the plugin's
+// generated main, headless over the null backend. The sources live in
+// the shared `scripts/` dir (labelle-engine#237, assembler v0.86.0 —
+// `scripts/game.cr` is the module root). No VM and nothing embeds — the
+// assembler's native-language splice LINKS the game's scripts/ dir over
+// the staged plugin package's native-crystal/src/game/ and the plugin's
 // declared `.language_builds` steps compile it (`crystal build
 // --cross-compile`) and localize its `main` away (ld -r / objcopy —
 // picked per OS by the steps' `.os` allowlists) into

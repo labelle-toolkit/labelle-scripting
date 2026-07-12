@@ -1,10 +1,12 @@
 // Rust example game (labelle-engine#741) — the NATIVE-COMPILED counterpart
-// of examples/ruby-game: rust/ sources drive the REAL engine through the
+// of examples/ruby-game: scripts/*.rs drive the REAL engine through the
 // Script Runtime Contract from the assembler's generated main, headless
-// over the null backend. No VM and nothing embeds — the assembler's
-// native-language splice (labelle-assembler v0.84.0) LINKS the game's
-// rust/ dir over the staged plugin package's native/src/game/ and the
-// plugin's declared `.language_builds` cargo step compiles it into
+// over the null backend. The sources live in the shared `scripts/` dir
+// (labelle-engine#237, assembler v0.86.0 — `scripts/mod.rs` is the
+// crate-module root). No VM and nothing embeds — the assembler's
+// native-language splice LINKS the game's scripts/ dir over the staged
+// plugin package's native/src/game/ and the plugin's declared
+// `.language_builds` cargo step compiles it into
 // liblabelle_rust_scripts.a, linked into this binary.
 //
 // THE point of living in this repo: the scripting plugin is pinned
