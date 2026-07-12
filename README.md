@@ -839,16 +839,22 @@ The plugin handles the studio Script Console's
   `examples/ts-game/scripts/20_hunger_controller.ts`.
 
 - **`examples/csharp-game/`** — the CoreCLR-hosted example
-  (labelle-engine#743), the same hunger sawtooth in `scripts/*.cs`
-  (`Script` classes, `Game.Register`), so the C# transcript diffs
-  token-for-token against the rust/crystal ones (`CS_*`/`ZIG_*`). Unlike
-  the native family the assembly is not linked in — the plugin's declared
-  `dotnet publish` step compiles `scripts/` (staged over the plugin
+  (labelle-engine#743) and a **fully-C# game**: the same hunger sawtooth
+  with ALL logic in `scripts/*.cs` (`Script` classes + `Game.Register`),
+  including a pure-C# event watcher (`FeedWatcher.cs`, the mirror of
+  ruby-game's `scripts/feed_watcher.rb`) in place of the Zig game-root hook
+  the rust/crystal examples use. The C# transcript diffs token-for-token
+  against the others (`CS_*`). The assembly is not linked in — the plugin's
+  declared `dotnet publish` step compiles `scripts/` (staged over the plugin
   package's `native-csharp/src/game/`) into `labelle_csharp_scripts.dll`
   beside the binary, and `src/csharp/vm.zig` loads it at runtime through
-  hostfxr, binding the contract via `[LibraryImport]` against the host.
-  Documentation-first: the assembler's csharp splice is a follow-up (no
-  released row yet), so there is no `csharp-example` CI job YET — the
-  plugin side is instead proven by `zig build test`'s csharp suite, which
-  drives the managed assembly through the real hostfxr path against the
+  hostfxr, binding the contract via `[LibraryImport]` against the host. The
+  ONLY non-C# files are `project.labelle`, `scenes/main.jsonc`, and the
+  component schemas `components/*.zig` — C# has no component-schema
+  authoring path yet (the contract has no registration call; no
+  declare-csharp extractor exists), so those stay Zig as the single
+  remaining non-C# piece + a declare-csharp follow-up. Documentation-first:
+  no `csharp-example` CI job YET (the assembler csharp splice is a
+  follow-up) — the plugin side is proven by `zig build test`'s csharp suite
+  driving the managed assembly through the real hostfxr path against the
   mock host. Timeline: `examples/csharp-game/scripts/Game.cs`.
