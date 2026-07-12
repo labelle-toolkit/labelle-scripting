@@ -80,7 +80,13 @@ pub fn main(init: std.process.Init) !void {
         // IGNORES the flag + its value — the assembler stays language-blind,
         // handing every runner (embedded or native) the identical argv.
         if (std.mem.eql(u8, arg, "--cache-dir")) {
-            _ = args.next(); // skip the value; embedded VMs need no workspace
+            // Skip the value; embedded VMs need no workspace. A missing
+            // value (flag as the final arg) is malformed — error rather
+            // than silently ending the loop with the flag consumed.
+            _ = args.next() orelse {
+                try std.Io.File.stderr().writeStreamingAll(io, "labelle-declare-ruby: --cache-dir needs an argument\n");
+                std.process.exit(2);
+            };
             continue;
         }
         const path = try allocator.dupe(u8, arg);
