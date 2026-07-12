@@ -13,6 +13,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Read-only job: never persist the GITHUB_TOKEN in .git/config.
+          persist-credentials: false
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -113,6 +116,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: labelle-scripting
+          # Read-only job: never persist the GITHUB_TOKEN in .git/config.
+          persist-credentials: false
 
       # Sibling checkout for the null backend: the generated main's
       # `script_contract.bind` touchpoint lives in labelle-null's
@@ -298,6 +303,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: labelle-scripting
+          # Read-only job: never persist the GITHUB_TOKEN in .git/config.
+          persist-credentials: false
 
       # Sibling checkout for the null backend — same reason and same
       # pattern as ruby-example above (the `script_contract.bind`
@@ -525,6 +532,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: labelle-scripting
+          # Read-only job: never persist the GITHUB_TOKEN in .git/config.
+          persist-credentials: false
 
       # Sibling checkout for the null backend — same reason and same
       # pattern as ruby-example above (the `script_contract.bind`
