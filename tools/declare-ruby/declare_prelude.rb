@@ -63,14 +63,19 @@
 #                                         non-primitive rest)
 #   Labelle.__declare_take_consts       — after the chunk ran clean: flat
 #                                         [name, value, ...] pairs — the
-#                                         top-level constants the chunk
-#                                         itself defined (a baseline diff
-#                                         of Object's constants — the
-#                                         runtime prelude's METHOD
+#                                         FULL non-baseline snapshot of
+#                                         Object's constants (seeded
+#                                         names included at CURRENT
+#                                         values; the baseline diff is
+#                                         the runtime prelude's METHOD
 #                                         harvest, respelled for
 #                                         constants), each value a
 #                                         primitive traveling verbatim or
-#                                         SENTINEL_TAG for the rest
+#                                         SENTINEL_TAG for the rest. The
+#                                         driver REPLACES its ledger with
+#                                         this, so reassignments and
+#                                         remove_const behave like the
+#                                         runtime's one shared VM
 # The Zig side accumulates fragments across chunks and emits
 # {"components":[...]} — plus an "events":[...] array only when any event
 # was declared — BYTE-compatible with the lua runner's __declare_emit
@@ -129,8 +134,6 @@ module Labelle
   @by_name = {}   # component name => file first declared in (seeded + local)
   @event_decls = []     # the event twins of the two above — separate
   @events_by_name = {}  # namespace: Hunger component + hunger event coexist
-  @seeded_consts = {}   # constant name (String) => true — driver-seeded,
-  #                       excluded from this chunk's own constant harvest
   @file = "?"
 
   # Largest finite f32, as a ruby Float (a double — same value the lua
@@ -243,7 +246,6 @@ module Labelle
   # no methods.
   def self.__declare_seed_const(name, value = NOOP_RESULT)
     Object.const_set(name, value)
-    @seeded_consts[name] = true
     nil
   end
 
@@ -258,13 +260,19 @@ module Labelle
     end
   end
 
+  # The FULL non-baseline snapshot — seeded names included, at their
+  # CURRENT values. The driver replaces its ledger wholesale with this,
+  # so a chunk reassigning a cross-file constant (X = 2 over a seeded 1)
+  # or removing one (remove_const) is reflected for every later chunk —
+  # exactly what the runtime's single shared VM would show. Excluding
+  # seeded names here would freeze the ledger at first definition.
   def self.__declare_take_consts
     added = []
     cs = Object.constants
     i = 0
     while i < cs.size
       sym = cs[i]
-      unless @baseline_consts[sym] || @seeded_consts[sym.to_s]
+      unless @baseline_consts[sym]
         added << sym.to_s
         added << __const_ledger_value(Object.const_get(sym))
       end

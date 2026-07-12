@@ -362,6 +362,34 @@ test "cross-file PRIMITIVE constants classify in spec positions, mirroring the r
     );
 }
 
+test "the ledger tracks reassignment and removal, mirroring the runtime VM (snapshot replace)" {
+    // The rabbit finding on #28 round 4: skip-seeded-and-append froze the
+    // ledger at FIRST definition — `X = 1` then `X = 2` left a third file
+    // reading 1 at extract while the runtime's one shared VM reads 2. The
+    // harvest is now the full post-eval snapshot (seeded names at CURRENT
+    // values) and the driver replaces the ledger wholesale, so the last
+    // write in file order wins — exactly the runtime semantics.
+    try expectSchema(&.{
+        .{ .path = "scripts/a.rb", .source = "SPEED = 1" },
+        .{ .path = "scripts/b.rb", .source = "SPEED = 2" },
+        .{ .path = "scripts/c.rb", .source = "Labelle.component \"C\", speed: SPEED" },
+    },
+        \\{"components":[{"name":"C","persist":"persistent","fields":[{"name":"speed","type":"i32","default":2}]}]}
+    );
+    // Removal rides the same replace: a constant an earlier file bound
+    // and a later file removed is ABSENT from that chunk's snapshot, so
+    // the file after it NameErrors — as the runtime would.
+    try expectFailure(&.{
+        .{ .path = "scripts/a.rb", .source = "GONE = 1" },
+        .{ .path = "scripts/b.rb", .source = "Object.send(:remove_const, :GONE)" },
+        .{ .path = "scripts/c.rb", .source = "Labelle.component(\"C\", level: GONE)" },
+    }, &.{
+        "scripts/c.rb:1",
+        "NameError",
+        "GONE",
+    });
+}
+
 test "a component constant where an event name belongs fails at generate (the on/emit shims)" {
     // The codex finding on #28: `Labelle.on(Worker)` — a real constant of
     // the WRONG KIND (a component, not an event) — used to extract clean

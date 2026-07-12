@@ -35,8 +35,11 @@
 //! later file legally references an earlier file's top-level constants
 //! at chunk scope (`Labelle.on(HungerFeed)` in a script, HungerFeed
 //! declared in an events file). After each clean chunk the driver
-//! harvests the constants the chunk defined (__declare_take_consts, a
-//! baseline diff of that state's Object) as name→TAGGED-VALUE pairs —
+//! harvests the FULL post-eval constant snapshot (__declare_take_consts,
+//! a baseline diff of that state's Object with seeded names included at
+//! current values — the ledger is REPLACED, so reassignments and
+//! remove_const behave like the runtime's one shared VM) as
+//! name→TAGGED-VALUE pairs —
 //! primitives (String, Integer, Float, true, false, nil) travel
 //! VERBATIM, everything else (classes incl. component view stubs,
 //! arrays, hashes, procs) degrades to a sentinel tag — and re-binds them
@@ -293,12 +296,15 @@ pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
         decls.deinit(allocator);
     }
 
-    // The constant ledger: top-level constants earlier chunks defined —
-    // name plus tagged value (primitives verbatim, `.sentinel` for the
-    // rest) — in input (= argv = runtime registration) order. Seeded
-    // into each later chunk's fresh state before its body runs — see the
-    // module doc. Dedup is on the ruby side: a chunk's own take excludes
-    // the names we seeded, so a redefinition never re-enters the ledger.
+    // The constant ledger: the game-level constants alive after the last
+    // chunk ran — name plus tagged value (primitives verbatim,
+    // `.sentinel` for the rest). Seeded into each later chunk's fresh
+    // state before its body runs, then REPLACED wholesale with that
+    // chunk's post-eval snapshot (seeds included, at current values) —
+    // so a reassignment or remove_const is reflected for every later
+    // chunk, exactly like the runtime's one shared VM. Input (= argv =
+    // runtime registration) order makes "earlier" mean what it means at
+    // runtime — see the module doc.
     var consts: std.ArrayList(Const) = .empty;
     defer {
         for (consts.items) |entry| {
@@ -474,8 +480,8 @@ fn runChunk(
 
     // Harvest this chunk's declarations — the component channel, then the
     // event channel: each a flat [name, fragment, ...] array, copied out
-    // before the state closes — and the top-level constants it defined
-    // (name→tagged-value), appended to the ledger later chunks are
+    // before the state closes — and its post-eval constant snapshot
+    // (name→tagged-value), which REPLACES the ledger later chunks are
     // seeded from.
     try harvestChannel(allocator, mrb, modv, sym_take, .component, input.path, decls);
     try harvestChannel(allocator, mrb, modv, sym_take_events, .event, input.path, decls);
@@ -483,21 +489,25 @@ fn runChunk(
     return null;
 }
 
-/// Pull the chunk's freshly defined top-level constants (the
-/// __declare_take_consts seam — flat [name, value, ...] pairs) out of
-/// its interpreter into the driver's cross-chunk ledger, copied before
-/// the state closes. The ruby side already excluded everything the
-/// interpreter and the prelude booted with (the baseline) and everything
-/// WE seeded (so a chunk redefining a seeded name never re-enters the
-/// ledger), and degraded every value to the tag vocabulary: a primitive
-/// travels verbatim; SENTINEL_TAG — a Symbol, which no real value on
-/// this channel can be (Symbol is not a primitive, so symbol-valued
-/// constants degrade to the tag themselves) — marks the non-primitive
-/// rest, recognized here by TYPE alone. Anything outside that
-/// vocabulary, a non-string name, or an odd length means a
-/// tampered/shadowed seam — the same prelude-integrity class as
-/// harvestChannel's rejections (a tampered ledger must hard-error, not
-/// seed lies into later chunks).
+/// Pull the chunk's post-eval constant snapshot (the
+/// __declare_take_consts seam — flat [name, value, ...] pairs, the FULL
+/// non-baseline set with seeded names at their CURRENT values) out of
+/// its interpreter, copied before the state closes, and REPLACE the
+/// driver's cross-chunk ledger with it — so a chunk reassigning a
+/// cross-file constant (X = 2 over a seeded 1) or removing one
+/// (remove_const) is reflected for every later chunk, exactly like the
+/// runtime's one shared VM. The old skip-seeded-and-append spelling
+/// froze the ledger at first definition. The ruby side degraded every
+/// value to the tag vocabulary: a primitive travels verbatim;
+/// SENTINEL_TAG — a Symbol, which no real value on this channel can be
+/// (Symbol is not a primitive, so symbol-valued constants degrade to
+/// the tag themselves) — marks the non-primitive rest, recognized here
+/// by TYPE alone. Anything outside that vocabulary, a non-string name,
+/// or an odd length means a tampered/shadowed seam — the same
+/// prelude-integrity class as harvestChannel's rejections (a tampered
+/// ledger must hard-error, not seed lies into later chunks); on that
+/// error the ledger keeps its previous contents (irrelevant — the run
+/// aborts).
 fn harvestConsts(
     allocator: std.mem.Allocator,
     mrb: ?*c.State,
@@ -511,6 +521,19 @@ fn harvestConsts(
     if (excPending(mrb) or flat.tt != .array) return error.DeclarePrelude;
     const len = c.labelle_mrb_ary_len(flat);
     if (@mod(len, 2) != 0) return error.DeclarePrelude;
+
+    var snapshot: std.ArrayList(Const) = .empty;
+    errdefer {
+        for (snapshot.items) |entry| {
+            allocator.free(entry.name);
+            switch (entry.value) {
+                .string => |s| allocator.free(s),
+                else => {},
+            }
+        }
+        snapshot.deinit(allocator);
+    }
+
     var i: c.Int = 0;
     while (i + 1 < len) : (i += 2) {
         const nv = c.mrb_ary_entry(flat, i);
@@ -531,8 +554,19 @@ fn harvestConsts(
         };
         const name = try allocator.dupe(u8, strSlice(nv));
         errdefer allocator.free(name);
-        try consts.append(allocator, .{ .name = name, .value = value });
+        try snapshot.append(allocator, .{ .name = name, .value = value });
     }
+
+    // Snapshot parsed clean — swap it in.
+    for (consts.items) |entry| {
+        allocator.free(entry.name);
+        switch (entry.value) {
+            .string => |s| allocator.free(s),
+            else => {},
+        }
+    }
+    consts.deinit(allocator);
+    consts.* = snapshot;
 }
 
 /// Pull one flat [name, fragment, ...] declaration channel (the
