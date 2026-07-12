@@ -273,6 +273,31 @@ test "Labelle.on dispatch fires with decoded symbol-keyed payloads" {
     try expectComponent(1, "Seen", "{\"amount\":7,\"count\":2,\"fanout\":2,\"nested_ok\":true}");
 }
 
+test "Labelle.event returns the frozen name: one constant drives emit AND on" {
+    fresh();
+    // The fixture declares hunger__feed at file scope (the SAME line the
+    // declare runner reads as schema), asserts the frozen-name return,
+    // Labelle.id == 0 and the name-validation raises at chunk scope
+    // (a failure there evicts the script and Fed never exists), then
+    // subscribes and emits exclusively through the constant.
+    scripting.registerScript("event_declared", @embedFile("ruby/event_declared.rb"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+    try expectComponent(1, "Fed", "{\"count\":0,\"ok\":true}");
+
+    // Tick once: update() emits toward the host through the constant —
+    // the frozen string crosses raw_event_emit intact.
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.eventsContain("hunger__feed {\"amount\":0.5,\"entity\":\"1\"}"));
+
+    // The host emits the same event back: the subscription registered
+    // through the constant (raw_event_subscribe + handler-table key)
+    // receives it with the decoded payload.
+    mock.hostEmit("hunger__feed", "{\"entity\":1,\"amount\":0.5}");
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "Fed", "{\"amount\":0.5,\"count\":1,\"ok\":true}");
+}
+
 test "eviction purges the dead scripts' handlers; siblings keep firing" {
     fresh();
     // Handler registered in init + failing init: the init-fail eviction

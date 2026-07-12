@@ -5,13 +5,14 @@
 //!
 //! Runs each script CHUNK BODY — never init/update/deinit, never
 //! controller lifecycles — against the declare stub `Labelle`
-//! (tools/declare-ruby/declare_prelude.rb): `Labelle.component(...)`
-//! records a schema declaration, every other `Labelle.*` (and the runtime
-//! API's classes) is a sentinel-returning no-op. One DSL, two consumers:
-//! at game runtime the SAME line yields a Component.ref-equivalent view
-//! class (src/ruby/prelude.rb); at generate time, run through this
-//! extractor, it yields the schema the assembler codegens real Zig
-//! components from — byte-compatible with the lua runner's output.
+//! (tools/declare-ruby/declare_prelude.rb): `Labelle.component(...)` and
+//! `Labelle.event(...)` record schema declarations, every other
+//! `Labelle.*` (and the runtime API's classes) is a sentinel-returning
+//! no-op. One DSL, two consumers: at game runtime the SAME lines yield a
+//! Component.ref-equivalent view class / the frozen event-name string
+//! (src/ruby/prelude.rb); at generate time, run through this extractor,
+//! they yield the schema the assembler codegens real Zig components and
+//! events from — byte-compatible with the lua runner's output.
 //!
 //! Isolation model — the one structural divergence from the lua runner:
 //! lua gives every chunk a fresh stub `_ENV` inside ONE VM; ruby has no
@@ -187,12 +188,16 @@ pub const Error = error{
 };
 
 /// One recorded declaration, accumulated across chunks: `name` + `file`
-/// re-seed every later chunk's duplicate detection; `fragment` is the
-/// pre-formatted schema-JSON component object the final emit joins.
+/// re-seed every later chunk's duplicate detection (per kind — events and
+/// components are separate namespaces); `fragment` is the pre-formatted
+/// schema-JSON object the final emit joins into its kind's array.
 const Decl = struct {
     name: []u8,
     file: []u8,
     fragment: []u8,
+    kind: Kind,
+
+    const Kind = enum { component, event };
 };
 
 /// Borrowed view of an mruby String's bytes (valid while its state lives).
@@ -224,15 +229,33 @@ pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
     }
 
     // All chunks ran clean: join the accumulated fragments. This side owns
-    // the envelope so it is byte-identical to the lua __declare_emit's.
+    // the envelope so it is byte-identical to the lua __declare_emit's —
+    // including the events rule: the "events" key exists ONLY when at
+    // least one event was declared (pre-events assemblers read only
+    // "components" from the JSON tree, so event-free schemas must stay
+    // byte-identical to what they always saw). One kind-tagged list keeps
+    // cross-kind declaration order irrelevant while preserving per-kind
+    // order, which is what the schema arrays carry.
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"components\":[");
-    for (decls.items, 0..) |d, i| {
-        if (i > 0) try out.append(allocator, ',');
+    var n_components: usize = 0;
+    for (decls.items) |d| {
+        if (d.kind != .component) continue;
+        if (n_components > 0) try out.append(allocator, ',');
         try out.appendSlice(allocator, d.fragment);
+        n_components += 1;
     }
-    try out.appendSlice(allocator, "]}");
+    try out.append(allocator, ']');
+    var n_events: usize = 0;
+    for (decls.items) |d| {
+        if (d.kind != .event) continue;
+        try out.appendSlice(allocator, if (n_events == 0) ",\"events\":[" else ",");
+        try out.appendSlice(allocator, d.fragment);
+        n_events += 1;
+    }
+    if (n_events > 0) try out.append(allocator, ']');
+    try out.append(allocator, '}');
     return .{ .schema = try out.toOwnedSlice(allocator) };
 }
 
@@ -261,14 +284,16 @@ fn runChunk(allocator: std.mem.Allocator, input: Input, decls: *std.ArrayList(De
 
     // Fresh state, fresh symbols (syms are per-state).
     const sym_seed = c.mrb_intern(mrb, "__declare_seed", "__declare_seed".len);
+    const sym_seed_event = c.mrb_intern(mrb, "__declare_seed_event", "__declare_seed_event".len);
     const sym_begin = c.mrb_intern(mrb, "__declare_begin", "__declare_begin".len);
     const sym_take = c.mrb_intern(mrb, "__declare_take", "__declare_take".len);
+    const sym_take_events = c.mrb_intern(mrb, "__declare_take_events", "__declare_take_events".len);
 
     // Replay earlier files' declarations into this state's duplicate
-    // detector, then stamp the current file. Arena-restored per call: the
-    // seed strings are C-frame-born objects, and mruby's arena holds ~100
-    // slots — an unrestored loop would overflow it on component-rich
-    // projects.
+    // detectors (per kind — separate namespaces), then stamp the current
+    // file. Arena-restored per call: the seed strings are C-frame-born
+    // objects, and mruby's arena holds ~100 slots — an unrestored loop
+    // would overflow it on component-rich projects.
     for (decls.items) |d| {
         const arena = c.labelle_mrb_gc_arena_save(mrb);
         defer c.labelle_mrb_gc_arena_restore(mrb, arena);
@@ -276,7 +301,11 @@ fn runChunk(allocator: std.mem.Allocator, input: Input, decls: *std.ArrayList(De
             c.mrb_str_new(mrb, d.name.ptr, @intCast(d.name.len)),
             c.mrb_str_new(mrb, d.file.ptr, @intCast(d.file.len)),
         };
-        _ = c.mrb_funcall_argv(mrb, modv, sym_seed, args.len, &args);
+        const sym = switch (d.kind) {
+            .component => sym_seed,
+            .event => sym_seed_event,
+        };
+        _ = c.mrb_funcall_argv(mrb, modv, sym, args.len, &args);
         if (excPending(mrb)) return error.DeclarePrelude;
     }
     {
@@ -311,29 +340,48 @@ fn runChunk(allocator: std.mem.Allocator, input: Input, decls: *std.ArrayList(De
         }
     }
 
-    // Harvest this chunk's declarations: a flat [name, fragment, ...]
-    // array, copied out before the state closes.
-    {
-        const arena = c.labelle_mrb_gc_arena_save(mrb);
-        defer c.labelle_mrb_gc_arena_restore(mrb, arena);
-        const flat = c.mrb_funcall_argv(mrb, modv, sym_take, 0, null);
-        if (excPending(mrb) or flat.tt != .array) return error.DeclarePrelude;
-        const len = c.labelle_mrb_ary_len(flat);
-        var i: c.Int = 0;
-        while (i + 1 < len) : (i += 2) {
-            const nv = c.mrb_ary_entry(flat, i);
-            const fv = c.mrb_ary_entry(flat, i + 1);
-            if (nv.tt != .string or fv.tt != .string) return error.DeclarePrelude;
-            const name = try allocator.dupe(u8, strSlice(nv));
-            errdefer allocator.free(name);
-            const file = try allocator.dupe(u8, input.path);
-            errdefer allocator.free(file);
-            const fragment = try allocator.dupe(u8, strSlice(fv));
-            errdefer allocator.free(fragment);
-            try decls.append(allocator, .{ .name = name, .file = file, .fragment = fragment });
-        }
-    }
+    // Harvest this chunk's declarations — the component channel, then the
+    // event channel: each a flat [name, fragment, ...] array, copied out
+    // before the state closes.
+    try harvestChannel(allocator, mrb, modv, sym_take, .component, input.path, decls);
+    try harvestChannel(allocator, mrb, modv, sym_take_events, .event, input.path, decls);
     return null;
+}
+
+/// Pull one flat [name, fragment, ...] declaration channel (the
+/// __declare_take / __declare_take_events seams) out of the chunk's
+/// interpreter, appending kind-tagged records to `decls`.
+fn harvestChannel(
+    allocator: std.mem.Allocator,
+    mrb: ?*c.State,
+    modv: c.Value,
+    sym: c.Sym,
+    kind: Decl.Kind,
+    path: []const u8,
+    decls: *std.ArrayList(Decl),
+) Error!void {
+    const arena = c.labelle_mrb_gc_arena_save(mrb);
+    defer c.labelle_mrb_gc_arena_restore(mrb, arena);
+    const flat = c.mrb_funcall_argv(mrb, modv, sym, 0, null);
+    if (excPending(mrb) or flat.tt != .array) return error.DeclarePrelude;
+    const len = c.labelle_mrb_ary_len(flat);
+    // Odd length means a tampered/shadowed seam (a chunk redefining the
+    // take method) — pairing up would silently drop the trailing item and
+    // emit an incomplete-but-successful schema.
+    if (@mod(len, 2) != 0) return error.DeclarePrelude;
+    var i: c.Int = 0;
+    while (i + 1 < len) : (i += 2) {
+        const nv = c.mrb_ary_entry(flat, i);
+        const fv = c.mrb_ary_entry(flat, i + 1);
+        if (nv.tt != .string or fv.tt != .string) return error.DeclarePrelude;
+        const name = try allocator.dupe(u8, strSlice(nv));
+        errdefer allocator.free(name);
+        const file = try allocator.dupe(u8, path);
+        errdefer allocator.free(file);
+        const fragment = try allocator.dupe(u8, strSlice(fv));
+        errdefer allocator.free(fragment);
+        try decls.append(allocator, .{ .name = name, .file = file, .fragment = fragment, .kind = kind });
+    }
 }
 
 /// "line N: <rest>" (the capture_errors SyntaxError shape) → the "N: <rest>"

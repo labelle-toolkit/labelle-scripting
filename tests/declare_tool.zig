@@ -294,3 +294,175 @@ test "cross-runner golden: the lua half — byte-identical to the ruby runner's 
         cross.expected_json,
     );
 }
+
+test "golden: events emit in their own array — no persist key, declaration order, sorted fields" {
+    // labelle-engine#772: the events array trails components, carries NO
+    // persist (events are never saved), and follows the same determinism
+    // rules — declaration order across files, fields sorted by name.
+    // labelle.id classifies u64 with default 0. (Every OTHER golden in
+    // this file has no events key at all — the emitters may add it only
+    // when an event was declared, or those pins break; that absence is
+    // the old-assembler compat rule.)
+    try expectSchema(&.{
+        .{
+            .path = "events/hunger__feed.lua",
+            .source =
+            \\HungerFeed = labelle.event("hunger__feed", {
+            \\  entity = labelle.id,
+            \\  amount = 0.5,
+            \\})
+            ,
+        },
+        .{ .path = "events/wave__spawned.lua", .source = "labelle.event(\"wave__spawned\", {})" },
+    },
+        \\{"components":[],"events":[{"name":"hunger__feed","fields":[{"name":"amount","type":"f32","default":0.5},{"name":"entity","type":"u64","default":0}]},{"name":"wave__spawned","fields":[]}]}
+    );
+}
+
+test "events and components are separate namespaces: one name, both kinds, both emit" {
+    // The SAME name declared as a component and as an event is legal —
+    // duplicate detection is per kind — and labelle.id is a legal
+    // COMPONENT field too (components gain u64 through the same marker).
+    try expectSchema(&.{
+        .{
+            .path = "lua/hunger.lua",
+            .source =
+            \\labelle.component("Hunger", { level = 1.0, owner = labelle.id })
+            \\labelle.event("Hunger", { entity = labelle.id })
+            ,
+        },
+    },
+        \\{"components":[{"name":"Hunger","persist":"persistent","fields":[{"name":"level","type":"f32","default":1.0},{"name":"owner","type":"u64","default":0}]}],"events":[{"name":"Hunger","fields":[{"name":"entity","type":"u64","default":0}]}]}
+    );
+}
+
+test "duplicate event declarations fail naming BOTH files" {
+    try expectFailure(&.{
+        .{ .path = "events/first.lua", .source = "labelle.event(\"hunger__feed\", {})" },
+        .{ .path = "events/second.lua", .source = "\nlabelle.event(\"hunger__feed\", {})" },
+    }, &.{
+        "events/second.lua:2", // the redeclaration site (chunkname:line)
+        "duplicate event 'hunger__feed'",
+        "first declared in events/first.lua",
+    });
+}
+
+test "malformed event declarations fail with file- and event-bearing errors" {
+    // Empty name.
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.event(\"\", {})" }},
+        &.{ "bad.lua:1", "non-empty event name" },
+    );
+    // Non-identifier name (double underscores ARE legal — hunger__feed
+    // passes the goldens above; a space does not).
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.event(\"hunger feed\", {})" }},
+        &.{ "bad.lua:1", "'hunger feed'", "not a valid identifier" },
+    );
+    // Missing spec table — payloadless events spell it {} explicitly.
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.event(\"tick\")" }},
+        &.{ "bad.lua:1", "'tick'", "spec table" },
+    );
+    // A third argument is not a persist knob: events take no options.
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.event(\"tick\", {}, { persist = \"transient\" })" }},
+        &.{ "bad.lua:1", "'tick'", "takes no options (events are not persisted)" },
+    );
+    // …and neither is a FOURTH: the recorder is vararg so extras can't
+    // slip past a fixed third param unseen.
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.event(\"tick\", {}, nil, { persist = \"transient\" })" }},
+        &.{ "bad.lua:1", "'tick'", "takes no options (events are not persisted)" },
+    );
+    // One EXPLICIT nil third arg stays legal — ruby's fixed-arity
+    // `opts = nil` signature cannot distinguish it from the two-arg
+    // call, so cross-runner parity keeps it callable here too.
+    try expectSchema(&.{.{ .path = "ok.lua", .source = "labelle.event(\"tick\", {}, nil)" }},
+        \\{"components":[],"events":[{"name":"tick","fields":[]}]}
+    );
+    // Unsupported field value type.
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.event(\"bad\", { cb = function() end })" }},
+        &.{ "bad.lua:1", "event 'bad' field 'cb'", "unsupported default of type function" },
+    );
+    // The no-op sentinel is rejected in spec and field positions, with
+    // the message naming the EVENT DSL.
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.event(\"bad\", labelle.array({}))" }},
+        &.{ "bad.lua:1", "event 'bad' spec", "cannot be used in event specs — declare-mode fields are literals" },
+    );
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.event(\"bad\", { w = labelle.array({}) })" }},
+        &.{ "bad.lua:1", "event 'bad' field 'w'", "cannot be used in event specs" },
+    );
+}
+
+test "labelle.id is a value: calling it fails pointedly, and it is no spec" {
+    // v1 has no id(value) constructor — `labelle.id(42)` must name the
+    // mistake, not classify garbage (ids always default 0).
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.component(\"Bad\", { owner = labelle.id(42) })" }},
+        &.{ "bad.lua:1", "labelle.id", "write entity = labelle.id" },
+    );
+    // In spec position the marker is a function, so the existing shape
+    // guard names the real problem.
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.event(\"bad\", labelle.id)" }},
+        &.{ "bad.lua:1", "'bad'", "spec table" },
+    );
+    // Nested inside a vec2-shaped table: v1 ids are scalar-only.
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.event(\"bad\", { at = { x = labelle.id, y = 0 } })" }},
+        &.{ "bad.lua:1", "event 'bad' field 'at'", "unsupported table default" },
+    );
+}
+
+test "the event field cap fails on the declaration line: 33 rejected, 32 passes" {
+    // Event payloads share the 32-field ceiling the ruby runner inherits
+    // from its view fast path — one schema, whatever the language, so the
+    // lua runner must reject the same declaration the ruby runner would
+    // (the drift pin in tests/declare_ruby_tool.zig reads both literals).
+    // No stdlib in declare chunks: the spec is built with operators only.
+    try expectFailure(&.{.{
+        .path = "events/wide.lua",
+        .source =
+        \\local spec = {}
+        \\for i = 1, 33 do spec["f" .. i] = 0 end
+        \\labelle.event("wide", spec)
+        ,
+    }}, &.{
+        "events/wide.lua:3", // the declaration site
+        "event 'wide' has 33 fields",
+        "at most 32 fields; split the event",
+    });
+
+    // Exactly 32 is the edge — still a legal declaration. Expected JSON
+    // is generated to match: fields f00..f31, where zero-padding makes
+    // numeric order lexicographic (= sorted).
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(testing.allocator);
+    try expected.appendSlice(
+        testing.allocator,
+        "{\"components\":[],\"events\":[{\"name\":\"wide32\",\"fields\":[",
+    );
+    for (0..32) |i| {
+        if (i > 0) try expected.append(testing.allocator, ',');
+        const field = try std.fmt.allocPrint(
+            testing.allocator,
+            "{{\"name\":\"f{d:0>2}\",\"type\":\"i32\",\"default\":0}}",
+            .{i},
+        );
+        defer testing.allocator.free(field);
+        try expected.appendSlice(testing.allocator, field);
+    }
+    try expected.appendSlice(testing.allocator, "]}]}");
+    try expectSchema(&.{.{
+        .path = "events/wide32.lua",
+        .source =
+        \\local spec = {}
+        \\for i = 0, 31 do spec["f" .. (i < 10 and "0" or "") .. i] = 0 end
+        \\labelle.event("wide32", spec)
+        ,
+    }}, expected.items);
+}
