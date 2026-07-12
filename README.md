@@ -10,31 +10,32 @@ Script [labelle](https://github.com/labelle-toolkit) games in **Lua, TypeScript,
 },
 ```
 
-Drop scripts in your language's convention dir (`lua/`, `ruby/`, `ts/`, …) and go. One language per project (validated at `labelle generate`); unchosen languages cost nothing — never fetched (lua and quickjs, lazy dependencies) or never compiled (ruby, an in-repo vendor snapshot).
+Drop scripts in the game's `scripts/` dir — the same structure Zig scripts use (numeric ordering prefixes and all, extension-keyed coexistence: `10_spawner.rb` next to `01_move.zig`; assembler ≥ v0.86.0, the legacy per-language dirs work for one release of grace) — and declare components in `components/` beside the Zig ones (`components/hunger.rb` next to `components/worker.zig`, for the declare-mode languages). One language per project (validated at `labelle generate`); unchosen languages cost nothing — never fetched (lua and quickjs, lazy dependencies) or never compiled (ruby, an in-repo vendor snapshot).
 
 Every language binds the engine's **Script Runtime Contract** (`labelle-engine/contract/labelle_script.h`, `LABELLE_CONTRACT_VERSION 1`): entities, components-by-name (JSON), events (subscribe + poll-drain), queries, prefabs, input, time. Both integration families — embedded-VM (lua, ruby/mruby, typescript/QuickJS, csharp/CoreCLR) and native-compiled (rust, crystal, go) — consume the identical surface, proven end to end by the [POC](https://github.com/labelle-toolkit/labelle-engine/pull/734).
 
 | sub-module | status |
 |---|---|
 | `lua` (Lua 5.4) | ✅ bootstrap done (#738) + per-frame allocation utilities (#2) — vendored Lua 5.4.8, contract-bound, tested against a mock host |
-| `ruby` (mruby 3.4) | ✅ done (labelle-engine#742) — vendored mruby, controllers + Component.ref + FrameArray, tested against the same mock host |
+| `ruby` (mruby 3.4) | ✅ done (labelle-engine#742) — vendored mruby, controllers + Component.ref + FrameArray, tested against the same mock host; game scripts in `scripts/`, component declarations in `components/*.rb` (tools/declare-ruby, assembler ≥ v0.86.0) — end-to-end proof `examples/ruby-game` |
 | `typescript` (QuickJS) | ✅ done (labelle-engine#745) — quickjs-ng 0.15, ES-module scripts, BigInt ids, typed via contract/labelle.d.ts, tested against the same mock host (plain JS at runtime; the TS→JS transpile hook is assembler#586) |
-| `rust` (staticlib) | ✅ done (labelle-engine#741) — first native-compiled sub-module: game `rust/` sources cargo-built into the shipped crate (`native/`), `Script` trait + safe wrappers, panics caught at every FFI entry, tested against the same mock host AND end-to-end (`examples/rust-game` through the assembler's native-language splice, labelle-assembler ≥ v0.84.0) |
-| `crystal` (localized object) | ✅ done (labelle-engine#741) — second native-compiled sub-module on rust's skeleton: game `crystal/` sources built by `crystal build --cross-compile` + a main-localization pass into a linkable object, `Labelle::Script` class + safe wrappers, every raise rescued at every FFI entry, GC collections enabled (host-thread runtime boot), tested against the same mock host AND end-to-end (`examples/crystal-game` through the assembler's native-language splice, labelle-assembler ≥ v0.85.0) |
+| `rust` (staticlib) | ✅ done (labelle-engine#741) — first native-compiled sub-module: game `scripts/` sources (module root `scripts/mod.rs`) cargo-built into the shipped crate (`native/`), `Script` trait + safe wrappers, panics caught at every FFI entry, tested against the same mock host AND end-to-end (`examples/rust-game` through the assembler's native-language splice, labelle-assembler ≥ v0.84.0; the `scripts/` dir since v0.86.0) |
+| `crystal` (localized object) | ✅ done (labelle-engine#741) — second native-compiled sub-module on rust's skeleton: game `scripts/` sources (module root `scripts/game.cr`) built by `crystal build --cross-compile` + a main-localization pass into a linkable object, `Labelle::Script` class + safe wrappers, every raise rescued at every FFI entry, GC collections enabled (host-thread runtime boot), tested against the same mock host AND end-to-end (`examples/crystal-game` through the assembler's native-language splice, labelle-assembler ≥ v0.85.0; the `scripts/` dir since v0.86.0) |
 | `go` (c-archive) | planned |
 | `csharp` (CoreCLR) | planned — last |
 
 ## Using the lua sub-module
 
 Zig side — register sources, wire the plugin controller (the assembler
-generates exactly this; until script-dir embedding lands, `registerScript`
-is the seam you call yourself):
+generates exactly this from your `scripts/` dir; `registerScript` is
+the seam to call yourself when embedding by hand):
 
 ```zig
 const scripting = @import("labelle_scripting");
 
 // once at boot, before setup — name = chunkname in error tracebacks
-scripting.registerScript("player", @embedFile("lua/player.lua"));
+// (the game's scripts/ dir; ordering prefixes strip from the stem)
+scripting.registerScript("player", @embedFile("scripts/player.lua"));
 
 try scripting.Controller.setup(&game); // boots the VM, runs each init()
 scripting.Controller.tick(&game, dt);  // each frame: inbox dispatch + update(dt)
@@ -169,7 +170,7 @@ Build with `-Dlanguage=ruby`. The Zig side is identical to lua — same
 semantics — only the sources are `.rb`:
 
 ```zig
-scripting.registerScript("hunger", @embedFile("ruby/10_hunger.rb"));
+scripting.registerScript("hunger", @embedFile("scripts/10_hunger.rb"));
 ```
 
 Ruby side — two tiers. Plain per-script hooks (lua parity):
@@ -226,35 +227,42 @@ existing instance (string-name forms `e.get("Hunger")` → Hash and
 `e.set("Hunger", h)` also work).
 
 **Declaring components in ruby** (one DSL, two consumers — the lua
-component-ref rule, ruby spelling): a chunk-scope
+component-ref rule, ruby spelling). Declaration files live where their
+kind lives — in `components/`, beside the Zig ones (the components dir
+is extension-keyed and mixed-language; assembler ≥ v0.86.0):
 
 ```ruby
-# scripts/10_hunger.rb
+# components/hunger.rb — next to components/worker.zig
 Hunger = Labelle.component "Hunger", level: 0.875, starving: false
 ```
 
 is a SCHEMA DECLARATION at build time — `labelle generate` runs the
 ruby declare runner (`tools/declare-ruby`, built by `zig build
 labelle-declare-ruby`, the lua extractor's per-language sibling) over
-the game's scripts and the assembler codegens a real Zig registry
-component from the extracted schema (field types inferred from the
-defaults: Float→f32, Integer→i32, bool, String→str, `{ x:, y: }`→vec2;
-persist policy via a trailing options hash, exactly like lua's third
-argument: `Tag = Labelle.component "Tag", { kind: "none" }, persist:
-"transient"`). At RUNTIME the same line evaluates to a
-`Component.ref`-EQUIVALENT view class built from the spec's keys — spec
-values and options are the build-time contract and are ignored, because
-the component already exists in the game's registry. An empty spec
-(`Labelle.component "Dead", {}`) yields a zero-field marker view.
-`Component.ref` stays the explicit-fields spelling of the same class —
-the two are interchangeable. In declare mode only `Labelle.component`
-is live: every other `Labelle.*` call (and `Component.ref`,
-`Entity.create`, `FrameArray.new`, ...) is a no-op returning a sentinel
-the extractor REJECTS in spec positions — helpers-as-data fail the
-build — while `class Foo < Labelle::Controller` bodies define cleanly
-(nothing runs). Each script is extracted in a fresh interpreter, so
-top-level defs, constants and even a clobbered `Labelle` never leak
-between files.
+the game's `components/*.rb` files and scripts (a chunk-scope
+declaration inside a script stays legal — both feed the extractor) and
+the assembler codegens a real Zig registry component from the extracted
+schema (field types inferred from the defaults: Float→f32, Integer→i32,
+bool, String→str, `{ x:, y: }`→vec2; persist policy via a trailing
+options hash, exactly like lua's third argument: `Tag =
+Labelle.component "Tag", { kind: "none" }, persist: "transient"`). At
+RUNTIME the same line evaluates to a `Component.ref`-EQUIVALENT view
+class built from the spec's keys — spec values and options are the
+build-time contract and are ignored, because the component already
+exists in the game's registry. Components-dir files are embedded and
+registered BEFORE the `scripts/` entries, so the view constants they
+define exist by the time scripts load (`examples/ruby-game` is the
+running proof: its controller uses the declared `Hunger` with no
+`Component.ref` line). An empty spec (`Labelle.component "Dead", {}`)
+yields a zero-field marker view. `Component.ref` stays the
+explicit-fields spelling of the same class — the two are
+interchangeable. In declare mode only `Labelle.component` is live:
+every other `Labelle.*` call (and `Component.ref`, `Entity.create`,
+`FrameArray.new`, ...) is a no-op returning a sentinel the extractor
+REJECTS in spec positions — helpers-as-data fail the build — while
+`class Foo < Labelle::Controller` bodies define cleanly (nothing runs).
+Each script is extracted in a fresh interpreter, so top-level defs,
+constants and even a clobbered `Labelle` never leak between files.
 
 **Per-frame allocation** (the mruby homework): mruby's `Array#clear`
 FREES the heap buffer, so per-frame scratch cleared with `.clear`
@@ -292,7 +300,7 @@ is identical to lua/ruby — same `registerScript`/`Controller` seam, same
 contract, same mock-tested semantics — only the sources are JavaScript:
 
 ```zig
-scripting.registerScript("player", @embedFile("ts/player.js"));
+scripting.registerScript("player", @embedFile("scripts/player.js"));
 ```
 
 Scripts are **plain JS at runtime** — the TS→JS transpile arrives with
@@ -390,17 +398,18 @@ Design: `RFC-LANGUAGE-PLUGINS.md` (labelle-engine#730) · epic: labelle-engine#2
 
 Build with `-Dlanguage=rust` — the first **native-compiled** sub-module
 (labelle-engine#741): there is no VM and nothing embeds. Your game's
-`rust/` dir is compiled by cargo into the crate this plugin ships
-(`native/` — Cargo manifest, the `labelle` module, the entry-point glue)
-as its `game` module, producing `liblabelle_rust_scripts.a`, which links
-into the game binary. The contract header IS the binding (the POC's
-finding): the crate declares the `labelle_*` symbols `extern "C"` and
-they resolve against the host's exports in the same binary — zero
-bindings layer, zero indirection. The plugin's Zig side shrinks to a
-thin dispatcher onto the glue's `labelle_rs_*` entry points
-(`src/rust/vm.zig`), driven by the same Controller as every VM language.
+`scripts/` dir (`.rs` sources, module root `scripts/mod.rs`) is compiled
+by cargo into the crate this plugin ships (`native/` — Cargo manifest,
+the `labelle` module, the entry-point glue) as its `game` module,
+producing `liblabelle_rust_scripts.a`, which links into the game binary.
+The contract header IS the binding (the POC's finding): the crate
+declares the `labelle_*` symbols `extern "C"` and they resolve against
+the host's exports in the same binary — zero bindings layer, zero
+indirection. The plugin's Zig side shrinks to a thin dispatcher onto the
+glue's `labelle_rs_*` entry points (`src/rust/vm.zig`), driven by the
+same Controller as every VM language.
 
-Your `rust/mod.rs` implements one convention entry point; scripts are
+Your `scripts/mod.rs` implements one convention entry point; scripts are
 plain structs implementing the `Script` trait, state in their fields:
 
 ```rust
@@ -455,13 +464,15 @@ movement).
 Script Console gets a documented `ok:false` refusal.
 
 **End-to-end wiring** (generate → cargo → link) rides the assembler's
-native-language splice (labelle-assembler ≥ v0.84.0): it stages your
-`rust/` as a LIVE LINK over the staged package's `native/src/game/`
-(edit a `.rs`, rerun `zig build` — no re-generate), passes
-`-Dlanguage=rust`, and runs the build step declared in this repo's
-`plugin.labelle` (`.language_builds` — cargo → staticlib →
-`addObjectFile`, desktop-first). `examples/rust-game` is the running
-proof. Needs a rust toolchain (rustc ≥ 1.82) wherever the game builds.
+native-language splice (labelle-assembler ≥ v0.84.0; the `scripts/`
+convention dir since v0.86.0 — the legacy `rust/` dir keeps working for
+one release of grace): it stages your `scripts/` as a LIVE LINK over
+the staged package's `native/src/game/` (edit a `.rs`, rerun
+`zig build` — no re-generate), passes `-Dlanguage=rust`, and runs the
+build step declared in this repo's `plugin.labelle` (`.language_builds`
+— cargo → staticlib → `addObjectFile`, desktop-first).
+`examples/rust-game` is the running proof. Needs a rust toolchain
+(rustc ≥ 1.82) wherever the game builds.
 
 ## Using the crystal sub-module
 
@@ -474,8 +485,9 @@ system libraries the plugin's fixed manifest list cannot predict —
 using them fails at final link with unresolved symbols naming the
 library; generate-time capture of crystal's printed link line is the
 planned follow-up. Your game's
-`crystal/` dir is compiled by `crystal build --cross-compile` together
-with the sources this plugin ships (`native-crystal/` — the `Labelle`
+`scripts/` dir (`.cr` sources, module root `scripts/game.cr`) is
+compiled by `crystal build --cross-compile` together with the sources
+this plugin ships (`native-crystal/` — the `Labelle`
 module and the entry-point glue) as its `Game` module; because crystal
 has no `--no-main`, a second build step localizes the object's own
 `main` (and every other symbol) away — `ld -r -exported_symbols_list`
@@ -491,7 +503,7 @@ registration on the game's main thread and the program's top-level
 constant initializers; the labelle-engine#734 POC's sharp edges, all
 institutionalized in the glue).
 
-Your `crystal/game.cr` implements one convention entry point; scripts
+Your `scripts/game.cr` implements one convention entry point; scripts
 are classes inheriting `Labelle::Script`, state in instance vars:
 
 ```crystal
@@ -555,7 +567,9 @@ Script Console gets a documented `ok:false` refusal.
 
 **End-to-end wiring** (generate → crystal build → localize → link)
 rides the assembler's native-language splice (labelle-assembler ≥
-v0.85.0, the crystal row): it stages your `crystal/` as a LIVE LINK
+v0.85.0, the crystal row; the `scripts/` convention dir since v0.86.0 —
+the legacy `crystal/` dir keeps working for one release of grace): it
+stages your `scripts/` as a LIVE LINK
 over the staged package's `native-crystal/src/game/` (edit a `.cr`,
 rerun `zig build` — no re-generate), passes `-Dlanguage=crystal`, and
 runs the steps declared in this repo's `plugin.labelle`
@@ -606,30 +620,44 @@ The plugin handles the studio Script Console's
 ## Examples
 
 - **`examples/ruby-game/`** — a headless (null-backend) game whose
-  `ruby/` scripts drive the real engine end-to-end through the Script
-  Runtime Contract: the `#742` HungerController pattern
-  (`Component.ref` + `get(…, into:)` + `set`), a cross-script
-  `hunger__feed` command-event, an `engine__tick` builtin subscription,
-  `FrameArray` in the hot loop, and plain top-level hooks. It also
-  demonstrates the cross-layer interop: a game-root Zig hook
-  (`hooks/feed_watcher.zig`) consumes the SAME `hunger__feed` from the
-  same engine bus, natively — scripts for iteration speed, `hooks/` as
-  the native escape, no glue. Pins: the scripting plugin `local:../..`
-  (THIS checkout — every CI run exercises the current tree),
+  `scripts/` ruby files drive the real engine end-to-end through the
+  Script Runtime Contract, in the labelle-engine#237 convention layout:
+  ordering-prefixed scripts (`10_spawner.rb`, `20_hunger_controller.rb`
+  — stems strip, prefixes order registration) beside an unnumbered one
+  (`feed_watcher.rb`), and the Hunger component DECLARED IN RUBY
+  (`components/hunger.rb`, one `Labelle.component` line beside the Zig
+  `components/worker.zig`) — the assembler codegens the real registry
+  component from its schema, the spawner attaches it BARE, and the
+  transcript's 0.875-seeded decay chain proves the declared defaults
+  traveled through the ECS. On top: the `#742` HungerController pattern
+  (the declared `Hunger` view + `get(…, into:)` + `set` — no
+  `Component.ref` line), a cross-script `hunger__feed` command-event
+  with THREE subscribers off one bus (the controller, the pure-ruby
+  top-level `scripts/feed_watcher.rb`, and the native game-root Zig
+  hook `hooks/feed_watcher.zig` — scripts for iteration speed, `hooks/`
+  as the native escape, no glue), an `engine__tick` builtin
+  subscription, `FrameArray` in the hot loop, and plain top-level
+  hooks. Pins: the scripting plugin `local:../..` (THIS checkout —
+  every CI run exercises the current tree, declare tool included),
   core/engine/gfx registry releases, a sibling `labelle-null` clone
   (its bind touchpoint is unreleased), and a pinned labelle-assembler
-  release binary. CI generates, builds, runs `LABELLE_NULL_FRAMES=5`
-  and diffs the ordered `RUBY_*`/`ZIG_*` transcript — ruby's permanent
-  regression net (labelle-scripting#10). Recipe + assertions:
+  release binary (≥ v0.86.0). CI generates (asserting the generated
+  `scripting_components.zig` and components-before-scripts registration
+  order), builds, runs `LABELLE_NULL_FRAMES=5` and diffs the ordered
+  `RUBY_*`/`ZIG_*` transcript — ruby's permanent regression net
+  (labelle-scripting#10). Recipe + assertions:
   `.github/workflows/ci.yml` → `ruby-example`; timeline:
-  `examples/ruby-game/ruby/hunger_controller.rb`.
+  `examples/ruby-game/scripts/20_hunger_controller.rb`.
 
 - **`examples/rust-game/`** — the NATIVE-COMPILED counterpart
-  (labelle-engine#741): the SAME hunger sawtooth, `rust/` Script-trait
-  structs instead of ruby — so the two transcripts diff token-for-token
-  and the cross-language story is visible by eye. No VM, nothing
-  embeds: the assembler's native-language splice (labelle-assembler ≥
-  v0.84.0) links `rust/` over the staged plugin package's
+  (labelle-engine#741): the SAME hunger sawtooth, `scripts/`
+  Script-trait structs instead of ruby (module root `scripts/mod.rs` —
+  the same convention dir, the native family's fixed-name spelling) —
+  so the transcripts diff token-for-token and the cross-language story
+  is visible by eye (ruby's carries one extra token, its pure-ruby
+  feed-watcher's). No VM, nothing embeds: the assembler's
+  native-language splice (labelle-assembler ≥ v0.84.0; the `scripts/`
+  dir since v0.86.0) links `scripts/` over the staged plugin package's
   `native/src/game/` (a live link — edits rebuild without
   re-generating) and the plugin's declared `.language_builds` cargo
   step compiles it into `liblabelle_rust_scripts.a`, linked into the
@@ -644,13 +672,15 @@ The plugin handles the studio Script Console's
   builds, runs `LABELLE_NULL_FRAMES=5` and diffs the ordered
   `RUST_*`/`ZIG_*` transcript — the native family's permanent
   regression net. Recipe + assertions: `.github/workflows/ci.yml` →
-  `rust-example`; timeline: `examples/rust-game/rust/mod.rs`.
+  `rust-example`; timeline: `examples/rust-game/scripts/mod.rs`.
 
 - **`examples/crystal-game/`** — the SECOND native-compiled example
   (labelle-engine#741), rust-game's crystal twin: the SAME hunger
-  sawtooth, `crystal/` `Labelle::Script` classes — three transcripts
-  now diff token-for-token across the family boundary. The assembler's
-  crystal splice (labelle-assembler ≥ v0.85.0) links `crystal/` over
+  sawtooth, `scripts/` `Labelle::Script` classes (module root
+  `scripts/game.cr`) — the three transcripts diff token-for-token
+  across the family boundary. The assembler's
+  crystal splice (labelle-assembler ≥ v0.85.0; the `scripts/` dir since
+  v0.86.0) links `scripts/` over
   the staged plugin package's `native-crystal/src/game/` (the same
   live link) and the plugin's declared `.language_builds` steps run
   the two-step recipe: `crystal build --cross-compile`, then the
@@ -670,4 +700,4 @@ The plugin handles the studio Script Console's
   crystal-builds, runs `LABELLE_NULL_FRAMES=5` and diffs the ordered
   `CRYSTAL_*`/`ZIG_*` transcript — crystal's permanent regression
   net. Recipe + assertions: `.github/workflows/ci.yml` →
-  `crystal-example`; timeline: `examples/crystal-game/crystal/game.cr`.
+  `crystal-example`; timeline: `examples/crystal-game/scripts/game.cr`.

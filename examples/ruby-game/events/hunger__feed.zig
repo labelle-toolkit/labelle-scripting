@@ -1,7 +1,7 @@
 //! The command-as-event the HungerController subscribes to
-//! (`on("hunger__feed")` in ruby/hunger_controller.rb): any code — Zig
-//! systems, other scripts, or (as in this example) ruby/spawner.rb — can
-//! command a feeding by emitting it. The ruby emit
+//! (`on("hunger__feed")` in scripts/20_hunger_controller.rb): any code —
+//! Zig systems, other scripts, or (as in this example)
+//! scripts/10_spawner.rb — can command a feeding by emitting it. The ruby emit
 //! (`Labelle.emit("hunger__feed", entity: @worker.id, amount: 0.5)`)
 //! crosses the Script Runtime Contract as JSON and is parsed into this
 //! struct on the REAL engine bus; the subscribe/poll drain hands it back

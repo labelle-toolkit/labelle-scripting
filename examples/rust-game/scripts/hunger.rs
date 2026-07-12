@@ -1,5 +1,6 @@
-//! hunger.rs — the labelle-engine#742 HungerController pattern, ported
-//! to the native family (rust twin of ruby-game's hunger_controller.rb):
+//! scripts/hunger.rs — the labelle-engine#742 HungerController pattern,
+//! ported to the native family (rust twin of ruby-game's
+//! scripts/20_hunger_controller.rb):
 //!
 //!   - a plain struct implementing the `Script` trait, ALL state in its
 //!     fields — no VM, no registry magic,
@@ -11,15 +12,15 @@
 //!     is exactly this clear-retains-capacity discipline, pinned flat
 //!     by RUST_BUFFERS_OK at tick 5,
 //!   - command-as-event feeding (`hunger__feed`, events/hunger__feed.zig)
-//!     subscribed in `init` — emitted by rust/spawner.rs on tick 2, so
-//!     the cross-script round-trip over the engine bus is part of the
+//!     subscribed in `init` — emitted by scripts/spawner.rs on tick 2,
+//!     so the cross-script round-trip over the engine bus is part of the
 //!     pinned transcript,
 //!   - a NATIVE game-root Zig hook (hooks/feed_watcher.zig) consumes the
 //!     SAME hunger__feed from the same bus — the two-layer interop.
 //!
 //! `Hunger` is a real engine component (components/hunger.zig) — rust
 //! has no declare mode, so every call addresses it by name over the
-//! contract at runtime. Timeline: mod.rs's header.
+//! contract at runtime. Timeline: scripts/mod.rs's header.
 
 use super::{f32_field, u64_field};
 use crate::labelle::{self, EntityId, Script};

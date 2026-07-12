@@ -1,13 +1,13 @@
-# crystal/spawner.cr — the plain-script tier (crystal twin of rust-game's
-# spawner.rs): seeds the world in `init` and commands a feeding over the
-# engine bus on tick 2. State lives in instance vars — the native
-# family's isolation is the type system itself (no per-script receiver
-# tricks: two scripts are two classes).
+# scripts/spawner.cr — the plain-script tier (crystal twin of
+# rust-game's scripts/spawner.rs): seeds the world in `init` and
+# commands a feeding over the engine bus on tick 2. State lives in
+# instance vars — the native family's isolation is the type system
+# itself (no per-script receiver tricks: two scripts are two classes).
 #
 # Each observable milestone logs ONE `CRYSTAL_<TOKEN>` line so CI can
 # `grep -oE '(CRYSTAL|ZIG)_[A-Z0-9_.]+'` and diff the exact ordered
-# sequence. This script's slice of the 5-frame timeline (game.cr's
-# header documents the full interleaving):
+# sequence. This script's slice of the 5-frame timeline
+# (scripts/game.cr's header documents the full interleaving):
 #
 #   setup   CRYSTAL_INIT              init: Worker entity created,
 #                                      Hunger{level: 0.875} written

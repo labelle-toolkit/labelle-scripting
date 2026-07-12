@@ -1,5 +1,6 @@
-# crystal/hunger.cr — the labelle-engine#742 HungerController pattern,
-# ported to the native family (crystal twin of rust-game's hunger.rs):
+# scripts/hunger.cr — the labelle-engine#742 HungerController pattern,
+# ported to the native family (crystal twin of rust-game's
+# scripts/hunger.rs):
 #
 #   - a plain class inheriting `Labelle::Script`, ALL state in instance
 #     vars — no VM, no registry magic,
@@ -15,7 +16,7 @@
 #     (tests/crystal/game/gc_churn.cr's discipline, rehearsed over a
 #     real game frame),
 #   - command-as-event feeding (`hunger__feed`, events/hunger__feed.zig)
-#     subscribed in `init` — emitted by crystal/spawner.cr on tick 2, so
+#     subscribed in `init` — emitted by scripts/spawner.cr on tick 2, so
 #     the cross-script round-trip over the engine bus is part of the
 #     pinned transcript,
 #   - a NATIVE game-root Zig hook (hooks/feed_watcher.zig) consumes the
@@ -23,7 +24,7 @@
 #
 # `Hunger` is a real engine component (components/hunger.zig) — crystal
 # has no declare mode, so every call addresses it by name over the
-# contract at runtime. Timeline: game.cr's header.
+# contract at runtime. Timeline: scripts/game.cr's header.
 
 class HungerSystem < Labelle::Script
   DECAY_PER_TICK = 0.25_f32 # exact in binary fp — see game.cr

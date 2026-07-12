@@ -1,26 +1,36 @@
-# spawner.rb — the plain top-level-hooks tier (init/update/deinit): seeds
-# the world and commands a feeding over the engine bus. State lives in
-# @ivars on the script's private receiver; the `engine__tick`
-# subscription happens in `init` so the block captures that receiver (a
-# file-scope block would capture `main` instead — its @ivars are not the
-# hooks').
+# scripts/10_spawner.rb — the plain top-level-hooks tier
+# (init/update/deinit): seeds the world and commands a feeding over the
+# engine bus. State lives in @ivars on the script's private receiver;
+# the `engine__tick` subscription happens in `init` so the block
+# captures that receiver (a file-scope block would capture `main`
+# instead — its @ivars are not the hooks').
+#
+# The `10_` prefix is the scripts/-dir ordering convention (the same
+# structure Zig scripts use — labelle-engine#237): registration order
+# is explicit — spawner, then 20_hunger_controller, then the unnumbered
+# feed_watcher — and the prefix strips from the registered stem, so
+# tracebacks and the generated main say "spawner".
 #
 # Each observable milestone logs ONE `RUBY_<TOKEN>` line so CI can
 # `grep -oE '(RUBY|ZIG)_[A-Z0-9_.]+'` and diff the exact ordered
 # sequence. This script's slice of the 5-frame timeline
-# (LABELLE_NULL_FRAMES=5; hunger_controller.rb documents the full
-# interleaving):
+# (LABELLE_NULL_FRAMES=5; scripts/20_hunger_controller.rb documents the
+# full interleaving):
 #
-#   setup   RUBY_INIT              init(): Worker entity created,
-#                                   Hunger{level: 0.875} written
+#   setup   RUBY_INIT              init(): Worker entity created, Hunger
+#                                   attached BARE — the declared
+#                                   defaults (components/hunger.rb,
+#                                   level 0.875) seed the decay chain
 #   tick 2  RUBY_FEED_SENT         emit hunger__feed{entity, amount: 0.5}
 #                                   (script updates run BEFORE controller
 #                                   ticks, so this precedes tick 2's
 #                                   RUBY_LEVEL_* token; the emit reaches
-#                                   TWO subscribers off one bus — the
+#                                   THREE subscribers off one bus — the
 #                                   native hooks/feed_watcher.zig at this
 #                                   frame's dispatchEvents, the ruby
-#                                   handler on tick 3's inbox)
+#                                   controller handler AND the pure-ruby
+#                                   scripts/feed_watcher.rb on tick 3's
+#                                   inbox)
 #   tick 3  RUBY_ENGINE_TICK_SEEN  first engine__tick arrives (emitted by
 #                                   g.tick AFTER the tick-1 drain, drained
 #                                   at tick 2's boundary, inbox-dispatched
@@ -37,12 +47,15 @@ def init
   @tick = 0
   @engine_tick_seen = false
 
-  # The worker the HungerController manages. 0.875 (7/8, exact in binary
-  # floating point at every width en route) seeds the decay chain; the
-  # component's declared default is 1.0, so the read-back chain starting
-  # at 0.875 proves THIS write traveled through the real ECS.
+  # The worker the HungerController manages. The Hunger set is BARE —
+  # the contract's all-defaults `{}` write — so the component arrives
+  # with its DECLARED defaults: level 0.875 (7/8, exact in binary
+  # floating point at every width en route), declared in ruby in
+  # components/hunger.rb. The decay chain starting at 0.875 therefore
+  # proves the DECLARATION traveled schema -> codegen -> registry ->
+  # ECS — an explicit write here would mask exactly that.
   @worker = Labelle::Entity.create
-  @worker.set("Hunger", level: 0.875, starving: false)
+  @worker.set("Hunger")
   @worker.set("Worker")
 
   # Builtin-event consumption: an ENGINE event that fires every frame in

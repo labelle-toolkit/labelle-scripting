@@ -1,20 +1,25 @@
-# crystal/game.cr — the game's module root (labelle-engine#741,
-# native-compiled family): at `labelle generate` the assembler LINKS
-# this whole `crystal/` dir over the scripting plugin's staged
-# `native-crystal/src/game/`, the plugin's declared `.language_builds`
-# steps compile it (`crystal build --cross-compile`) and localize its
-# `main` away (ld -r on macOS, objcopy on linux — picked by the steps'
-# `.os` allowlists), and the game binary links the resulting
-# `labelle_crystal_scripts_lib.o` — the `labelle_*` contract symbols
-# resolve against the host's exports in the same binary. No VM, nothing
-# embeds; `Game.register` below is the one convention entry point.
+# scripts/game.cr — the game's module root (labelle-engine#741,
+# native-compiled family; `scripts/` is the shared convention dir every
+# script language uses since labelle-engine#237 / assembler v0.86.0):
+# at `labelle generate` the assembler LINKS this whole `scripts/` dir
+# over the scripting plugin's staged `native-crystal/src/game/`, the
+# plugin's declared `.language_builds` steps compile it (`crystal build
+# --cross-compile`) and localize its `main` away (ld -r on macOS,
+# objcopy on linux — picked by the steps' `.os` allowlists), and the
+# game binary links the resulting `labelle_crystal_scripts_lib.o` — the
+# `labelle_*` contract symbols resolve against the host's exports in
+# the same binary. No VM, nothing embeds; `Game.register` below is the
+# one convention entry point (`scripts/game.cr` IS the module root —
+# the native family's fixed name, where ruby uses ordering prefixes).
 #
 # The game mirrors examples/rust-game token-for-token (which mirrors
 # examples/ruby-game) so the cross-language story is visible by eye:
-# same components (components/hunger.zig + worker.zig), same
+# same Hunger/Worker component shapes (Zig files here — crystal has no
+# declare mode; the ruby game declares Hunger in ruby), same
 # command-event (events/hunger__feed.zig), same native Zig hook
 # (hooks/feed_watcher.zig) — only the script layer swaps rust for
-# crystal. Registration order stands in for ruby's two tiers: the
+# crystal (and ruby's transcript carries one extra token, its pure-ruby
+# feed-watcher's). Registration order stands in for ruby's two tiers: the
 # spawner registers FIRST (its `init` seeds the world before the
 # system's, its `update` runs before the system's each tick) and
 # `deinit` runs in REVERSE registration order, so the system tears down
@@ -71,9 +76,10 @@ require "./hunger"
 require "./spawner"
 
 module Game
-  # The game registration entry point (the `native-crystal/src/game/game.cr`
-  # convention — see the plugin README's crystal section). Registration
-  # order is hook order; `deinit` runs reversed.
+  # The game registration entry point (the game's `scripts/game.cr`,
+  # staged as `native-crystal/src/game/game.cr` — see the plugin
+  # README's crystal section). Registration order is hook order;
+  # `deinit` runs reversed.
   def self.register(scripts : Labelle::Scripts) : Nil
     scripts.add "spawner", Spawner.new
     scripts.add "hunger", HungerSystem.new
