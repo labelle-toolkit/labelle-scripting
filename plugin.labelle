@@ -52,13 +52,32 @@
     // events-support answer lives in the resolved manifest, not an
     // assembler-side semver compare.
     //
-    // `typescript` (embedded) has no `.languages` row yet: it ships no
-    // declare tool (its `components/*.zig` are hand-written), and its
-    // transpile toolchain-pin capability is a separate #619 slice still
-    // pending an RFC-pinned schema — adding a row with a `.declare` pointing
-    // at a non-existent tool, or a `.transpile` the assembler can't yet
-    // consume generically, would be inventing an unspecified contract.
-    // `crystal` lands its native declare row with #775.
+    // `typescript` (embedded) carries a `.transpile` capability but NO
+    // `.declare` (RFC-LANGUAGE-PLUGINS rev 18 §7 "Transpile fetch-pin
+    // contract", #619 transpile slice): it ships no declare tool (its
+    // `components/*.zig` are hand-written; a `components/*.ts` → schema
+    // declare runner is future work, #773), so the `.declare` field is
+    // simply omitted. Its `.transpile` row is the toolchain FETCH PIN the
+    // assembler used to hardcode in `scripting_transpile.zig`'s
+    // `TSC_VERSION`/`TSC_PLATFORMS`: an exact `.version`, a `.fetch_url`
+    // template with `{platform}`/`{version}` placeholders, and one
+    // `.platforms` row per (os, arch) naming the npm registry package
+    // suffix, the in-tarball `.binary`, and a MANDATORY `.sha512` (the npm
+    // `dist.integrity` value, RAW base64 — the `sha512-` SRI prefix
+    // stripped; a `sha512-`-prefixed value is a malformed row). The
+    // assembler reads this GENERICALLY (rev-18 option (b),
+    // manifest-with-mandatory-hashes): select the host `(os, arch)` row,
+    // REFUSE a hash-less pin, fetch → verify-sha512 → safe-extract → run —
+    // it owns *whether* a byte is trusted, this manifest owns *what* to
+    // fetch. The tsconfig codegen, the `.ts`↔`.js` collision gate and the
+    // `<binary> -p` invocation stay assembler-owned codegen (the RFC's
+    // "honest boundary" residue), NOT described by this row. The VALUES
+    // below were lifted verbatim from the assembler's frozen table — never
+    // invented — so a pre-`.transpile` assembler (its `TSC_PLATFORMS`
+    // fallback) and the generic reader fetch byte-identical tarballs. Old
+    // assemblers ignore this unknown key and keep their frozen pin table
+    // (the documented forward-compat). `crystal` lands its native declare
+    // row with #775.
     .languages = .{
         .{ .name = "lua", .extensions = .{"lua"}, .kind = .embedded,
            .declare = .{ .tool = "labelle-declare", .dir = "tools/declare",
@@ -70,6 +89,30 @@
            .module_root = "mod.rs", // scripts/mod.rs; build steps stay in .language_builds
            .declare = .{ .tool = "labelle-declare-rs", .dir = "tools/declare-rs",
                          .events = true } }, // native languages declare too — probe is internal to the tool
+        // typescript: NO `.declare` (its `components/*.zig` are hand-written;
+        // #773 will add a `components/*.ts` declare runner). The `.transpile`
+        // row is the toolchain fetch pin (rev 18) — TypeScript 7.0's
+        // Go-native `tsc`, shipped as npm platform packages
+        // `@typescript/typescript-<os>-<arch>` (esbuild's distribution
+        // shape: a registry tarball whose `lib/` holds the native binary).
+        // `.version` is an EXACT published pin; each `.platforms` row's
+        // `.sha512` is the npm `dist.integrity` digest, RAW base64. Lifted
+        // verbatim from the assembler's frozen `TSC_PLATFORMS` (7.0.2) so
+        // both readers fetch identical bytes.
+        .{ .name = "typescript", .extensions = .{"ts"}, .kind = .embedded,
+           .transpile = .{
+               .emits = "js",
+               .toolchain = "tsc",
+               .version = "7.0.2",
+               .fetch_url = "https://registry.npmjs.org/@typescript/typescript-{platform}/-/typescript-{platform}-{version}.tgz",
+               .platforms = .{
+                   .{ .os = "macos",   .arch = "aarch64", .platform = "darwin-arm64", .binary = "lib/tsc",     .sha512 = "gowzar9MwS/aRWp6f3a4KUqzRjAZjOsmGNCM6LcTgXum+dBfgsBVMN+AgvOCCbguXyick6LJhpBszxMebJ8syA==" },
+                   .{ .os = "macos",   .arch = "x86_64",  .platform = "darwin-x64",   .binary = "lib/tsc",     .sha512 = "SZ9xZInqApNlNGc9s0W1VSsktYSOe9cFqNOIqmN1Gs8SmkjKZYFt017G4VwPxASInODuAdbTW7sXiFUf893RgA==" },
+                   .{ .os = "linux",   .arch = "x86_64",  .platform = "linux-x64",    .binary = "lib/tsc",     .sha512 = "EYdf2cNg7rgCWJnxCdJ+F3V39O8ihb37eHAu1LK8oAFizgTQbPOK7zHHXbPt8rX24COqODXeI3sIf0fCXG7H/A==" },
+                   .{ .os = "linux",   .arch = "aarch64", .platform = "linux-arm64",  .binary = "lib/tsc",     .sha512 = "Qh4eU4/y3yDjnfjjyPYihMj5/ODIlmt+Bzu17OI+fiSRDW57QmU5SiN63exPRNJPKUzcc1INa1NXdrJ+MqHjUQ==" },
+                   .{ .os = "windows", .arch = "x86_64",  .platform = "win32-x64",    .binary = "lib/tsc.exe", .sha512 = "0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g==" },
+               },
+           } },
     },
     // Per-LANGUAGE build steps (labelle-engine#741, native-compiled
     // family) — the #586 `.build` Step schema, applied only when the
