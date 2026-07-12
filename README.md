@@ -22,7 +22,7 @@ Every language binds the engine's **Script Runtime Contract** (`labelle-engine/c
 | `rust` (staticlib) | ✅ done (labelle-engine#741) — first native-compiled sub-module: game `scripts/` sources (module root `scripts/mod.rs`) cargo-built into the shipped crate (`native/`), `Script` trait + safe wrappers, panics caught at every FFI entry, tested against the same mock host AND end-to-end (`examples/rust-game` through the assembler's native-language splice, labelle-assembler ≥ v0.84.0; the `scripts/` dir since v0.86.0) |
 | `crystal` (localized object) | ✅ done (labelle-engine#741) — second native-compiled sub-module on rust's skeleton: game `scripts/` sources (module root `scripts/game.cr`) built by `crystal build --cross-compile` + a main-localization pass into a linkable object, `Labelle::Script` class + safe wrappers, every raise rescued at every FFI entry, GC collections enabled (host-thread runtime boot), tested against the same mock host AND end-to-end (`examples/crystal-game` through the assembler's native-language splice, labelle-assembler ≥ v0.85.0; the `scripts/` dir since v0.86.0) |
 | `go` (c-archive) | planned |
-| `csharp` (CoreCLR) | planned — last |
+| `csharp` (CoreCLR) | ✅ done (labelle-engine#743) — the epic's final sub-module: game `scripts/*.cs` compiled by `dotnet publish` into a managed assembly (`native-csharp/`), loaded at runtime through the .NET hosting API (hostfxr) with `[UnmanagedCallersOnly]` entries, contract bound via `[LibraryImport]` against the host process; both deployment modes (framework-dependent / self-contained) documented below; desktop-first (mobile AOT out of v1). Tested against the same mock host end to end (`examples/csharp-game`; the assembler csharp splice is a follow-up) |
 
 ## Using the lua sub-module
 
@@ -661,6 +661,98 @@ fast on drift, and any toolchain bump goes through this repo's full
 suite before consumers see it. Treat crystal version bumps as
 deliberate, reviewed changes — never incidental.
 
+## Using the csharp sub-module
+
+Build with `-Dlanguage=csharp` — the language-plugins epic's final
+sub-module (labelle-engine#743). C# is **CoreCLR-hosted**: the .NET
+runtime is embedded in the game process (joining lua/ruby/typescript in
+the embedded-runtime family), but game scripts are *compiled* C#, not
+interpreted source — so the dispatch shape matches the compiled family
+(rust/crystal): registered *sources* are refused, and the plugin drives
+the managed side through the Controller-tier entry points.
+
+Your game's `scripts/*.cs` are compiled — together with the plugin's
+shipped `Labelle` + `Glue` module (`native-csharp/`) — into a managed
+assembly `labelle_csharp_scripts.dll` by `dotnet publish` (the plugin's
+declared `.language_builds` step). At runtime `src/csharp/vm.zig` loads
+that assembly through the .NET hosting API:
+
+1. locate `hostfxr` (the app dir first for self-contained, else
+   `$DOTNET_ROOT` / the platform's default install);
+2. `hostfxr_initialize_for_runtime_config(labelle_csharp_scripts.runtimeconfig.json)`;
+3. `hostfxr_get_runtime_delegate(load_assembly_and_get_function_pointer)`;
+4. resolve each `[UnmanagedCallersOnly]` entry in `Glue` to a bare C
+   function pointer — no marshalling thunk.
+
+The contract flows the other way exactly like rust/crystal: `Labelle.cs`
+declares the `labelle_*` symbols with **`[LibraryImport]`** and a
+`DllImportResolver` binds them against the **host process**
+(`NativeLibrary.GetMainProgramHandle()`), so a C# `Labelle.Log(...)` lands
+in the same game log sink a Zig script would. **The host binary must
+export the contract symbols** in its dynamic symbol table (the repo's test
+binary is linked `rdynamic`; a shipped game's assembler-generated main must
+do the same — `-rdynamic` on ELF, an export table on PE/COFF).
+
+Your scripts are plain classes deriving `Script` (global namespace — no
+`using` needed), registered by a `Game.Register` convention:
+
+```csharp
+public static class Game {
+    public static void Register(Scripts scripts) {
+        scripts.Add("player", new Player());
+    }
+}
+
+public sealed class Player : Script {
+    public override void Init() { Labelle.Log("hello from C#"); }
+    public override void Update(float dt) { /* … */ }
+    public override void OnEvent(string name, string payload) { /* … */ }
+    public override void Deinit() { }
+}
+```
+
+Ids are `ulong` end to end (no bitcast/BigInt caveat). Contract wrappers
+follow the family's **buffer-reuse idiom**: `GetComponentInto` /
+`QueryInto` / `PollInto` take a caller-owned `ref byte[]` (or
+`List<EntityId>`) held in a field and grow it at most once via the
+contract's required-size legs. Exceptions are contained at every FFI
+entry (a throw out of an `[UnmanagedCallersOnly]` method into foreign
+frames is UB): Init throw → logged + evicted; Update/OnEvent throw →
+logged every time, script stays; `Register` throw → all-or-nothing
+rollback — the same isolation story as rust's panics / crystal's raises.
+
+**Deployment modes** (both documented, both ride the same hosting call —
+they differ only in where hostfxr and the shared framework live):
+
+- **Framework-dependent** (the default; smallest artifact): `dotnet
+  publish -c Release --self-contained false`. Needs a globally installed
+  .NET runtime on the player's machine (matching the `TargetFramework`);
+  `hostfxr` resolves from the system install (`$DOTNET_ROOT` / the
+  platform default). This is what CI and `zig build test` verify.
+- **Self-contained** (no prerequisite; larger artifact): `dotnet publish
+  -c Release --self-contained true -r <rid>` (e.g. `win-x64`,
+  `linux-x64`, `osx-arm64`). Ships the runtime — including `hostfxr` —
+  beside the binary; `src/csharp/vm.zig` finds it in the app directory
+  first, so no system .NET is required.
+
+The VM reads `LABELLE_CS_ASSEMBLY_DIR` to locate the assembly (the
+assembler stages it there); absent that, it looks beside the running
+executable. Needs the .NET SDK (≥ 7 for the `[LibraryImport]` source
+generator) wherever the game's C# is built.
+
+**End-to-end wiring** (generate → dotnet publish → hostfxr load) is the
+assembler's csharp splice — a follow-up to labelle-engine#743 (no
+released assembler row yet), so `examples/csharp-game` is
+documentation-first while the plugin side is verified by `zig build test`
+(the csharp suite drives the managed assembly through hostfxr against the
+mock host). Game scripts target the refined `scripts/*.cs` convention;
+legacy per-language `csharp/` dirs are a transition compatibility note.
+
+**Desktop-first**: Windows / macOS / Linux. Mobile is explicitly out of
+v1 — iOS forbids JIT, so a mobile C# story is a NativeAOT
+(`[UnmanagedCallersOnly]` compiled ahead of time, linked like the rust
+family) follow-up, not this ticket.
+
 ## Studio Script Console (eval)
 
 The plugin handles the studio Script Console's
@@ -799,3 +891,24 @@ The plugin handles the studio Script Console's
   cache. Recipe + assertions: `.github/workflows/ci.yml` →
   `ts-example`; timeline:
   `examples/ts-game/scripts/20_hunger_controller.ts`.
+
+- **`examples/csharp-game/`** — the CoreCLR-hosted example
+  (labelle-engine#743) and a **fully-C# game**: the same hunger sawtooth
+  with ALL logic in `scripts/*.cs` (`Script` classes + `Game.Register`),
+  including a pure-C# event watcher (`FeedWatcher.cs`, the mirror of
+  ruby-game's `scripts/feed_watcher.rb`) in place of the Zig game-root hook
+  the rust/crystal examples use. The C# transcript diffs token-for-token
+  against the others (`CS_*`). The assembly is not linked in — the plugin's
+  declared `dotnet publish` step compiles `scripts/` (staged over the plugin
+  package's `native-csharp/src/game/`) into `labelle_csharp_scripts.dll`
+  beside the binary, and `src/csharp/vm.zig` loads it at runtime through
+  hostfxr, binding the contract via `[LibraryImport]` against the host. The
+  ONLY non-C# files are `project.labelle`, `scenes/main.jsonc`, and the
+  component schemas `components/*.zig` — C# has no component-schema
+  authoring path yet (the contract has no registration call; no
+  declare-csharp extractor exists), so those stay Zig as the single
+  remaining non-C# piece + a declare-csharp follow-up. Documentation-first:
+  no `csharp-example` CI job YET (the assembler csharp splice is a
+  follow-up) — the plugin side is proven by `zig build test`'s csharp suite
+  driving the managed assembly through the real hostfxr path against the
+  mock host. Timeline: `examples/csharp-game/scripts/Game.cs`.

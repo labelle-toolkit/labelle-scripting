@@ -47,6 +47,19 @@ jobs:
         with:
           crystal: "1.17"
 
+      # The csharp sub-module's suite (labelle-engine#743): `zig build test`
+      # `dotnet build`s tests/csharp's managed assembly and loads it through
+      # hostfxr against the mock host (the test binary is linked rdynamic so
+      # its contract exports bind the assembly's [LibraryImport]). Needs the
+      # .NET SDK ≥ 7 (the [LibraryImport] source generator); framework-
+      # dependent, so the installed runtime serves hostfxr. build.zig SKIPS
+      # the csharp binary when `dotnet` is absent, so this step is what makes
+      # the lane actually run — drop it and csharp silently goes uncovered.
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "7.0.x"
+
       # The lua dep is lazy — `zig build test` fetches it on demand
       # (network needed once; hash-pinned in build.zig.zon).
       #

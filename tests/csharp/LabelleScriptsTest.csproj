@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The csharp suite's managed test assembly (labelle-engine#743): the SHIPPED
+    Labelle + Glue module (native-csharp/src/, explicitly included below)
+    recomposed around tests/csharp/game/'s scenario scripts (picked up by the
+    default source glob under this directory) — the C# spelling of the rust
+    suite's #[path] recomposition / crystal's require recomposition. The
+    placeholder native-csharp/src/game/Game.cs is deliberately NOT included:
+    the test game (tests/csharp/game/Game.cs) provides `Game.Register`.
+
+    build.zig's csharp test wiring runs `dotnet build` on this project into a
+    cache dir and points src/csharp/vm.zig at it via LABELLE_CS_ASSEMBLY_DIR;
+    the assembly name matches the shipped one so the VM's fixed
+    `labelle_csharp_scripts.dll` lookup finds it. Contract symbols resolve
+    against the test binary's mock world (tests/mock_world.zig), exported via
+    the binary's rdynamic link — the production resolution model with a toy
+    host behind it.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <AssemblyName>labelle_csharp_scripts</AssemblyName>
+    <RootNamespace>Labelle</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <NoWarn>$(NoWarn);CA2255</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\native-csharp\src\Labelle.cs" Link="Labelle.cs" />
+    <Compile Include="..\..\native-csharp\src\Glue.cs" Link="Glue.cs" />
+  </ItemGroup>
+
+</Project>

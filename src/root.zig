@@ -20,20 +20,23 @@
 //! rides the C contract.
 //!
 //! Language sub-modules: build.zig selects exactly one (`-Dlanguage=lua`,
-//! `-Dlanguage=ruby`, `-Dlanguage=typescript` or `-Dlanguage=rust`) and
-//! surfaces the choice through the `scripting_options` module; the
-//! comptime switch below is what keeps unselected backends out of
-//! analysis entirely. Each backend directory (src/lua/, src/ruby/,
-//! src/ts/, src/rust/, …) exposes the same tiny surface: `vm.Vm`
+//! `-Dlanguage=ruby`, `-Dlanguage=typescript`, `-Dlanguage=rust`,
+//! `-Dlanguage=crystal` or `-Dlanguage=csharp`) and surfaces the choice
+//! through the `scripting_options` module; the comptime switch below is
+//! what keeps unselected backends out of analysis entirely. Each backend
+//! directory (src/lua/, src/ruby/, src/ts/, src/rust/, …) exposes the same
+//! tiny surface: `vm.Vm`
 //! (init/close/loadScript/callScriptHook/evictScript/callLabelleFn) and
 //! `bindings.install`.
 //!
 //! Two integration FAMILIES share that surface (RFC-LANGUAGE-PLUGINS):
 //! embedded-VM backends (lua/ruby/typescript) run sources delivered via
-//! `registerScript`; the native-compiled backends (rust — src/rust/vm.zig,
-//! crystal — src/crystal/vm.zig) are thin dispatchers onto entry points
-//! of a compiled artifact the game links (cargo staticlib / crystal
-//! object), and registered sources are refused (native code can't run
+//! `registerScript`; the compiled backends (rust — src/rust/vm.zig,
+//! crystal — src/crystal/vm.zig, csharp — src/csharp/vm.zig) are thin
+//! dispatchers onto entry points of a compiled artifact (cargo staticlib /
+//! crystal object linked into the game, or — for csharp — a managed
+//! assembly the embedded CoreCLR runtime loads at runtime through
+//! hostfxr), and registered sources are refused (compiled code can't run
 //! from text). The Controller below is family-agnostic on purpose.
 
 const std = @import("std");
@@ -72,6 +75,10 @@ const Backend = switch (build_options.language) {
     .crystal => struct {
         pub const vm = @import("crystal/vm.zig");
         pub const bindings = @import("crystal/bindings.zig");
+    },
+    .csharp => struct {
+        pub const vm = @import("csharp/vm.zig");
+        pub const bindings = @import("csharp/bindings.zig");
     },
 };
 

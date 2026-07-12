@@ -51,6 +51,12 @@
         // same must-ship reasoning (the eval_shared_suite {package}/ scan
         // pins both).
         "native-crystal",
+        // The csharp CoreCLR managed assembly (labelle-engine#743): the
+        // Labelle + Glue module + LabelleScripts.csproj the declared
+        // `dotnet publish` step compiles the GAME's scripts into. Must ship
+        // — the step runs against the consumer's staged copy (the
+        // eval_shared_suite {package}/ scan pins it too).
+        "native-csharp",
         // Bundled packs plugin.labelle's `.packs` references (the studio
         // console's eval-handler hook rides packs/scripting_console/) —
         // the assembler resolves them from the consuming game's FETCHED
