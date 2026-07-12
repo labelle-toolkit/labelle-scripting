@@ -109,12 +109,10 @@ module Labelle
   # game's event union by the time this line runs. Events are never
   # persisted, so there is no options argument (the declare runner
   # rejects a third argument outright).
-  def self.event(name, spec = nil, *rest)
+  def self.event(name, _spec = nil, *_rest)
     unless name.is_a?(String) && !name.empty?
       raise ArgumentError, "Labelle.event: expected a non-empty event name string"
     end
-    _ = spec
-    _ = rest
     name.freeze
   end
 

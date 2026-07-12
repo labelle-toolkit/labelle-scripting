@@ -466,6 +466,31 @@ test "malformed event declarations fail with file- and event-bearing errors" {
         &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"bad\", w: Labelle.array([]))" }},
         &.{ "events/bad.rb:1", "event 'bad' field 'w'", "cannot be used in event specs" },
     );
+    // A symbol and a string key normalize to ONE field name — two
+    // spellings of the same field fail on the declaration line instead
+    // of emitting an ambiguous two-`entity` schema to the assembler.
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"hit\", { entity: Labelle.id, \"entity\" => 0 })" }},
+        &.{ "events/bad.rb:1", "event 'hit' field 'entity'", "declared twice" },
+    );
+    try expectFailure(
+        &.{.{ .path = "components/bad.rb", .source = "Labelle.component(\"Hit\", { level: 1.0, \"level\" => 2.0 })" }},
+        &.{ "components/bad.rb:1", "component 'Hit' field 'level'", "declared twice" },
+    );
+}
+
+test "a tampered take seam cannot silently truncate the harvest" {
+    // The extractor pulls flat [name, fragment, ...] pairs through the
+    // __declare_take* seams; a chunk that shadows one could hand back an
+    // odd-length array, and pairing up would silently DROP the trailing
+    // item — a successful-looking but incomplete schema. The extractor
+    // rejects odd lengths as prelude-integrity breakage: a hard
+    // error.DeclarePrelude (the same class as a seam typo), NOT a
+    // user-facing .failure outcome.
+    try testing.expectError(error.DeclarePrelude, extract.run(testing.allocator, &.{.{
+        .path = "events/evil.rb",
+        .source = "def Labelle.__declare_take_events; [\"only_a_name\"]; end",
+    }}));
 }
 
 test "Labelle.id is no-arg only, and no spec" {

@@ -258,7 +258,7 @@ local MAX_EVENT_FIELDS = 32
 -- Returns the event-name string — the same value the runtime prelude
 -- returns — so chunk-scope `local HungerFeed = labelle.event(...)` binds
 -- one consistent value in both modes.
-local function declare_event(name, spec, extra)
+local function declare_event(name, spec, ...)
   local file = __DECLARE_FILE or "?"
   if type(name) ~= "string" or name == "" then
     error("labelle.event: expected a non-empty event name string", 2)
@@ -267,7 +267,14 @@ local function declare_event(name, spec, extra)
     error("labelle.event: event name '" .. name ..
       "' is not a valid identifier ([A-Za-z_][A-Za-z0-9_]*)", 2)
   end
-  if extra ~= nil then
+  -- Vararg so a 4th+ argument can't slip past unseen (a fixed `extra`
+  -- param would silently discard them). One EXPLICIT nil third arg stays
+  -- legal — ruby's fixed-arity `opts = nil` signature cannot distinguish
+  -- `event("x", {})` from `event("x", {}, nil)`, so rejecting it here
+  -- would break cross-runner parity; ruby rejects 4+ args natively
+  -- (wrong number of arguments), and this is the lua analog.
+  local extra_n = select("#", ...)
+  if extra_n > 1 or (extra_n == 1 and select(1, ...) ~= nil) then
     error("labelle.event: event '" .. name ..
       "' takes no options (events are not persisted)", 2)
   end

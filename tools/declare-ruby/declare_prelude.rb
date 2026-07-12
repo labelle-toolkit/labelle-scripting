@@ -350,12 +350,18 @@ module Labelle
 
     fields = []      # [[name, type, default-json], ...] — sorted below
     view_fields = [] # symbols, spec insertion order (the runtime view's order)
+    seen = {}        # symbol and string keys normalize to one field name
     spec.each do |k, v|
       ks = k.is_a?(Symbol) ? k.to_s : k
       unless __identifier?(ks)
         raise ArgumentError, "Labelle.component: component '" + name + "' field '" + k.to_s +
                              "' is not a valid identifier"
       end
+      if seen.key?(ks)
+        raise ArgumentError, "Labelle.component: component '" + name + "' field '" + ks +
+                             "' is declared twice (a symbol and a string key normalize to the same field)"
+      end
+      seen[ks] = true
       __reject_noop(v, "component '" + name + "' field '" + ks + "'")
       t, j = __classify("component '" + name + "' field '" + ks + "'", v)
       fields << [ks, t, j]
@@ -422,12 +428,18 @@ module Labelle
     end
 
     fields = [] # [[name, type, default-json], ...] — sorted below
+    seen = {}   # symbol and string keys normalize to one field name
     spec.each do |k, v|
       ks = k.is_a?(Symbol) ? k.to_s : k
       unless __identifier?(ks)
         raise ArgumentError, "Labelle.event: event '" + name + "' field '" + k.to_s +
                              "' is not a valid identifier"
       end
+      if seen.key?(ks)
+        raise ArgumentError, "Labelle.event: event '" + name + "' field '" + ks +
+                             "' is declared twice (a symbol and a string key normalize to the same field)"
+      end
+      seen[ks] = true
       __reject_noop(v, "event '" + name + "' field '" + ks + "'", "event")
       t, j = __classify("event '" + name + "' field '" + ks + "'", v)
       fields << [ks, t, j]

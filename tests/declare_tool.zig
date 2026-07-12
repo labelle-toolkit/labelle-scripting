@@ -369,6 +369,18 @@ test "malformed event declarations fail with file- and event-bearing errors" {
         &.{.{ .path = "bad.lua", .source = "labelle.event(\"tick\", {}, { persist = \"transient\" })" }},
         &.{ "bad.lua:1", "'tick'", "takes no options (events are not persisted)" },
     );
+    // …and neither is a FOURTH: the recorder is vararg so extras can't
+    // slip past a fixed third param unseen.
+    try expectFailure(
+        &.{.{ .path = "bad.lua", .source = "labelle.event(\"tick\", {}, nil, { persist = \"transient\" })" }},
+        &.{ "bad.lua:1", "'tick'", "takes no options (events are not persisted)" },
+    );
+    // One EXPLICIT nil third arg stays legal — ruby's fixed-arity
+    // `opts = nil` signature cannot distinguish it from the two-arg
+    // call, so cross-runner parity keeps it callable here too.
+    try expectSchema(&.{.{ .path = "ok.lua", .source = "labelle.event(\"tick\", {}, nil)" }},
+        \\{"components":[],"events":[{"name":"tick","fields":[]}]}
+    );
     // Unsupported field value type.
     try expectFailure(
         &.{.{ .path = "bad.lua", .source = "labelle.event(\"bad\", { cb = function() end })" }},

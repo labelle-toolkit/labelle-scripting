@@ -365,6 +365,10 @@ fn harvestChannel(
     const flat = c.mrb_funcall_argv(mrb, modv, sym, 0, null);
     if (excPending(mrb) or flat.tt != .array) return error.DeclarePrelude;
     const len = c.labelle_mrb_ary_len(flat);
+    // Odd length means a tampered/shadowed seam (a chunk redefining the
+    // take method) — pairing up would silently drop the trailing item and
+    // emit an incomplete-but-successful schema.
+    if (@mod(len, 2) != 0) return error.DeclarePrelude;
     var i: c.Int = 0;
     while (i + 1 < len) : (i += 2) {
         const nv = c.mrb_ary_entry(flat, i);
