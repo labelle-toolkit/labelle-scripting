@@ -1263,19 +1263,15 @@ jobs:
     timeout-minutes: 30
     env:
       # The pinned labelle-assembler release the example generates with —
-      # a BINARY release (tag → release.yml assets). v0.86.0 is the HARD
-      # floor for this example: the transpile phase itself ships in it
-      # (labelle-assembler#613 — check+emit at generate, the generated
-      # labelle-components.d.ts, the shared tool cache), alongside the
-      # `scripts/` convention dir (labelle-assembler#614). Older releases
-      # hard-fail on `.ts` sources (#586's placeholder gate). Bump
+      # a BINARY release (tag → release.yml assets). v0.89.0 is the HARD
+      # floor for this example NOW: it carries the transpile-before-declare
+      # composition (labelle-engine#773, rev 20 option (b)) — the assembler
+      # transpiles components/*.ts + events/*.ts BEFORE the declare phase
+      # and hands the labelle-declare-ts embedded-VM runner the emitted .js,
+      # so this game DECLARES its components + events in typescript. Older
+      # releases hard-fail on a `components/*.ts` (the pre-#773 gate). Bump
       # deliberately, never float.
-      # (Pinned one notch above this job's own floor: all four example
-      # jobs ride ONE assembler release — the rust example's NATIVE
-      # `.languages` declarations (labelle-engine#774) now set the
-      # repo-wide v0.88.0 pin, the first release with the generic
-      # `.languages` declare reader.)
-      ASSEMBLER_VERSION: v0.88.0
+      ASSEMBLER_VERSION: v0.89.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/ts-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
@@ -1343,22 +1339,29 @@ jobs:
             echo "E: generate reported failure"
             exit 1
           fi
-          # The transpile phase cold-fetched the ASSEMBLER-pinned tsc
-          # 7.0.2 native compiler (registry tarball, sha512-verified, no
-          # node/npm anywhere) into the fresh HOME's SHARED tool cache:
-          # the evidence line, then the cached binary itself.
-          grep -q 'fetching the typescript 7.0.2 native compiler' generate.log
-          test -x "$HOME/.labelle/tools/typescript/7.0.2/linux-x64/lib/tsc"
-          # TypeScript has NO declare mode (DECLARE_RUNNERS is lua+ruby)
-          # AND a pure-.ts project collects zero embeddable .js at
-          # declare time, so the phase no-ops SILENTLY — before even its
-          # runner-row gate prints the pointed skip note. Its presence
-          # here would mean stray runnable .js sources leaked into
-          # scripts/ (this example is all-.ts by design).
-          if grep -q 'script-declared components' generate.log; then
-            echo "E: declare-phase note printed — a pure-.ts project must skip the phase silently"
-            exit 1
-          fi
+          # The transpile phase cold-fetched the ASSEMBLER-pinned tsc 7.0.2
+          # native compiler (registry tarball, sha512-verified, no node/npm
+          # anywhere) into the fresh HOME's SHARED tool cache — the evidence
+          # line, then the cached binary itself. The generic transpile
+          # consumer (labelle-assembler#623, released in v0.89.0) names the
+          # toolchain by its manifest `.toolchain` ("tsc") in both the fetch
+          # diagnostic AND the cache segment (tools/<toolchain>/<version>/).
+          grep -qE 'fetching the tsc 7\.0\.2 .*compiler' generate.log
+          test -x "$HOME/.labelle/tools/tsc/7.0.2/linux-x64/lib/tsc"
+          # THE declare assertions (rev 20 option (b), labelle-engine#773):
+          # components/hunger.ts is transpiled BEFORE the declare phase and
+          # its emitted .js extracted into a real generated registry
+          # component (field defaults included — the transcript's 0.875 seed
+          # comes from HERE), components/worker.ts's zero-field tag beside
+          # it, and events/hunger__feed.ts's schema as the generated event
+          # struct (ONE scripting_events.zig at the target root — fields
+          # sorted by name, labelle.id classified u64).
+          grep -qF 'pub const Hunger' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'level: f32 = 0.875,' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const Worker' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const HungerFeed' .labelle/null_desktop/scripting_events.zig
+          grep -qF 'amount: f32 = 0.5,' .labelle/null_desktop/scripting_events.zig
+          grep -qF 'entity: u64 = 0,' .labelle/null_desktop/scripting_events.zig
           # This example is BORN on scripts/ — the legacy-dir grace note
           # must not appear (its presence means a ts/ dir leaked in, or
           # the resolve probe regressed).
@@ -1385,23 +1388,55 @@ jobs:
           # Codegen assertions — each is one link of the chain; fail
           # loudly if a regression drops it.
           M=.labelle/null_desktop/main.zig
-          # THE transpile-family assertion: the embeds are the EMITTED
-          # plain-JS twins out of the MATERIALIZED target dir (a real
-          # dir — the phase traded linkAndScan's symlink away), ordering
-          # prefixes stripped/ordered exactly like the first collection;
-          # a .ts embed means the emit rewrite fell through.
+          # The declared components wired into the game's component registry
+          # — scenes/saves/typed queries reach them like any components/*.zig
+          # file (rev 20 option (b)).
+          grep -qF '.Hunger = @import("scripting_components.zig").Hunger,' $M
+          grep -qF '.Worker = @import("scripting_components.zig").Worker,' $M
+          # The declared EVENT's union row — byte-for-byte the shape a
+          # Zig-authored events/hunger__feed.zig produced, so the bus, the
+          # sidecars and the native hook consume it unchanged.
+          grep -qF 'hunger__feed: @import("scripting_events.zig").HungerFeed,' $M
+          # THE transpile-family assertion: every embed is the EMITTED
+          # plain-JS twin out of a MATERIALIZED target dir (real dirs — the
+          # phase traded linkAndScan's symlinks away for components/, events/
+          # AND scripts/), ordering prefixes stripped exactly like the first
+          # collection; a .ts embed means the emit rewrite fell through.
           test ! -L .labelle/null_desktop/scripts
+          test -f .labelle/null_desktop/components/hunger.js
+          test -f .labelle/null_desktop/events/hunger__feed.js
           test -f .labelle/null_desktop/scripts/10_spawner.js
+          # All six chunks registered before the VM boots — components/
+          # DECLARATIONS first (their view constants must exist when scripts
+          # load), then events/, then scripts/ in ordering-prefix order
+          # (stems stripped: 10_spawner -> "spawner"), unnumbered last. The
+          # ORDER is the contract (components -> events -> scripts, pinned by
+          # the assembler), so diff it, don't just grep.
+          grep -qF 'scripting.registerScript("hunger", @embedFile("components/hunger.js"));' $M
+          grep -qF 'scripting.registerScript("worker", @embedFile("components/worker.js"));' $M
+          grep -qF 'scripting.registerScript("hunger__feed", @embedFile("events/hunger__feed.js"));' $M
           grep -qF 'scripting.registerScript("spawner", @embedFile("scripts/10_spawner.js"));' $M
           grep -qF 'scripting.registerScript("hunger_controller", @embedFile("scripts/20_hunger_controller.js"));' $M
           grep -qF 'scripting.registerScript("feed_watcher", @embedFile("scripts/feed_watcher.js"));' $M
-          if grep -qE '@embedFile\("scripts/[^"]+\.ts"\)' $M; then
+          if grep -qE '@embedFile\("(components|events|scripts)/[^"]+\.ts"\)' $M; then
             echo "E: a .ts source got embedded — the transpile rewrite regressed"
             exit 1
           fi
           grep -oE 'registerScript\("[a-z_0-9]+"' $M | cut -d'"' -f2 > .labelle/reg_order.txt
-          printf '%s\n' spawner hunger_controller feed_watcher > .labelle/reg_expected.txt
+          printf '%s\n' hunger worker hunger__feed spawner hunger_controller feed_watcher > .labelle/reg_expected.txt
           diff .labelle/reg_expected.txt .labelle/reg_order.txt
+
+          # Purity inventory (labelle-engine#772's mandate: every shipped
+          # language can go 100% selected-language): the ONLY authored .zig
+          # in this example is the OPTIONAL native escape hatch. A new
+          # load-bearing .zig here voids the purity story — make it a .ts, or
+          # consciously move it into hooks/ and update the variant below.
+          ZIGS=$(git ls-files -- '*.zig')
+          if [ "$ZIGS" != "hooks/feed_watcher.zig" ]; then
+            echo "E: examples/ts-game .zig inventory changed (expected exactly hooks/feed_watcher.zig):"
+            printf '%s\n' "$ZIGS"
+            exit 1
+          fi
           # Splice: the generated flag half of the templates' double-gate.
           grep -qF 'const scripting_enabled = true;' $M
           # labelle-null template: the bind touchpoint (proves the sibling
@@ -1547,8 +1582,95 @@ jobs:
           fi
           # Warm shared tool cache: the tsc fetched by the previous step
           # was REUSED — a second fetch line means the cache key broke.
-          if grep -q 'fetching the typescript' typo.log; then
+          if grep -qE 'fetching the (tsc|typescript)' typo.log; then
             echo "E: the shared tool cache was not reused (a second tsc fetch ran)"
             exit 1
           fi
           echo "PASS: the typo'd field failed generate with tsc's TS2551 relayed verbatim, nothing was emitted, and the warm tool cache was reused"
+
+      # THE purity gate (labelle-engine#772's mandate: every shipped
+      # language can go 100% selected-language — "no Zig at all").
+      # hooks/feed_watcher.zig is the example's OPTIONAL native escape hatch
+      # — kept above as the interop demo — so purity is proven by deletion:
+      # scratch-copy the example, rm -rf the copy's hooks/, regenerate +
+      # rebuild + rerun. The copy is a ZERO-.zig typescript game; it must
+      # generate, build and run green with the whole transcript minus
+      # exactly the native hook's token. Same HOME (warm tool cache).
+      - name: Purity variant — delete hooks/, rerun 100% typescript
+        run: |
+          set -o pipefail
+          export HOME="$RUNNER_TEMP/labelle-home"
+
+          cd labelle-scripting/examples
+          rm -rf ts-game-pure && mkdir ts-game-pure
+          (cd ts-game && tar cf - --exclude .labelle --exclude generate.log --exclude 'ts-game-typo-scratch' .) | (cd ts-game-pure && tar xf -)
+          rm -rf ts-game-pure/hooks
+          cd ts-game-pure
+
+          # 100% typescript, provably: not one .zig file in the authored tree.
+          if [ -n "$(find . -name '*.zig' -not -path './.labelle/*')" ]; then
+            echo "E: purity copy still contains .zig files:"
+            find . -name '*.zig' -not -path './.labelle/*'
+            exit 1
+          fi
+
+          ASM=$GITHUB_WORKSPACE/labelle-assembler
+          $ASM install --project-root .
+          $ASM generate --project-root . 2>&1 | tee generate.log
+          if grep -q 'generate failed' generate.log; then
+            echo "E: generate reported failure"
+            exit 1
+          fi
+
+          # The typescript-declared component + event still generate; the
+          # hooks scan folds nothing (no receiver, no native subscriber).
+          grep -qF 'pub const Hunger' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const HungerFeed' .labelle/null_desktop/scripting_events.zig
+          if grep -q 'FeedWatcher' .labelle/null_desktop/main.zig; then
+            echo "E: FeedWatcher receiver generated for a hooks-less game"
+            exit 1
+          fi
+
+          cd .labelle/null_desktop
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          LABELLE_NULL_FRAMES=5 ./zig-out/bin/ts_game > run.log 2>&1
+
+          # The full job's pinned sequence minus exactly the native hook's
+          # token — every typescript-side milestone, position and value,
+          # survives the deletion untouched.
+          grep -oE '(TS|ZIG)_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          TS_INIT
+          TS_CTRL_READY
+          TS_LEVEL_0.625
+          TS_FEED_SENT
+          TS_LEVEL_0.375
+          TS_ENGINE_TICK_SEEN
+          TS_WATCHER_SAW_0.5
+          TS_FED_LEVEL_0.875
+          TS_LEVEL_0.625
+          TS_LEVEL_0.375
+          TS_LEVEL_0.125
+          TS_STARVING
+          TS_FRAMEARRAY_OK
+          TS_DEINIT
+          TS_CTRL_DONE
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: purity-variant milestone sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: the 100% typescript game (zero .zig) generated, built and ran green — hooks/ is proven OPTIONAL (15 tokens, ZIG_FEED_SEEN_0.5 alone gone) — TypeScript closes the zero-Zig, every-language goal"

@@ -11,10 +11,19 @@
 // (`registerScript("spawner", @embedFile("scripts/10_spawner.js"))`);
 // quickjs-ng runs them as ES modules with BigInt entity ids.
 //
-// TypeScript has NO declare mode (DECLARE_RUNNERS is lua+ruby): the
-// components stay Zig (components/hunger.zig beside components/worker.zig,
-// the rust-game shape) and the TS story is TYPED ACCESS against the
-// generated d.ts instead — same registry, opposite direction.
+// TypeScript now DECLARES its components AND events (labelle-engine#773,
+// rev 20 option (b), labelle-assembler v0.89.0): components/hunger.ts +
+// components/worker.ts + events/hunger__feed.ts are transpiled BEFORE the
+// declare phase, the labelle-declare-ts embedded-VM runner evals the
+// emitted .js, and the assembler codegens the real registry component and
+// event union entry (CI greps the generated scripting_components.zig and
+// scripting_events.zig). The loop closes on itself — the generated
+// labelle-components.d.ts is built from that same declared registry, so
+// scripts get TYPED access to the very components typescript declared.
+// This is the PROVABLY-PURE typescript game: the ONLY .zig is the OPTIONAL
+// native escape hatch, hooks/feed_watcher.zig (CI deletes it in a scratch
+// copy and the game still runs green) — typescript closes the "zero-Zig,
+// every language" goal.
 //
 // THE point of living in this repo: the scripting plugin is pinned
 // `local:../..` — THIS checkout — so every CI run exercises the CURRENT
