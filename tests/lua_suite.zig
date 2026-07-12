@@ -266,6 +266,30 @@ test "labelle.on dispatch fires with decoded payloads" {
     try expectComponent(1, "Seen", "{\"amount\":7,\"count\":2,\"fanout\":2,\"nested_ok\":true}");
 }
 
+test "labelle.event returns the name: one binding drives emit AND on" {
+    fresh();
+    // The fixture declares hunger__feed at chunk scope (the SAME line the
+    // declare runner reads as schema), asserts the returned name,
+    // labelle.id == 0 and the name-validation errors at chunk scope (a
+    // failure there evicts the script and Fed never exists), then
+    // subscribes and emits exclusively through the binding.
+    scripting.registerScript("event_declared", @embedFile("lua/event_declared.lua"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+    try expectComponent(1, "Fed", "{\"count\":0,\"ok\":true}");
+
+    // Tick once: update() emits toward the host through the binding.
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.eventsContain("hunger__feed {\"amount\":0.5,\"entity\":\"1\"}"));
+
+    // The host emits the same event back: the subscription registered
+    // through the binding (raw_event_subscribe + handler-table key)
+    // receives it with the decoded payload.
+    mock.hostEmit("hunger__feed", "{\"entity\":1,\"amount\":0.5}");
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "Fed", "{\"amount\":0.5,\"count\":1,\"ok\":true}");
+}
+
 test "eviction purges the dead scripts' handlers; siblings keep firing" {
     fresh();
     // Chunk-scope handler + failing init(): the init-fail eviction path

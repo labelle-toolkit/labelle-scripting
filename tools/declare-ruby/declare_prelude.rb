@@ -3,16 +3,20 @@
 # tools/declare/declare_prelude.lua for the reference semantics this file
 # mirrors line for line where ruby can spell them).
 #
-# Declare mode is the build-time consumer of the component DSL: the SAME
-# `Hunger = Labelle.component "Hunger", level: 0.875, starving: false`
-# line that hands a script a Component.ref-equivalent view class at
-# runtime (src/ruby/prelude.rb) is, here, a schema declaration. Only
-# `Labelle.component` is live; every other `Labelle.*` call — and every
-# call INTO the runtime API's classes (`Labelle::Component.ref`,
-# `Labelle::Entity.create`, `Labelle::FrameArray.new`, ...) — is a silent
-# no-op returning NOOP_RESULT, an identity-checked sentinel that
-# `component` rejects if it lands in a spec position (helpers-as-data must
-# fail the build, never silently drop or misparse). `Labelle::Controller`
+# Declare mode is the build-time consumer of the component AND event DSLs:
+# the SAME `Hunger = Labelle.component "Hunger", level: 0.875` line that
+# hands a script a Component.ref-equivalent view class at runtime
+# (src/ruby/prelude.rb) is, here, a schema declaration — and the SAME
+# `HungerFeed = Labelle.event "hunger__feed", entity: Labelle.id,
+# amount: 0.5` line that returns the frozen event-name string at runtime
+# is, here, an event-schema declaration (labelle-engine#772). Only
+# `Labelle.component`, `Labelle.event` and `Labelle.id` are live; every
+# other `Labelle.*` call — and every call INTO the runtime API's classes
+# (`Labelle::Component.ref`, `Labelle::Entity.create`,
+# `Labelle::FrameArray.new`, ...) — is a silent no-op returning
+# NOOP_RESULT, an identity-checked sentinel that the recorders reject if
+# it lands in a spec position (helpers-as-data must fail the build, never
+# silently drop or misparse). `Labelle::Controller`
 # exists as a bare subclassable class: controller definitions are CHUNK
 # SCOPE in ruby (`class HungerController < Labelle::Controller`), so a
 # declare pass that NameError'd on it could never scan a real game script.
@@ -31,6 +35,11 @@
 #                                         component before the chunk runs
 #                                         (duplicate detection with
 #                                         first-declared-in attribution)
+#   Labelle.__declare_seed_event(name, file) — the event-namespace twin
+#                                         (events and components are
+#                                         SEPARATE namespaces: a Hunger
+#                                         component and a hunger event
+#                                         coexist)
 #   Labelle.__declare_begin(file)       — stamp the chunk's path (the
 #                                         lua __DECLARE_FILE twin)
 #   Labelle.__declare_take              — after the chunk ran clean:
@@ -39,9 +48,12 @@
 #                                         pre-formatted schema-JSON
 #                                         component objects, declaration
 #                                         order
+#   Labelle.__declare_take_events       — the same flat shape for this
+#                                         chunk's event declarations
 # The Zig side accumulates fragments across chunks and emits
-# {"components":[...]} — BYTE-compatible with the lua runner's
-# __declare_emit (the cross-runner golden in tests/ pins it).
+# {"components":[...]} — plus an "events":[...] array only when any event
+# was declared — BYTE-compatible with the lua runner's __declare_emit
+# (the cross-runner golden in tests/ pins it).
 #
 # Determinism: components emit in DECLARATION order (argv order, then
 # top-to-bottom within a file); fields emit SORTED BY NAME. mruby hashes
@@ -75,8 +87,24 @@ module Labelle
   # loudly, mirroring the lua sentinel table's nil-on-index behavior.
   NOOP_RESULT = Object.new.freeze
 
+  # The id FIELD marker (labelle-engine#772): `entity: Labelle.id` in an
+  # event or component spec classifies the field as {"type":"u64",
+  # "default":0} — the schema's entity-id type, which no plain ruby value
+  # can spell (an Integer would classify i32). Recognition is by IDENTITY,
+  # like NOOP_RESULT — but this one is a LEGAL field value, so __classify
+  # accepts it where __reject_noop would have fired. A bare frozen Object
+  # (not a Hash) so every structural guard rejects it with the right error
+  # already in place: `Labelle.event("x", Labelle.id)` lands on "expects a
+  # spec Hash", a nested `{ x: Labelle.id, y: 0 }` on the vec2 shape check
+  # (v1 ids are scalar-only). At runtime Labelle.id returns plain 0
+  # (src/ruby/prelude.rb), so the same spec line evaluates clean in both
+  # modes.
+  ID_SENTINEL = Object.new.freeze
+
   @decls = []     # [[name, fragment], ...] — THIS chunk's, declaration order
   @by_name = {}   # component name => file first declared in (seeded + local)
+  @event_decls = []     # the event twins of the two above — separate
+  @events_by_name = {}  # namespace: Hunger component + hunger event coexist
   @file = "?"
 
   # Largest finite f32, as a ruby Float (a double — same value the lua
@@ -103,6 +131,11 @@ module Labelle
     nil
   end
 
+  def self.__declare_seed_event(name, file)
+    @events_by_name[name] = file
+    nil
+  end
+
   def self.__declare_begin(file)
     @file = file
     nil
@@ -114,6 +147,17 @@ module Labelle
     while i < @decls.size
       flat << @decls[i][0]
       flat << @decls[i][1]
+      i += 1
+    end
+    flat
+  end
+
+  def self.__declare_take_events
+    flat = []
+    i = 0
+    while i < @event_decls.size
+      flat << @event_decls[i][0]
+      flat << @event_decls[i][1]
       i += 1
     end
     flat
@@ -186,10 +230,13 @@ module Labelle
   end
 
   # Classify one spec value into [<schema type>, <default as JSON>], or
-  # raise with `where` naming the component and field. The raise happens
-  # inside the Labelle.component call chain, so the backtrace's script
-  # frame is the declaration site.
+  # raise with `where` naming the declaration and field. The raise happens
+  # inside the Labelle.component/Labelle.event call chain, so the
+  # backtrace's script frame is the declaration site.
   def self.__classify(where, v)
+    if v.equal?(ID_SENTINEL)
+      return ["u64", "0"]
+    end
     if true.equal?(v) || false.equal?(v)
       return ["bool", v ? "true" : "false"]
     end
@@ -229,14 +276,16 @@ module Labelle
       raise ArgumentError, where + ": unsupported Hash default (only { x:, y: } vec2 hashes are supported in v1)"
     end
     raise ArgumentError, where + ": unsupported default of type " + v.class.to_s +
-                         " (v1 supports number, boolean, string, and { x:, y: } vec2 hashes)"
+                         " (v1 supports number, boolean, string, { x:, y: } vec2 hashes, and Labelle.id)"
   end
 
   # The pointed rejection for a helper result where a literal belongs.
-  def self.__reject_noop(v, ctx)
+  # `kind` ("component", the default, or "event") names the calling DSL
+  # in the message.
+  def self.__reject_noop(v, ctx, kind = "component")
     if v.equal?(NOOP_RESULT)
-      raise ArgumentError, "Labelle.component: " + ctx + ": Labelle.* helpers cannot be used " \
-                           "in component specs — declare-mode fields are literals"
+      raise ArgumentError, "Labelle." + kind + ": " + ctx + ": Labelle.* helpers cannot be used " \
+                           "in " + kind + " specs — declare-mode fields are literals"
     end
     nil
   end
@@ -301,12 +350,18 @@ module Labelle
 
     fields = []      # [[name, type, default-json], ...] — sorted below
     view_fields = [] # symbols, spec insertion order (the runtime view's order)
+    seen = {}        # symbol and string keys normalize to one field name
     spec.each do |k, v|
       ks = k.is_a?(Symbol) ? k.to_s : k
       unless __identifier?(ks)
         raise ArgumentError, "Labelle.component: component '" + name + "' field '" + k.to_s +
                              "' is not a valid identifier"
       end
+      if seen.key?(ks)
+        raise ArgumentError, "Labelle.component: component '" + name + "' field '" + ks +
+                             "' is declared twice (a symbol and a string key normalize to the same field)"
+      end
+      seen[ks] = true
       __reject_noop(v, "component '" + name + "' field '" + ks + "'")
       t, j = __classify("component '" + name + "' field '" + ks + "'", v)
       fields << [ks, t, j]
@@ -328,6 +383,95 @@ module Labelle
     @by_name[name] = @file
 
     __view_class(name, view_fields)
+  end
+
+  # ── the live call: Labelle.event(name, spec) ─────────────────────────
+  # The component recorder minus persistence (labelle-engine#772). Ruby's
+  # trailing-hash sugar makes the RFC line read bare:
+  #   HungerFeed = Labelle.event "hunger__feed", entity: Labelle.id, amount: 0.5
+  # Same identifier rules, same __classify vocabulary (Labelle.id
+  # included), fields sorted by name — but NO options argument (events are
+  # never saved: a third arg is a pointed error, not a persist knob) and a
+  # SEPARATE namespace (an event may share a component's name; duplicates
+  # are checked per kind). Returns the frozen event-name string — the same
+  # value the runtime prelude returns — so the chunk-scope constant binds
+  # one consistent value in both modes.
+  def self.event(name, spec = nil, opts = nil)
+    unless name.is_a?(String) && !name.empty?
+      raise ArgumentError, "Labelle.event: expected a non-empty event name string"
+    end
+    unless __identifier?(name)
+      raise ArgumentError, "Labelle.event: event name '" + name +
+                           "' is not a valid identifier ([A-Za-z_][A-Za-z0-9_]*)"
+    end
+    unless opts.nil?
+      raise ArgumentError, "Labelle.event: event '" + name +
+                           "' takes no options (events are not persisted)"
+    end
+    __reject_noop(spec, "event '" + name + "' spec", "event")
+    unless spec.is_a?(Hash)
+      raise ArgumentError, "Labelle.event: event '" + name +
+                           "' expects a spec Hash of field defaults ({} for a payloadless event)"
+    end
+    if @events_by_name.key?(name)
+      raise ArgumentError, "Labelle.event: duplicate event '" + name +
+                           "' (first declared in " + @events_by_name[name] + ")"
+    end
+
+    # Event payloads share the view fast path's field ceiling — one
+    # schema, whatever the language (the lua runner enforces the same 32
+    # through its MAX_EVENT_FIELDS twin literal).
+    if spec.size > MAX_VIEW_FIELDS
+      raise ArgumentError, "Labelle.event: event '" + name + "' has " + spec.size.to_s +
+                           " fields — event payloads support at most " +
+                           MAX_VIEW_FIELDS.to_s + " fields; split the event"
+    end
+
+    fields = [] # [[name, type, default-json], ...] — sorted below
+    seen = {}   # symbol and string keys normalize to one field name
+    spec.each do |k, v|
+      ks = k.is_a?(Symbol) ? k.to_s : k
+      unless __identifier?(ks)
+        raise ArgumentError, "Labelle.event: event '" + name + "' field '" + k.to_s +
+                             "' is not a valid identifier"
+      end
+      if seen.key?(ks)
+        raise ArgumentError, "Labelle.event: event '" + name + "' field '" + ks +
+                             "' is declared twice (a symbol and a string key normalize to the same field)"
+      end
+      seen[ks] = true
+      __reject_noop(v, "event '" + name + "' field '" + ks + "'", "event")
+      t, j = __classify("event '" + name + "' field '" + ks + "'", v)
+      fields << [ks, t, j]
+    end
+    fields.sort! { |a, b| a[0] <=> b[0] }
+
+    # No "persist" key on purpose — the schema shape is the contract, and
+    # events carry none.
+    frag = '{"name":' + __quote(name) + ',"fields":['
+    i = 0
+    while i < fields.size
+      f = fields[i]
+      frag << "," if i > 0
+      frag << '{"name":' << __quote(f[0]) << ',"type":"' << f[1] << '","default":' << f[2] << "}"
+      i += 1
+    end
+    frag << "]}"
+
+    @event_decls << [name, frag]
+    @events_by_name[name] = @file
+
+    name.freeze
+  end
+
+  # The id field marker's accessor (see ID_SENTINEL above). No-arg only:
+  # v1 has no id(value) constructor — id fields always default 0, so an
+  # argument is a declaration mistake worth naming.
+  def self.id(*args)
+    unless args.empty?
+      raise ArgumentError, "Labelle.id: takes no arguments (v1: id fields always default 0)"
+    end
+    ID_SENTINEL
   end
 
   # Every OTHER Labelle.* module call — on/log/emit/array/u64str/spawn/

@@ -93,6 +93,42 @@ module Labelle
     Component.__view(name, fields)
   end
 
+  # Declare a game EVENT (one DSL, two consumers — the Labelle.component
+  # rule for the event bus, labelle-engine#772):
+  #   HungerFeed = Labelle.event "hunger__feed", entity: Labelle.id, amount: 0.5
+  # is a SCHEMA DECLARATION at build time — `labelle generate` runs the
+  # declare runner over the game's events/*.rb files (and scripts) and
+  # the assembler materializes a real events/<name>.zig from the
+  # extracted schema. At RUNTIME — here — the same call validates the
+  # name and returns it as a FROZEN String, so the one constant drives
+  # both legs of the bus: Labelle.emit(HungerFeed, entity: id) and
+  # Labelle.on(HungerFeed) (both take event-name strings; a frozen one is
+  # just a string that can't be mutated out from under the subscription).
+  # The spec — and anything after it — is the build-time contract and is
+  # deliberately ignored: the generated event already exists in the
+  # game's event union by the time this line runs. Events are never
+  # persisted, so there is no options argument (the declare runner
+  # rejects a third argument outright).
+  def self.event(name, _spec = nil, *_rest)
+    unless name.is_a?(String) && !name.empty?
+      raise ArgumentError, "Labelle.event: expected a non-empty event name string"
+    end
+    name.freeze
+  end
+
+  # The id FIELD marker for event/component specs: at build time
+  # `entity: Labelle.id` classifies the field as u64 (the entity-id type)
+  # with default 0; at runtime it returns plain 0 so the same spec line
+  # evaluates clean in both modes. v1: id fields always default 0 — there
+  # is no id(value) constructor, so arguments are an error here exactly
+  # as they are at declare time.
+  def self.id(*args)
+    unless args.empty?
+      raise ArgumentError, "Labelle.id: takes no arguments (v1: id fields always default 0)"
+    end
+    0
+  end
+
   # Spawn a prefab; params is an optional {x:, y:} Hash. Returns an Entity
   # or nil on failure.
   def self.spawn(prefab, params = nil)

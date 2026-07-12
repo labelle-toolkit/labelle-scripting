@@ -685,6 +685,39 @@ function labelle.component(name, spec, opts)
   return { __labelle_component = name }
 end
 
+--- Declare a game EVENT — at BUILD time (the labelle-declare runner
+--- extracts `name` + the spec's inferred field schema and the assembler
+--- materializes a real events/<name>.zig from it; events/*.lua is the
+--- convention home, labelle-engine#772). At RUNTIME — here — the same
+--- call validates nothing beyond the name and returns the NAME STRING
+--- itself (immutable, as every Lua string is), so one binding drives
+--- both legs of the bus:
+---
+---   local HungerFeed = labelle.event("hunger__feed",
+---     { entity = labelle.id, amount = 0.5 })
+---   labelle.on(HungerFeed, function(ev) ... end)
+---   labelle.emit(HungerFeed, { entity = labelle.u64str(id), amount = 0.5 })
+---
+--- One DSL, two consumers (the labelle.component rule): the spec is the
+--- build-time contract and is deliberately ignored here — the generated
+--- event already exists in the game's event union by the time this line
+--- runs. Events are never persisted, so there is no options argument
+--- (the declare runner rejects a third argument outright).
+function labelle.event(name, spec)
+  if type(name) ~= "string" or name == "" then
+    error("labelle.event: expected a non-empty event name string", 2)
+  end
+  local _ = spec -- build-time contract; unused at runtime
+  return name
+end
+
+--- The id FIELD marker for event/component specs: at BUILD time
+--- `entity = labelle.id` classifies the field as u64 (the entity-id
+--- type) with default 0; at runtime the marker is simply the number 0,
+--- so the same spec line evaluates clean in both modes. v1: id fields
+--- always default 0 (there is no id(value) constructor).
+labelle.id = 0
+
 --- Log through the game's sink (stringifies for convenience).
 function labelle.log(msg)
   labelle.raw_log(tostring(msg))
