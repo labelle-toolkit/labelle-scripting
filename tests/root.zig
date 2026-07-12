@@ -32,6 +32,7 @@ test {
         .typescript => @import("ts_suite.zig"),
         .rust => @import("rust_suite.zig"),
         .crystal => @import("crystal_suite.zig"),
+        .csharp => @import("csharp_suite.zig"),
     };
 }
 

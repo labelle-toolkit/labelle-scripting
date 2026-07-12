@@ -2,8 +2,8 @@
 //! language sub-module, selected at build time.
 //!
 //! Language selection is a build option (`-Dlanguage=lua|ruby|typescript|
-//! rust|crystal`) rather than N sibling packages because every language
-//! binds the same
+//! rust|crystal|csharp`) rather than N sibling packages because every
+//! language binds the same
 //! Script Runtime Contract and exposes the same Controller — one module
 //! name (`labelle_scripting`), one plugin entry in project.labelle, N
 //! interchangeable VMs behind it. Unchosen languages must not be
@@ -45,7 +45,15 @@ const crystal_lib_paths = @import("tools/crystal_lib_paths.zig");
 /// -exported_symbols_list` on macOS, `objcopy --keep-global-symbols`
 /// on linux) demotes every symbol but the labelle_cr_* entries before
 /// the object links in (the labelle-engine#734 POC's recipe).
-const Language = enum { lua, ruby, typescript, rust, crystal };
+///
+/// `csharp` is the epic's FINAL entry (labelle-engine#743): a CoreCLR
+/// HOST. Nothing is vendored or compiled into the Zig module — game
+/// scripts compile to a managed assembly (`labelle_csharp_scripts.dll`,
+/// via `dotnet build`) that src/csharp/vm.zig LOADS at runtime through the
+/// .NET hosting API (hostfxr). Desktop-first: mobile AOT is out of v1
+/// (labelle-engine#743). The declared build step is a `dotnet` publish,
+/// not a link — the assembly rides beside the game binary, not inside it.
+const Language = enum { lua, ruby, typescript, rust, crystal, csharp };
 
 /// Lua 5.4.8 sources, minus the `lua.c`/`luac.c` executable mains
 /// (interpreter core + auxlib + all standard libraries).
@@ -301,6 +309,18 @@ pub fn build(b: *std.Build) void {
                 // crystal covered.
                 break :wire;
             }
+            if (lang == .csharp and (!isDesktop(target.result.os.tag) or
+                (b.findProgram(&.{"dotnet"}, &.{}) catch null) == null))
+            {
+                // C# scripting is CoreCLR-hosted (labelle-engine#743): its
+                // suite needs the .NET SDK to compile the managed test
+                // assembly and a desktop OS to host the runtime (mobile
+                // AOT is out of v1). Skip the csharp test binary when
+                // either is absent rather than aborting configuration —
+                // every other language still wires; CI's desktop lanes
+                // with dotnet installed keep csharp covered.
+                break :wire;
+            }
             const lang_mod = b.createModule(.{
                 .root_source_file = b.path("src/root.zig"),
                 .target = target,
@@ -502,7 +522,39 @@ pub fn build(b: *std.Build) void {
                 test_step.dependOn(&run_boot_tests.step);
             }
 
+            // The csharp binary's managed test assembly (labelle-engine
+            // #743): unlike rust/crystal there is no object to LINK — C#
+            // is CoreCLR-hosted, so the assembly is loaded at RUNTIME. The
+            // `dotnet build` step compiles the SHIPPED glue + Labelle
+            // module (native-csharp/src/, recomposed by the test csproj's
+            // <Compile> globs around tests/csharp/game/'s scenario scripts)
+            // into `labelle_csharp_scripts.dll` + its runtimeconfig.json in
+            // a cache dir; the test binary is built `rdynamic` so its
+            // mock-world contract exports are visible to the managed
+            // assembly's [LibraryImport] resolver (GetMainProgramHandle),
+            // exactly as a shipped game host must export them. The run step
+            // points the VM at the built assembly via LABELLE_CS_ASSEMBLY_DIR
+            // (src/csharp/vm.zig's documented override). Local dev / CI need
+            // the .NET SDK on PATH (the wire-skip above gates it).
+            var csharp_out_dir: []const u8 = "";
+            if (lang == .csharp) {
+                csharp_out_dir = b.cache_root.join(b.allocator, &.{"csharp-suite-out"}) catch @panic("OOM");
+                const dotnet = b.addSystemCommand(&.{
+                    "dotnet",     "build",
+                    "-c",         "Release",
+                    "--nologo",   "-v",
+                    "quiet",      "-o",
+                    csharp_out_dir,
+                });
+                dotnet.addFileArg(b.path("tests/csharp/LabelleScriptsTest.csproj"));
+                tests.step.dependOn(&dotnet.step);
+                // Export the mock-world contract symbols so the managed
+                // assembly can bind them against the host process.
+                tests.rdynamic = true;
+            }
+
             const run_tests = b.addRunArtifact(tests);
+            if (lang == .csharp) run_tests.setEnvironmentVariable("LABELLE_CS_ASSEMBLY_DIR", csharp_out_dir);
             test_step.dependOn(&run_tests.step);
         }
     }
@@ -675,6 +727,17 @@ fn configureLanguage(
             // assembler's `.language_builds` steps in consumer games,
             // the test-loop wiring in this repo's suite).
         },
+        .csharp => {
+            // CoreCLR host (labelle-engine#743): NOTHING is vendored,
+            // compiled or LINKED into the Zig module — src/csharp/vm.zig
+            // is pure Zig that loads a managed assembly at RUNTIME through
+            // hostfxr. The assembly (native-csharp/'s C# sources carrying
+            // the GAME's csharp/ dir as its `Game` module) is produced by
+            // the declared `dotnet` build step (plugin.labelle
+            // `.language_builds`) and rides BESIDE the game binary, not
+            // inside it — so unlike rust/crystal there is no object to add
+            // to the module here.
+        },
     }
 }
 
@@ -718,6 +781,16 @@ fn linkCrystalRuntime(mod: *std.Build.Module, os_tag: std.Target.Os.Tag, lib_dir
 /// script configure time for every language's test graph, so a panic here
 /// would abort `zig build --help` on a Windows host or a wasm cross for a
 /// game that never selected crystal.
+/// The desktop OSes the csharp CoreCLR host targets in v1 (mobile AOT is
+/// out of scope — labelle-engine#743). Gates the csharp test binary's
+/// wiring the way `crystalTriple` gates crystal's.
+fn isDesktop(os_tag: std.Target.Os.Tag) bool {
+    return switch (os_tag) {
+        .windows, .macos, .linux => true,
+        else => false,
+    };
+}
+
 fn crystalTriple(b: *std.Build, t: std.Target) ?[]const u8 {
     const arch = switch (t.cpu.arch) {
         .aarch64 => "aarch64",

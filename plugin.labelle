@@ -18,7 +18,7 @@
     // suite (and vice versa). Assemblers older than v0.83.0 ignore this
     // key and keep the fast-path.
     .params_schema = .{
-        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript", "rust", "crystal" }, .required = true },
+        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript", "rust", "crystal", "csharp" }, .required = true },
     },
     // Per-LANGUAGE build steps (labelle-engine#741, native-compiled
     // family) — the #586 `.build` Step schema, applied only when the
@@ -114,6 +114,40 @@
                    .system_libs = .{ .linux = .{ "gc", "pcre2-8", "gcc_s", "pthread", "dl", "rt", "m" } },
                    .library_paths = .{"{crystal_env:CRYSTAL_LIBRARY_PATH}"},
                    .platforms = .{"desktop"} },
+            },
+        },
+        // C# (labelle-engine#743, the epic's final language) — a CoreCLR
+        // HOST, not a link. The one step is `dotnet publish`: it compiles
+        // the game's csharp/ sources (staged over native-csharp/src/game/)
+        // together with the shipped Labelle + Glue module into the managed
+        // assembly `labelle_csharp_scripts.dll` PLUS its runtimeconfig.json
+        // and deps.json, emitted into the game's runtime dir BESIDE the
+        // binary — there is nothing to `addObjectFile`/link, so the step
+        // declares NO `.artifact`/`.link` (unlike rust/crystal): the
+        // assembly is loaded at RUNTIME by src/csharp/vm.zig through
+        // hostfxr, resolving the [UnmanagedCallersOnly] entries and binding
+        // the contract via [LibraryImport] against the host process's
+        // exports. `--self-contained false` selects FRAMEWORK-DEPENDENT
+        // deployment (the default, smallest artifact — needs a globally
+        // installed .NET runtime on the player's machine); a SELF-CONTAINED
+        // deployment (`--self-contained true -r <rid>`, ships the runtime
+        // beside the binary, no prerequisite) is the documented alternative
+        // (README csharp section) — the vm's hostfxr search handles both.
+        // Desktop-first: mobile AOT (NativeAOT for iOS/Android) is out of
+        // v1, so the step declares the desktop platform allowlist and a
+        // non-desktop csharp generate fails up front. Needs the .NET SDK
+        // (>= 7 for the [LibraryImport] source generator) wherever the game
+        // builds. Assembler floor: the same native-language splice family
+        // as rust/crystal (v0.85.0+ forward-compat tolerates this entry's
+        // artifact-less, link-less shape for non-selected consumers).
+        .{
+            .language = "csharp",
+            .steps = .{
+                .{
+                    .name = "dotnet-publish-scripts",
+                    .command = .{ "dotnet", "publish", "{package}/native-csharp/LabelleScripts.csproj", "-c", "Release", "--self-contained", "false", "-o", "{cache}" },
+                    .platforms = .{"desktop"},
+                },
             },
         },
     },

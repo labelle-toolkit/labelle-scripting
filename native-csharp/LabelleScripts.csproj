@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    labelle_csharp_scripts — the managed assembly a csharp-scripted labelle
+    game compiles its `csharp/` sources into (labelle-engine#743, the CoreCLR
+    host family; rust's native/ and crystal's native-crystal/ twin).
+
+    Built by the plugin's declared step (plugin.labelle `.language_builds`):
+    `dotnet publish` emits `labelle_csharp_scripts.dll` PLUS its
+    runtimeconfig.json / deps.json BESIDE the game binary. src/csharp/vm.zig
+    then loads it at RUNTIME through hostfxr, resolves the [UnmanagedCallersOnly]
+    entries in Glue.cs, and the `labelle_*` contract symbols the assembly
+    consumes resolve against the HOST PROCESS's exports (Labelle.cs's
+    DllImportResolver → GetMainProgramHandle) — the CoreCLR spelling of
+    rust/crystal's same-binary link-time resolution.
+
+    Deployment is documented for BOTH modes in the plugin README (csharp
+    section): FRAMEWORK-DEPENDENT (this file's default, needs a globally
+    installed .NET runtime) and SELF-CONTAINED (a self-contained publish with
+    a runtime identifier ships the runtime beside the binary). Desktop-first:
+    mobile AOT (NativeAOT for iOS/Android) is out of v1.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <AssemblyName>labelle_csharp_scripts</AssemblyName>
+    <RootNamespace>Labelle</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+
+    <!-- Function-pointer / raw-pointer P/Invoke in Labelle.cs. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- Emit the runtimeconfig.json a native host (hostfxr) needs to load
+         this class library as a component (not an app). -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+
+    <!-- CA2255: the ModuleInitializer in Labelle.cs is deliberate — it
+         installs the DllImportResolver before any Glue entry P/Invokes, which
+         is exactly the "advanced" load-time scenario the analyzer allows. -->
+    <NoWarn>$(NoWarn);CA2255</NoWarn>
+  </PropertyGroup>
+
+</Project>
