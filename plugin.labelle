@@ -68,20 +68,53 @@
                 },
             },
         },
-        // Crystal (labelle-engine#741, second native language): the
-        // entry is SPECIFIED but deliberately NOT declared yet. Its
-        // two-step recipe (crystal build --cross-compile emitting a
-        // main-carrying object, then a per-OS main-localization pass —
-        // ld64 -exported_symbols_list / objcopy --keep-global-symbols,
-        // `.link = .object`) needs step-schema features the released
-        // assembler (v0.84.0) REJECTS with a hard parse error for every
-        // consumer — strict validation covers non-selected entries too:
-        // per-step .os allowlists, artifact-less intermediates,
-        // {crystal_target}, .library_paths + {crystal_env:…}. The entry
-        // therefore ships TOGETHER with the assembler's crystal splice
-        // row (whose spec — PR #19's ASSEMBLER-FOLLOW-UP — carries the
-        // canonical entry text, plus the forward-compat requirement that
-        // non-selected entries tolerate unknown step keys so future
-        // languages can't re-break released assemblers).
+        // Crystal (labelle-engine#741, second native language) — the
+        // POC-proven two-step recipe: `crystal build --cross-compile`
+        // emits an object that still CARRIES crystal's `main` (no
+        // `--no-main` exists), then a per-OS localization pass demotes
+        // every symbol except the labelle_cr_* entries (ld64
+        // -exported_symbols_list on macOS, objcopy
+        // --keep-global-symbols on linux) so the localized object —
+        // `.link = .object` — rides the game link without hijacking the
+        // game's entry point. System libs are the crystal runtime's:
+        // bdw-gc + iconv + pcre2 on macOS; on linux gcc_s is the
+        // unwinder crystal begin/rescue needs (_Unwind_*) plus the
+        // usual pthread/dl/rt/m — and gc/pcre2 resolve via
+        // `.library_paths`' {crystal_env:CRYSTAL_LIBRARY_PATH}, a
+        // COLON-SEPARATED list the assembler must split per entry
+        // (tools/crystal_lib_paths.zig is the reference split).
+        // Assembler floor: v0.85.0 (the crystal splice row) — the first
+        // release whose step schema parses this entry's per-step `.os`,
+        // the artifact-less intermediate, {crystal_target} and
+        // `.library_paths`; v0.84.0's strict-everything validation
+        // hard-failed on them for EVERY consumer (any language), which
+        // is why the entry shipped only once v0.85.0's forward-compat
+        // (non-selected entries tolerate unknown step keys) closed that
+        // class of break for the languages after crystal.
+        .{
+            .language = "crystal",
+            .steps = .{
+                .{ .name = "crystal-build",
+                   .command = .{ "crystal", "build", "--release", "--cross-compile", "--target", "{crystal_target}", "{package}/native-crystal/src/main.cr", "-o", "{cache}/labelle_crystal_scripts" },
+                   .os = .{ "macos", "linux" },
+                   .platforms = .{"desktop"} },
+                .{ .name = "localize-main-macos",
+                   .command = .{ "ld", "-r", "{cache}/labelle_crystal_scripts.o", "-o", "{cache}/labelle_crystal_scripts_lib.o", "-exported_symbols_list", "{package}/native-crystal/exported_symbols_macos.txt" },
+                   .artifact = "{cache}/labelle_crystal_scripts_lib.o",
+                   .link = .object,
+                   .os = .{"macos"},
+                   .system_libs = .{ .macos = .{ "gc", "iconv", "pcre2-8" } },
+                   .library_paths = .{"{crystal_env:CRYSTAL_LIBRARY_PATH}"},
+                   .platforms = .{"desktop"} },
+                .{ .name = "localize-main-linux",
+                   .command = .{ "objcopy", "--keep-global-symbols={package}/native-crystal/exported_symbols_linux.txt", "{cache}/labelle_crystal_scripts.o", "{cache}/labelle_crystal_scripts_lib.o" },
+                   .artifact = "{cache}/labelle_crystal_scripts_lib.o",
+                   .link = .object,
+                   .os = .{"linux"},
+                   .system_libs = .{ .linux = .{ "gc", "pcre2-8", "gcc_s", "pthread", "dl", "rt", "m" } },
+                   .library_paths = .{"{crystal_env:CRYSTAL_LIBRARY_PATH}"},
+                   .platforms = .{"desktop"} },
+            },
+        },
     },
 }

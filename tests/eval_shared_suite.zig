@@ -306,10 +306,10 @@ test "packaging: build.zig.zon ships every directory plugin.labelle references" 
             search = rest;
         }
         // The manifest DOES declare package-relative build inputs today
-        // (rust; crystal's entry is HELD for the assembler release that
-        // parses its schema features — see plugin.labelle's note) —
-        // keeps the scan meaningful.
-        try expect(found_package_refs >= 1);
+        // (rust's native/ AND crystal's native-crystal/ — the crystal
+        // entry shipped with labelle-assembler v0.85.0, the release
+        // that parses its schema features) — keeps the scan meaningful.
+        try expect(found_package_refs >= 2);
     }
 
     // And the manifest DOES reference the console pack today — keeps the

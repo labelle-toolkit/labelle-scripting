@@ -20,7 +20,7 @@ Every language binds the engine's **Script Runtime Contract** (`labelle-engine/c
 | `ruby` (mruby 3.4) | ✅ done (labelle-engine#742) — vendored mruby, controllers + Component.ref + FrameArray, tested against the same mock host |
 | `typescript` (QuickJS) | ✅ done (labelle-engine#745) — quickjs-ng 0.15, ES-module scripts, BigInt ids, typed via contract/labelle.d.ts, tested against the same mock host (plain JS at runtime; the TS→JS transpile hook is assembler#586) |
 | `rust` (staticlib) | ✅ done (labelle-engine#741) — first native-compiled sub-module: game `rust/` sources cargo-built into the shipped crate (`native/`), `Script` trait + safe wrappers, panics caught at every FFI entry, tested against the same mock host AND end-to-end (`examples/rust-game` through the assembler's native-language splice, labelle-assembler ≥ v0.84.0) |
-| `crystal` (localized object) | ✅ done (labelle-engine#741) — second native-compiled sub-module on rust's skeleton: game `crystal/` sources built by `crystal build --cross-compile` + a main-localization pass into a linkable object, `Labelle::Script` class + safe wrappers, every raise rescued at every FFI entry, GC collections enabled (host-thread runtime boot), tested against the same mock host (assembler crystal-splice row is the follow-up) |
+| `crystal` (localized object) | ✅ done (labelle-engine#741) — second native-compiled sub-module on rust's skeleton: game `crystal/` sources built by `crystal build --cross-compile` + a main-localization pass into a linkable object, `Labelle::Script` class + safe wrappers, every raise rescued at every FFI entry, GC collections enabled (host-thread runtime boot), tested against the same mock host AND end-to-end (`examples/crystal-game` through the assembler's native-language splice, labelle-assembler ≥ v0.85.0) |
 | `go` (c-archive) | planned |
 | `csharp` (CoreCLR) | planned — last |
 
@@ -524,16 +524,17 @@ spelled).
 Script Console gets a documented `ok:false` refusal.
 
 **End-to-end wiring** (generate → crystal build → localize → link)
-rides the assembler's native-language splice — the same #741 follow-up
-as rust: it stages your `crystal/` over the staged package's
-`native-crystal/src/game/`, passes `-Dlanguage=crystal`, and runs the
-two steps declared in this repo's `plugin.labelle` (`.language_builds`
-— crystal build → `ld -r`/objcopy → `addObjectFile`, desktop-first).
-Until that assembler release, the sub-module is fully usable against
-the mock host and via hand-wiring (build and localize the object
-yourself, as build.zig's own test wiring demonstrates). Needs a
-crystal toolchain (≥ 1.16 — `Crystal.init_runtime`) wherever the game
-builds.
+rides the assembler's native-language splice (labelle-assembler ≥
+v0.85.0, the crystal row): it stages your `crystal/` as a LIVE LINK
+over the staged package's `native-crystal/src/game/` (edit a `.cr`,
+rerun `zig build` — no re-generate), passes `-Dlanguage=crystal`, and
+runs the steps declared in this repo's `plugin.labelle`
+(`.language_builds` — crystal build → `ld -r`/objcopy picked by the
+per-step `.os` allowlists → `addObjectFile`, desktop-first).
+`examples/crystal-game` is the running proof. Needs a crystal
+toolchain (≥ 1.16 — `Crystal.init_runtime`) wherever the game builds —
+generate included: resolving `{crystal_env:CRYSTAL_LIBRARY_PATH}` runs
+`crystal env`.
 
 **A stability note, stated plainly**: crystal has no public embedding
 API — `Crystal.init_runtime` and `Crystal.main_user_code` are
@@ -614,3 +615,29 @@ The plugin handles the studio Script Console's
   `RUST_*`/`ZIG_*` transcript — the native family's permanent
   regression net. Recipe + assertions: `.github/workflows/ci.yml` →
   `rust-example`; timeline: `examples/rust-game/rust/mod.rs`.
+
+- **`examples/crystal-game/`** — the SECOND native-compiled example
+  (labelle-engine#741), rust-game's crystal twin: the SAME hunger
+  sawtooth, `crystal/` `Labelle::Script` classes — three transcripts
+  now diff token-for-token across the family boundary. The assembler's
+  crystal splice (labelle-assembler ≥ v0.85.0) links `crystal/` over
+  the staged plugin package's `native-crystal/src/game/` (the same
+  live link) and the plugin's declared `.language_builds` steps run
+  the two-step recipe: `crystal build --cross-compile`, then the
+  per-OS main-localization the steps' `.os` allowlists select
+  (`ld -r` + exported-symbols list on macOS, `objcopy
+  --keep-global-symbols` on linux — CI pins that a linux generate
+  emits ONLY the objcopy step), linked as
+  `labelle_crystal_scripts_lib.o` with the crystal runtime's system
+  libs and the `{crystal_env:CRYSTAL_LIBRARY_PATH}`-derived search
+  paths. The scripts show the family's idioms crystal-spelled: reused
+  `Labelle::Buffer`s in instance vars (grow-once wrappers, parse from
+  `to_slice` — pinned settled by `CRYSTAL_BUFFERS_OK`; the Buffer
+  pair carries the pin since Array capacity is not introspectable),
+  UInt64 ids end to end, cross-script `hunger__feed` + `engine__tick`
+  over the same bus, and the same game-root Zig hook consuming the
+  same emit natively. CI generates (asserting NO `registerScript`),
+  crystal-builds, runs `LABELLE_NULL_FRAMES=5` and diffs the ordered
+  `CRYSTAL_*`/`ZIG_*` transcript — crystal's permanent regression
+  net. Recipe + assertions: `.github/workflows/ci.yml` →
+  `crystal-example`; timeline: `examples/crystal-game/crystal/game.cr`.
