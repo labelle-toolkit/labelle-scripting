@@ -10,10 +10,11 @@
 // transpile phase (labelle-assembler#613, v0.86.0) TYPE-CHECKS it with
 // the pinned tsc 7.0.2 native binary against contract/labelle.d.ts plus
 // the GENERATED labelle-components.d.ts (built from this game's real
-// component registry — see .labelle/<target>/scripts/ after a generate),
-// then embeds the emitted plain-JS twin. Misspell `level` in the set
-// below and generate FAILS with the tsc diagnostic, before anything
-// builds.
+// component registry, itself DECLARED in typescript now — see
+// components/hunger.ts and .labelle/<target>/scripts/ after a generate),
+// then embeds the emitted plain-JS twin. Misspell a component name in a
+// `set`/`get` and generate FAILS with the tsc diagnostic, before anything
+// builds (the CI negative test pins it on the controller's field access).
 //
 // The `10_` prefix is the scripts/-dir ordering convention (the same
 // structure Zig scripts use — labelle-engine#237): registration order is
@@ -27,10 +28,9 @@
 // scripts/20_hunger_controller.ts documents the full interleaving):
 //
 //   setup   TS_INIT              init(): Worker entity created, Hunger
-//                                 written EXPLICITLY at 0.875 (no declare
-//                                 mode for typescript — the typed write,
-//                                 not a declared default, seeds the decay
-//                                 chain)
+//                                 attached BARE — the DECLARED default
+//                                 (components/hunger.ts, level 0.875, rev
+//                                 20 option (b)) seeds the decay chain
 //   tick 2  TS_FEED_SENT         emit hunger__feed{entity, amount: 0.5}
 //                                 (script updates run in registration
 //                                 order, so this precedes tick 2's
@@ -57,7 +57,6 @@
 // dispatch — see labelle-engine/src/script_contract.zig "Event tap
 // semantics".
 
-const START_LEVEL = 0.875; // 7/8 — exact in binary floating point
 const FEED_AMOUNT = 0.5; // exact too — the token carries it verbatim
 
 let worker: Entity | null = null;
@@ -80,16 +79,16 @@ export function init(): void {
   }
   workerId = worker.id;
 
-  // The TYPED write that seeds the decay chain: `set` is overloaded by
-  // the GENERATED labelle-components.d.ts (`"Hunger"` is a
-  // `keyof LabelleComponents` literal), so this object literal is
-  // checked against the REAL registry shape from components/hunger.zig
-  // — `{ levl: 0.875 }` would fail generate with a tsc diagnostic.
-  // 0.875 (7/8) is exact in binary floating point at every width en
-  // route; the component's declared default is 1.0, so tick 1's
-  // TS_LEVEL_0.625 = 0.875 - 0.25 is reachable only through THIS write
-  // having traveled the contract into the ECS.
-  worker.set("Hunger", { level: START_LEVEL, starving: false });
+  // Hunger attached BARE — the contract's all-defaults `{}` write — so it
+  // arrives with its DECLARED defaults (components/hunger.ts, level 0.875,
+  // rev 20 option (b)). The decay chain starting at 0.875 therefore proves
+  // the TYPESCRIPT DECLARATION traveled schema -> codegen -> registry ->
+  // ECS: an explicit write here would mask exactly that. `set` is still
+  // typed against the GENERATED labelle-components.d.ts (built from the
+  // declared registry — `"Hunger"` is a `keyof LabelleComponents`
+  // literal), so a typo'd component name is a tsc diagnostic at generate;
+  // the CI negative test keeps a typed field write to pin that gate.
+  worker.set("Hunger"); // bare — the declared default 0.875 seeds the chain
   worker.set("Worker"); // bare set — the all-defaults `{}` write
 
   // Builtin-event consumption: an ENGINE event that fires every frame in

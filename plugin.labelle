@@ -113,7 +113,18 @@
                    .{ .os = "linux",   .arch = "aarch64", .platform = "linux-arm64",  .binary = "lib/tsc",     .sha512 = "Qh4eU4/y3yDjnfjjyPYihMj5/ODIlmt+Bzu17OI+fiSRDW57QmU5SiN63exPRNJPKUzcc1INa1NXdrJ+MqHjUQ==" },
                    .{ .os = "windows", .arch = "x86_64",  .platform = "win32-x64",    .binary = "lib/tsc.exe", .sha512 = "0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g==" },
                },
-           } },
+           },
+           // rev 20 option (b) (labelle-engine#773): typescript now DECLARES
+           // components + events. The assembler transpiles `components/*.ts` +
+           // `events/*.ts` BEFORE the declare phase (driven by `.transpile`
+           // above) and runs THIS embedded-VM declare tool over the emitted
+           // `.js` — the tool is a pure quickjs evaluator (the lua/ruby twin),
+           // toolchain-agnostic, knowing nothing about tsc. `.events = true`
+           // ⇒ declared events supported. The pairing of `.transpile` AND
+           // `.declare` on one row is exactly what triggers the
+           // transpile-then-declare composition (assembler v0.89.0).
+           .declare = .{ .tool = "labelle-declare-ts", .dir = "tools/declare-ts",
+                         .events = true } },
         // crystal (labelle-engine#775) — rust's native TWIN: declares through
         // the IDENTICAL `.declare = { .tool, .dir, .events }` shape, its
         // compile-and-run probe (labelle-declare-crystal) internal to the tool

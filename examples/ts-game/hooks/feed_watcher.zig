@@ -19,17 +19,23 @@
 //!
 //! The token carries the payload amount (`ZIG_FEED_SEEN_0.5` — f32 0.5
 //! is exact in binary floating point), proving the JSON-emitted
-//! typescript payload was parsed into events/hunger__feed.zig's
-//! `HungerFeed` and crossed the layer boundary intact — not just that
-//! the hook fired. CI pins its position in the ordered transcript.
+//! typescript payload was parsed into the typescript-DECLARED event's
+//! generated struct and crossed the layer boundary intact — not just
+//! that the hook fired. CI pins its position in the ordered transcript.
+//!
+//! The event is DECLARED in typescript now (events/hunger__feed.ts, rev
+//! 20 option (b)), materialized as ONE generated scripting_events.zig the
+//! game tree cannot import per-file — so this native hook spells its
+//! payload param `anytype` (the documented consequence, RFC-LANGUAGE-
+//! PLUGINS: the dispatcher never inspects param types; a Zig-AUTHORED
+//! event would keep its typed `@import`). Field access is unchanged.
 
 const std = @import("std");
-const HungerFeed = @import("../events/hunger__feed.zig").HungerFeed;
 
 pub const FeedWatcher = struct {
     // *const: this receiver is stateless (the dispatcher holds *FeedWatcher
     // and coerces). A hook that accumulates state takes `*FeedWatcher`.
-    pub fn hunger__feed(self: *const FeedWatcher, feed: HungerFeed) void {
+    pub fn hunger__feed(self: *const FeedWatcher, feed: anytype) void {
         _ = self;
         std.log.info("ZIG_FEED_SEEN_{d} entity={d}", .{ feed.amount, feed.entity });
     }
