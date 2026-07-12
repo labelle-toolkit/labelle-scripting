@@ -13,6 +13,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Read-only job: never persist the GITHUB_TOKEN in .git/config.
+          persist-credentials: false
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -79,7 +82,10 @@ jobs:
           rustfmt --check --edition 2021 examples/rust-game/rust/*.rs
 
       - name: Crystal formatting
-        run: crystal tool format --check native-crystal tests/crystal
+        # The crystal example game's sources ride along: like the rust
+        # example's, they have no build manifest of their own (they
+        # compile as the plugin package's game module) — check the dir.
+        run: crystal tool format --check native-crystal tests/crystal examples/crystal-game/crystal
 
   # Ruby example game (labelle-scripting#10) — the ruby counterpart of the
   # assembler's `examples/scripting-smoke`, living in THIS repo so every
@@ -99,15 +105,19 @@ jobs:
       # whose `scripting_splice.EMBED_LANGUAGES` carries the ruby row
       # (labelle-assembler#603, `.rb` embedding): v0.81.0 and older warn
       # "no embeddable-source integration" and embed nothing (the first
-      # registerScript grep below fails loudly). Bump deliberately,
+      # registerScript grep below fails loudly). Pinned to v0.85.0 —
+      # ONE floor for every example job (crystal's is the binding one;
+      # v0.85 is additive over ruby's old v0.83 pin). Bump deliberately,
       # never float.
-      ASSEMBLER_VERSION: v0.83.0
+      ASSEMBLER_VERSION: v0.85.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/ruby-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
       - uses: actions/checkout@v4
         with:
           path: labelle-scripting
+          # Read-only job: never persist the GITHUB_TOKEN in .git/config.
+          persist-credentials: false
 
       # Sibling checkout for the null backend: the generated main's
       # `script_contract.bind` touchpoint lives in labelle-null's
@@ -279,15 +289,22 @@ jobs:
       # native/src/game/, and consumes plugin.labelle's `.language_builds`
       # cargo step. v0.83.0 and older warn "no scripting integration yet"
       # and wire nothing (the no-registerScript grep below would pass
-      # vacuously, but the Controller.tick grep fails loudly). Bump
-      # deliberately, never float.
-      ASSEMBLER_VERSION: v0.84.0
+      # vacuously, but the Controller.tick grep fails loudly). Pinned to
+      # v0.85.0 — ONE floor for every example job, and the HARD floor for
+      # this repo's plugin.labelle since the crystal `.language_builds`
+      # entry landed: v0.84.0's strict step-schema validation covered
+      # non-selected entries too, so it rejects the manifest for EVERY
+      # language (v0.85.0 added the forward-compat that ends that class
+      # of break). Bump deliberately, never float.
+      ASSEMBLER_VERSION: v0.85.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/rust-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
       - uses: actions/checkout@v4
         with:
           path: labelle-scripting
+          # Read-only job: never persist the GITHUB_TOKEN in .git/config.
+          persist-credentials: false
 
       # Sibling checkout for the null backend — same reason and same
       # pattern as ruby-example above (the `script_contract.bind`
@@ -481,3 +498,264 @@ jobs:
             exit 1
           fi
           echo "PASS: rust drove the real engine — Script-trait structs compiled by the plugin's cargo step, buffer-reuse wrappers, cross-script hunger__feed (rust AND native Zig hook off one bus) + engine__tick over 5 headless frames, against this repo's HEAD"
+
+  # Crystal example game (labelle-engine#741) — the SECOND native-compiled
+  # example, rust-example's crystal twin, living in THIS repo so every push
+  # runs a real crystal game through the real assembler against the real
+  # engine: examples/crystal-game pins its scripting plugin `local:../..`
+  # (the CURRENT checkout), so the native-crystal/ sources, the glue and
+  # src/crystal/vm.zig under review are exactly what crystal compiles and
+  # the generated game links. Crystal's permanent regression net — and the
+  # end-to-end proof that generate → stage → crystal build → localize →
+  # link → run works (the two-step `.language_builds` recipe with per-OS
+  # `.os` selection), not just the mock-host suite.
+  crystal-example:
+    runs-on: ubuntu-latest
+    # Cold toolkit fetch + engine compile + one crystal --release build
+    # normally lands well under 15; bound a wedged runner far below
+    # GitHub's 6h default.
+    timeout-minutes: 30
+    env:
+      # The pinned labelle-assembler release the example generates with —
+      # a BINARY release (tag → release.yml assets). v0.85.0 is the FIRST
+      # release that recognizes crystal (`NATIVE_LANGUAGES` row) AND
+      # parses the crystal `.language_builds` entry's step schema
+      # (per-step `.os` allowlists, artifact-less intermediates,
+      # {crystal_target}, `.library_paths` + {crystal_env:…} — all
+      # labelle-assembler#612): v0.84.0 hard-fails generate on the entry
+      # for every language, older releases wire nothing. Bump
+      # deliberately, never float.
+      ASSEMBLER_VERSION: v0.85.0
+    steps:
+      # Checkout into a subdir so the example's sibling pins resolve:
+      # examples/crystal-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
+      - uses: actions/checkout@v4
+        with:
+          path: labelle-scripting
+          # Read-only job: never persist the GITHUB_TOKEN in .git/config.
+          persist-credentials: false
+
+      # Sibling checkout for the null backend — same reason and same
+      # pattern as ruby-example above (the `script_contract.bind`
+      # touchpoint is on labelle-null main, unreleased).
+      - name: Checkout labelle-null (bind touchpoint is unreleased)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The toolchain must exist before GENERATE, not just the build:
+      # resolving the entry's {crystal_env:CRYSTAL_LIBRARY_PATH} runs
+      # `crystal env` at generate time (a missing toolchain fails
+      # generate pointedly, naming the step). Same pin story as the test
+      # job: the embedding recipe relies on ≥ 1.16 runtime facts; bump
+      # deliberately, never float.
+      - name: Setup Crystal
+        uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: "1.17"
+
+      # objcopy IS the linux localization step (the `.os`-selected half
+      # of the plugin's two-step recipe). binutils is preinstalled on
+      # ubuntu runners (the test job's crystal legs already lean on it) —
+      # assert, don't install, so a runner-image regression names itself.
+      - name: Assert objcopy present (the linux localization step)
+        run: objcopy --version | head -1
+
+      - name: Download the pinned labelle-assembler release binary
+        run: |
+          curl -fL -o labelle-assembler \
+            "https://github.com/labelle-toolkit/labelle-assembler/releases/download/${ASSEMBLER_VERSION}/labelle-assembler-linux-x86_64"
+          chmod +x labelle-assembler
+
+      # Mirrors rust-example's flow: generate → codegen greps → build
+      # (fingerprint dance) → bounded headless run → ordered-transcript
+      # diff. The crystal-family deltas are the point of every grep below.
+      # Frame-by-frame timeline: crystal/game.cr's header.
+      - name: Generate + build + run the crystal example game
+        run: |
+          # Actions' default shell has no pipefail — without it the tee
+          # below masks a failed generate with exit 0.
+          set -o pipefail
+
+          # Fresh HOME for the whole flow: the assembler keeps its package
+          # cache under ~/.labelle — never let a runner's (or, when run
+          # locally, a developer's) real one leak into the run. Unlike
+          # rust-example's RUSTUP_HOME/CARGO_HOME dance, crystal needs NO
+          # survival exports: it resolves its stdlib and library paths
+          # from the install prefix, not HOME (`crystal env` prints
+          # identical values under a bogus HOME — verified), and its only
+          # HOME-derived path is the compile cache (CRYSTAL_CACHE_DIR →
+          # $HOME/.cache/crystal), which lands harmlessly inside the
+          # fresh HOME. The generalized lesson stands: know what your
+          # toolchain reads from HOME before you swap it.
+          export HOME="$RUNNER_TEMP/labelle-home"
+          mkdir -p "$HOME"
+
+          cd labelle-scripting/examples/crystal-game
+          ASM=$GITHUB_WORKSPACE/labelle-assembler
+
+          # Fetch core/engine/gfx releases into the package cache. The
+          # scripting plugin needs no fetch (`local:../..` — this
+          # checkout) and neither does the backend (`backend_package`
+          # pins the sibling labelle-null clone above).
+          $ASM install --project-root .
+          $ASM generate --project-root . 2>&1 | tee generate.log
+
+          # Belt and braces on top of the exit code (pipefail set at the
+          # top of this step): never trust artifacts past a failed
+          # generate.
+          if grep -q 'generate failed' generate.log; then
+            echo "E: generate reported failure"
+            exit 1
+          fi
+          # Native splices skip the declare phase SILENTLY (zero embedded
+          # scripts — the phase no-ops before its language gate), unlike
+          # ruby's pointed skip note. Its presence would mean the splice
+          # got misclassified as an embed family.
+          if grep -q 'script-declared components' generate.log; then
+            echo "E: declare-phase note printed for a native splice"
+            exit 1
+          fi
+
+          # Codegen assertions — each is one link of the chain; fail
+          # loudly if a regression drops it.
+          M=.labelle/null_desktop/main.zig
+          B=.labelle/null_desktop/build.zig
+          # THE native-family assertion: crystal arrives as machine code —
+          # nothing embeds, nothing registers. A registerScript line here
+          # means the splice fell back to the embed family.
+          if grep -q 'registerScript' $M; then
+            echo "E: registerScript emitted for a native-compiled language"
+            exit 1
+          fi
+          # Splice (family-shared): the generated flag half of the
+          # templates' double-gate.
+          grep -qF 'const scripting_enabled = true;' $M
+          # labelle-null template: the bind touchpoint (proves the sibling
+          # checkout — not the stale v0.3.0 release — was staged).
+          grep -qF 'engine.script_contract.bind(&g);' $M
+          # Splice: the Controller tick that drives inbox dispatch +
+          # every script's update(dt) through the glue.
+          grep -qF 'scripting.Controller.tick(&g, scaled_dt);' $M
+          # Splice: the event tap between plugin ticks and dispatchEvents.
+          grep -qF 'engine.script_contract.drainEvents(&g);' $M
+          # Game-root hooks scan: the native hunger__feed subscriber
+          # (hooks/feed_watcher.zig) folded into the GameHooks receiver
+          # tuple — the Zig half of the cross-layer events interop.
+          grep -qF 'feed_u_watcher.FeedWatcher' $M
+          # Build wiring: the plugin's -Dlanguage option selects the
+          # crystal dispatcher (src/crystal/vm.zig — no VM compiled in).
+          grep -qF '.language = .crystal' $B
+          # Build wiring (.language_builds → #586 steps): the emitted
+          # crystal-build argv, verbatim through the declared prefix (the
+          # {crystal_target} placeholder becomes the emitted
+          # plugin_build_crystal_target const; the main.cr path is a
+          # generate-time absolute literal).
+          grep -qF 'const plugin_build_crystal_target: []const u8 = switch (target.result.os.tag) {' $B
+          grep -qF 'b.addSystemCommand(&.{ "crystal", "build", "--release", "--cross-compile", "--target", plugin_build_crystal_target' $B
+          # Build wiring, the `.os` selection golden: a linux generate
+          # emits ONLY the objcopy localization (chained onto the build
+          # step) — the macOS ld step must be absent.
+          grep -qF '"objcopy"' $B
+          grep -qF -- '--keep-global-symbols=' $B
+          grep -qF 'exported_symbols_linux.txt' $B
+          if grep -q 'exported_symbols_macos' $B; then
+            echo "E: macOS localization step emitted by a linux generate (.os selection broke)"
+            exit 1
+          fi
+          # Build wiring: the localized-object artifact (step index 1 —
+          # the OS filter kept build + ONE localization) and its link
+          # onto the game binary.
+          grep -qF 'const plugin_scripting_build_artifact_1 = b.path("plugin-build/scripting/labelle_crystal_scripts_lib.o");' $B
+          grep -qF 'exe.root_module.addObjectFile(plugin_scripting_build_artifact_1);' $B
+          # Build wiring: the declared per-OS system libs (the crystal
+          # runtime's final-link needs — gcc_s is the unwinder crystal
+          # begin/rescue rides).
+          grep -qF 'exe.root_module.linkSystemLibrary("gc", .{});' $B
+          grep -qF 'exe.root_module.linkSystemLibrary("gcc_s", .{});' $B
+          # Build wiring: the {crystal_env:CRYSTAL_LIBRARY_PATH}-derived
+          # search paths, resolved at generate — every entry of the
+          # colon-split value must have landed as one addLibraryPath
+          # (this runner's crystal prints its lib dir first; a
+          # whole-value un-split regression would mangle it).
+          grep -qF 'exe.root_module.addLibraryPath(.{ .cwd_relative = ' $B
+          LIBDIR=$(crystal env CRYSTAL_LIBRARY_PATH | cut -d: -f1)
+          grep -qF "$LIBDIR" $B
+          # Staging is a LIVE LINK, not a copy (deps are shared across
+          # targets — .labelle/deps/): the game's crystal/ IS the staged
+          # package's game module, so edits flow into the next `zig
+          # build` without a re-generate. One symlink test + one
+          # read-through beats a second full build.
+          STAGED=.labelle/deps/labelle-scripting/native-crystal/src/game
+          test -L "$STAGED"
+          cmp crystal/game.cr "$STAGED/game.cr"
+
+          cd .labelle/null_desktop
+
+          # labelle-cli-equivalent fixFingerprint dance — the assembler
+          # emits a placeholder fingerprint.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          # `|| true`: with pipefail on, a NO-MATCH grep would otherwise
+          # exit 1 and set -e kills the step silently — and the happy path
+          # (first build succeeds, ERR empty, nothing to fix) is real: this
+          # example's fingerprint has never actually needed the dance.
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # Headless bounded run: no window, no GL — the binary runs to
+          # completion (rc=0) or crashes.
+          LABELLE_NULL_FRAMES=5 ./zig-out/bin/crystal_game > run.log 2>&1
+
+          # Pin the exact ordered milestone sequence — token-for-token the
+          # rust transcript's shape, so the cross-language story is
+          # diffable by eye. Tokens carry BEHAVIOR: every CRYSTAL_LEVEL_*
+          # value is the level the script wrote through the real ECS that
+          # tick (each one reachable only via the previous tick's
+          # persisted write), CRYSTAL_FED_LEVEL_0.875 is re-READ after
+          # the feed handler's write — the emitted id and f32 0.5 amount
+          # round-tripped the engine bus bit-exact — ZIG_FEED_SEEN_0.5 is
+          # the NATIVE game-root hook consuming the same emit at tick 2's
+          # dispatchEvents (frame end, one tick BEFORE the crystal
+          # handler's inbox — the cross-layer latency is part of the
+          # pin), and CRYSTAL_BUFFERS_OK pins the reused Labelle::Buffer
+          # pair settled (grow-once wrappers + capacity-retaining clears
+          # — crystal's FrameArray equivalent). The char class includes
+          # '.' for exactly the value-carrying tokens. Timeline:
+          # crystal/game.cr.
+          grep -oE '(CRYSTAL|ZIG)_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          CRYSTAL_INIT
+          CRYSTAL_CTRL_READY
+          CRYSTAL_LEVEL_0.625
+          CRYSTAL_FEED_SENT
+          CRYSTAL_LEVEL_0.375
+          ZIG_FEED_SEEN_0.5
+          CRYSTAL_ENGINE_TICK_SEEN
+          CRYSTAL_FED_LEVEL_0.875
+          CRYSTAL_LEVEL_0.625
+          CRYSTAL_LEVEL_0.375
+          CRYSTAL_LEVEL_0.125
+          CRYSTAL_STARVING
+          CRYSTAL_BUFFERS_OK
+          CRYSTAL_CTRL_DONE
+          CRYSTAL_DEINIT
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: crystal-example milestone sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: crystal drove the real engine — Labelle::Script classes compiled by the plugin's crystal-build step and localized by objcopy, Buffer-reuse wrappers, cross-script hunger__feed (crystal AND native Zig hook off one bus) + engine__tick over 5 headless frames, against this repo's HEAD"

@@ -1,0 +1,61 @@
+// Crystal example game (labelle-engine#741) — the SECOND native-compiled
+// example, examples/rust-game's crystal twin: crystal/ sources drive the
+// REAL engine through the Script Runtime Contract from the assembler's
+// generated main, headless over the null backend. No VM and nothing
+// embeds — the assembler's native-language splice (labelle-assembler
+// v0.85.0, the crystal row) LINKS the game's crystal/ dir over the
+// staged plugin package's native-crystal/src/game/ and the plugin's
+// declared `.language_builds` steps compile it (`crystal build
+// --cross-compile`) and localize its `main` away (ld -r / objcopy —
+// picked per OS by the steps' `.os` allowlists) into
+// labelle_crystal_scripts_lib.o, linked into this binary.
+//
+// THE point of living in this repo: the scripting plugin is pinned
+// `local:../..` — THIS checkout — so every CI run exercises the CURRENT
+// tree (the native-crystal/ sources, the glue, src/crystal/vm.zig), not
+// a release. Crystal's permanent regression net: generate + crystal
+// build + localize + build + run bounded frames (`LABELLE_NULL_FRAMES=5`)
+// and assert the ordered `CRYSTAL_*` milestone tokens — see
+// `.github/workflows/ci.yml` → `crystal-example`.
+.{
+    .name = "crystal_game",
+    .title = "LaBelle — Crystal Example Game (null backend)",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    // Headless: no window, no GPU, no input. The built binary runs a
+    // fixed-dt tick loop bounded by LABELLE_NULL_FRAMES and exits cleanly.
+    // Pinned as an EXPLICIT external `backend_package` to a SIBLING
+    // checkout rather than the registry `.backend = .null` shorthand: the
+    // generated main's `script_contract.bind` touchpoint lives in
+    // labelle-null's `templates/headless.txt` (labelle-null#5, on main)
+    // and the latest release (v0.3.0) predates it. CI clones labelle-null
+    // beside this repo — the same pattern as the assembler's own
+    // scripting-smoke job. Switch to a registry pin once labelle-null
+    // cuts a release carrying the touchpoint.
+    .backend_package = .{ .name = "null", .repo = "local:../../../labelle-null" },
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    // The scripting plugin resolved from the repo root two levels up —
+    // the working tree under test — with the one-language-per-project
+    // param (labelle-assembler#584/#589) selecting crystal: the SECOND
+    // native-compiled row (labelle-assembler v0.85.0). Crystal has no
+    // declare mode (native splices skip the phase silently — zero
+    // embedded scripts); `Hunger` is a real components/*.zig file the
+    // crystal scripts address by name over the contract at runtime.
+    .plugins = .{
+        .{
+            .name = "scripting",
+            .repo = "local:../..",
+            .params = .{ .language = "crystal" },
+        },
+    },
+    // Registry-resolved toolkit releases (this repo has no toolkit
+    // siblings to pin — the one `local:` dep is the plugin itself, plus
+    // the labelle-null sibling above).
+    .core_version = "1.26.0",
+    .engine_version = "2.5.0",
+    .gfx_version = "1.28.1",
+}
