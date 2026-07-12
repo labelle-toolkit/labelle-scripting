@@ -18,7 +18,7 @@ Every language binds the engine's **Script Runtime Contract** (`labelle-engine/c
 |---|---|
 | `lua` (Lua 5.4) | ✅ bootstrap done (#738) + per-frame allocation utilities (#2) — vendored Lua 5.4.8, contract-bound, tested against a mock host |
 | `ruby` (mruby 3.4) | ✅ done (labelle-engine#742) — vendored mruby, controllers + Component.ref + FrameArray, tested against the same mock host; game scripts in `scripts/`, component declarations in `components/*.rb` (tools/declare-ruby, assembler ≥ v0.86.0) — end-to-end proof `examples/ruby-game` |
-| `typescript` (QuickJS) | ✅ done (labelle-engine#745) — quickjs-ng 0.15, ES-module scripts, BigInt ids, typed via contract/labelle.d.ts, tested against the same mock host (plain JS at runtime; the TS→JS transpile hook is assembler#586) |
+| `typescript` (QuickJS) | ✅ done (labelle-engine#745) — quickjs-ng 0.15, ES-module scripts, BigInt ids, typed via contract/labelle.d.ts, tested against the same mock host; game `scripts/*.ts` sources are TYPE-CHECKED and emitted at `labelle generate` by the assembler's pinned tsc 7.0.2 native binary against a `labelle-components.d.ts` generated from the game's real component registry — type errors fail generate (labelle-assembler ≥ v0.86.0, #613) — end-to-end proof `examples/ts-game` |
 | `rust` (staticlib) | ✅ done (labelle-engine#741) — first native-compiled sub-module: game `scripts/` sources (module root `scripts/mod.rs`) cargo-built into the shipped crate (`native/`), `Script` trait + safe wrappers, panics caught at every FFI entry, tested against the same mock host AND end-to-end (`examples/rust-game` through the assembler's native-language splice, labelle-assembler ≥ v0.84.0; the `scripts/` dir since v0.86.0) |
 | `crystal` (localized object) | ✅ done (labelle-engine#741) — second native-compiled sub-module on rust's skeleton: game `scripts/` sources (module root `scripts/game.cr`) built by `crystal build --cross-compile` + a main-localization pass into a linkable object, `Labelle::Script` class + safe wrappers, every raise rescued at every FFI entry, GC collections enabled (host-thread runtime boot), tested against the same mock host AND end-to-end (`examples/crystal-game` through the assembler's native-language splice, labelle-assembler ≥ v0.85.0; the `scripts/` dir since v0.86.0) |
 | `go` (c-archive) | planned |
@@ -160,8 +160,9 @@ story: 1k entities of query + get-into + set + FrameArray per tick, per-
 read allocation ≈ 0 and steady-state memory flat across 100 ticks.
 
 Cross-language, same idioms: ruby spells them `e.get_into(Klass, @h)` +
-`Labelle::FrameArray` (below); typescript will lean on typed arrays /
-reused objects over the same contract when it lands.
+`Labelle::FrameArray` (below); typescript spells them
+`e.get("Hunger", into)` + `labelle.FrameArray` (+ a reused
+`Float64Array` for pure-numeric scratch) over the same contract.
 
 ## Using the ruby sub-module
 
@@ -303,18 +304,34 @@ contract, same mock-tested semantics — only the sources are JavaScript:
 scripting.registerScript("player", @embedFile("scripts/player.js"));
 ```
 
-Scripts are **plain JS at runtime** — the TS→JS transpile arrives with
-the assembler build hook (labelle-assembler#586). What makes this the
-*typescript* sub-module today is the authoring surface:
-`contract/labelle.d.ts` hand-declares types for the whole script API, so
-you get typed autocomplete and checking now:
+Scripts are **plain JS at runtime** — and you author them in
+**TypeScript**: since labelle-assembler v0.86.0 (#613,
+labelle-engine#745), `.ts` sources in the game's `scripts/` dir are
+TYPE-CHECKED and emitted to plain-JS ES modules at `labelle generate` by
+the assembler's pinned **tsc 7.0.2 native binary** (fetched once per
+machine into the shared `~/.labelle/tools/typescript/` cache from a
+hash-pinned registry tarball — no node/npm anywhere; `.js`-only projects
+never touch the toolchain). **Type errors fail generate** with tsc's
+diagnostics relayed verbatim, and the check runs against two declaration
+files: `contract/labelle.d.ts` (this repo — the whole script API) plus a
+**generated `labelle-components.d.ts`** built from the game's REAL
+component registry (`interface LabelleComponents` + keyof-constrained
+`Entity.get/set` overloads; i64/u64 fields type as `bigint`) — so
+`e.get("Hunger", h)` types `h.level` as `number` and a typo'd `h.levl`
+is a TS2551 at generate, before anything builds. `examples/ts-game` is
+the running proof.
+
+Editor-side authoring (no assembler in the loop) works for both
+extensions:
 
 - **.js scripts**: put `// @ts-check` at the top and add a
   `jsconfig.json` whose `"include"` lists your scripts plus
   `labelle.d.ts` (copy it or point at the resolved package's
   `contract/` dir) — your editor checks every call against the real API.
-- **.ts scripts**: check with `tsc --noEmit` the same way, and (until
-  assembler#586 lands) run the emitted `.js` through `registerScript`.
+- **.ts scripts**: your editor picks the same declarations up; after
+  any generate, `<target>/tsconfig.json` IS the generated config —
+  `tsc -p <target>/tsconfig.json` reproduces CI's exact check, the
+  generated `labelle-components.d.ts` included.
 
 Script side — each script is an **ES module**: module scope is the
 isolation boundary (top-level `let`/`const`/`function` are private to the
@@ -701,3 +718,30 @@ The plugin handles the studio Script Console's
   `CRYSTAL_*`/`ZIG_*` transcript — crystal's permanent regression
   net. Recipe + assertions: `.github/workflows/ci.yml` →
   `crystal-example`; timeline: `examples/crystal-game/scripts/game.cr`.
+
+- **`examples/ts-game/`** — the TYPED example (labelle-engine#745,
+  labelle-assembler#613): the SAME hunger sawtooth, `scripts/` `.ts`
+  ES modules — the transcripts diff token-for-token against ruby's
+  (one deliberate tail delta: no controller tier means per-script
+  deinits run in registration order, so `TS_DEINIT` precedes
+  `TS_CTRL_DONE`). At `labelle generate` the assembler's transpile
+  phase (≥ v0.86.0) resolves the pinned **tsc 7.0.2 native binary**
+  from the shared tool cache (`~/.labelle/tools/typescript/` —
+  hash-pinned registry tarball, no node/npm), generates
+  `labelle-components.d.ts` from the game's REAL component registry
+  (`"Hunger": { level: number; starving: boolean }` out of
+  `components/hunger.zig` — typescript has no declare mode, so
+  components stay Zig and the typed DIRECTION inverts ruby's),
+  type-checks strict, and embeds the emitted plain-JS twins. The
+  scripts are visibly typed: the cached `into` view and a helper
+  parameter are annotated `LabelleComponents["Hunger"]`, entity ids
+  travel as BigInt end to end, and payload fields narrow from
+  `JsonValue`. Same three-subscriber `hunger__feed` story (module
+  controller, pure-ts top-level watcher, native Zig hook),
+  `engine__tick`, `labelle.FrameArray` pinned flat. CI additionally
+  runs THE #613 acceptance negatively: a scratch copy with `h.level`
+  typo'd to `h.levl` must FAIL generate with tsc's TS2551 relayed
+  verbatim, emit nothing (`noEmitOnError`), and reuse the warm tool
+  cache. Recipe + assertions: `.github/workflows/ci.yml` →
+  `ts-example`; timeline:
+  `examples/ts-game/scripts/20_hunger_controller.ts`.
