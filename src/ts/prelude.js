@@ -206,6 +206,37 @@
     return { __labelle_component: name };
   };
 
+  /**
+   * Declare a custom event — at BUILD time (the labelle-declare-ts runner
+   * extracts `name` + the spec's inferred field schema and the assembler
+   * generates a real GameEvents union row from it). At RUNTIME — here — the
+   * same call is pure sugar: it validates nothing, declares nothing, and
+   * returns the event-NAME string, so the declared constant feeds
+   * `labelle.emit`/`labelle.on` directly:
+   *
+   *   export const HungerFeed = labelle.event("hunger__feed", {
+   *     entity: labelle.id, amount: 0.5,
+   *   });
+   *   labelle.emit(HungerFeed, { entity: e.id, amount: 1.0 });
+   *
+   * One DSL, two consumers (RFC-LANGUAGE-PLUGINS rev 20): the spec object is
+   * the build-time contract and deliberately ignored here — the runtime twin
+   * of the lua/ruby preludes, which likewise return the name.
+   */
+  labelle.event = (name, _spec) => {
+    if (typeof name !== "string" || name.length === 0)
+      throw new TypeError("labelle.event: expected a non-empty event name string");
+    return name;
+  };
+
+  /**
+   * The entity-id field marker for declarations (`entity: labelle.id` in a
+   * component/event spec ⇒ a u64 id field). At runtime it is plain 0 — specs
+   * are ignored here, so the same declaration line evaluates clean in both
+   * modes (the declare runner recognizes the marker; the game never reads it).
+   */
+  labelle.id = 0;
+
   /** Log through the game's sink (stringifies for convenience). */
   labelle.log = (msg) => {
     labelle.raw_log(String(msg));

@@ -269,6 +269,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Its typescript twin (tools/declare-ts): same promotion, same
+    // no-C-sources rule — within the TYPESCRIPT test binary the quickjs
+    // objects come from the typescript-language module; tests/root.zig's
+    // comptime gate keeps this module unanalyzed (and so unlinked) in every
+    // other language's binary. Like the lua/ruby cores, the ts runner is an
+    // embedded VM RUN in-process (unlike the rust/crystal probes).
+    const declare_ts_core_mod = b.createModule(.{
+        .root_source_file = b.path("tools/declare-ts/extract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The CRYSTAL_LIBRARY_PATH splitter, promoted the same way (this
     // build script imports it directly; the eval shared suite unit-tests
     // its multi-entry behavior through the named module — same file, so
@@ -405,6 +417,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "labelle_scripting", .module = lang_mod },
                     .{ .name = "declare_core", .module = declare_core_mod },
                     .{ .name = "declare_ruby_core", .module = declare_ruby_core_mod },
+                    .{ .name = "declare_ts_core", .module = declare_ts_core_mod },
                     .{ .name = "crystal_lib_paths", .module = crystal_lib_paths_mod },
                 },
             });
@@ -773,6 +786,46 @@ pub fn build(b: *std.Build) void {
             "Build the ruby declare-mode schema extractor (zig-out/bin/labelle-declare-ruby)",
         );
         declare_ruby_step.dependOn(&b.addInstallArtifact(declare_ruby_exe, .{}).step);
+    }
+
+    // ── labelle-declare-ts: the typescript declare-mode schema extractor ────
+    // The lua/ruby runners' embedded-VM sibling (RFC-LANGUAGE-PLUGINS rev 20,
+    // labelle-engine#773). Same shape as the lua `labelle-declare` step:
+    // host-targeted, Debug-pinned, reached only through its named step. Under
+    // the assembler's rev-20 option (b) it receives the EMITTED `.js` (the
+    // assembler transpiles `components/*.ts` + `events/*.ts` FIRST), so the
+    // tool is a pure quickjs evaluator that knows NOTHING about tsc. It
+    // compiles its OWN copy of the quickjs-ng sources (+ abi_check.c, the
+    // _Static_asserts pinning the hand-mirrored JSValue layout the extractor's
+    // C API relies on) — a separate compilation, nothing doubled — behind the
+    // same lazy-dependency gate the typescript LANGUAGE arm uses, so a `zig
+    // build --help` on a machine that never fetched quickjs still configures.
+    if (quickjs_dep_opt) |qjs_dep| {
+        const declare_ts_mod = b.createModule(.{
+            .root_source_file = b.path("tools/declare-ts/main.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        });
+        declare_ts_mod.addIncludePath(qjs_dep.path("."));
+        declare_ts_mod.addCSourceFiles(.{
+            .root = qjs_dep.path("."),
+            .files = &quickjs_sources,
+            .flags = &quickjs_flags,
+        });
+        declare_ts_mod.addCSourceFile(.{
+            .file = b.path("src/ts/abi_check.c"),
+            .flags = &quickjs_flags,
+        });
+        const declare_ts_exe = b.addExecutable(.{
+            .name = "labelle-declare-ts",
+            .root_module = declare_ts_mod,
+        });
+        const declare_ts_step = b.step(
+            "labelle-declare-ts",
+            "Build the typescript declare-mode schema extractor (zig-out/bin/labelle-declare-ts)",
+        );
+        declare_ts_step.dependOn(&b.addInstallArtifact(declare_ts_exe, .{}).step);
     }
 }
 
