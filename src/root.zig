@@ -30,9 +30,10 @@
 //!
 //! Two integration FAMILIES share that surface (RFC-LANGUAGE-PLUGINS):
 //! embedded-VM backends (lua/ruby/typescript) run sources delivered via
-//! `registerScript`; the native-compiled backend (rust — src/rust/vm.zig)
-//! is a thin dispatcher onto entry points of a cargo-built staticlib the
-//! game links, and registered sources are refused (native code can't run
+//! `registerScript`; the native-compiled backends (rust — src/rust/vm.zig,
+//! crystal — src/crystal/vm.zig) are thin dispatchers onto entry points
+//! of a compiled artifact the game links (cargo staticlib / crystal
+//! object), and registered sources are refused (native code can't run
 //! from text). The Controller below is family-agnostic on purpose.
 
 const std = @import("std");
@@ -67,6 +68,10 @@ const Backend = switch (build_options.language) {
     .rust => struct {
         pub const vm = @import("rust/vm.zig");
         pub const bindings = @import("rust/bindings.zig");
+    },
+    .crystal => struct {
+        pub const vm = @import("crystal/vm.zig");
+        pub const bindings = @import("crystal/bindings.zig");
     },
 };
 

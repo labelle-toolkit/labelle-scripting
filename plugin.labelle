@@ -18,7 +18,7 @@
     // suite (and vice versa). Assemblers older than v0.83.0 ignore this
     // key and keep the fast-path.
     .params_schema = .{
-        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript", "rust" }, .required = true },
+        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript", "rust", "crystal" }, .required = true },
     },
     // Per-LANGUAGE build steps (labelle-engine#741, native-compiled
     // family) — the #586 `.build` Step schema, applied only when the
@@ -30,14 +30,17 @@
     // manifest-LEVEL key rides the documented forward-compat instead
     // (old assemblers ignore it — they can't splice rust anyway).
     //
-    // Consumed by the assembler's native-language splice row (the #741
-    // follow-up), which also stages the game's rust/ dir over the staged
-    // package's native/src/game/ so cargo compiles the game's scripts
-    // into liblabelle_rust_scripts.a — linked into the game binary,
-    // where its labelle_* externs resolve against the host's exports.
-    // Desktop-first: cross-target cargo (android/ios/wasm rust triples)
-    // is future work, so the step declares a platform allowlist and a
-    // non-desktop rust generate fails up front, not at link time.
+    // Consumed by the assembler's native-language splice rows (the #741
+    // follow-ups), which also stage the game's language dir over the
+    // staged package's game-module root — rust/ over native/src/game/
+    // (cargo compiles the game's scripts into liblabelle_rust_scripts.a),
+    // crystal/ over native-crystal/src/game/ (crystal compiles them into
+    // labelle_crystal_scripts_lib.o) — linked into the game binary,
+    // where the labelle_* externs resolve against the host's exports.
+    // Desktop-first: cross-target builds (android/ios/wasm triples)
+    // are future work, so the steps declare a platform allowlist and a
+    // non-desktop native-language generate fails up front, not at link
+    // time.
     .language_builds = .{
         .{
             .language = "rust",
@@ -65,5 +68,20 @@
                 },
             },
         },
+        // Crystal (labelle-engine#741, second native language): the
+        // entry is SPECIFIED but deliberately NOT declared yet. Its
+        // two-step recipe (crystal build --cross-compile emitting a
+        // main-carrying object, then a per-OS main-localization pass —
+        // ld64 -exported_symbols_list / objcopy --keep-global-symbols,
+        // `.link = .object`) needs step-schema features the released
+        // assembler (v0.84.0) REJECTS with a hard parse error for every
+        // consumer — strict validation covers non-selected entries too:
+        // per-step .os allowlists, artifact-less intermediates,
+        // {crystal_target}, .library_paths + {crystal_env:…}. The entry
+        // therefore ships TOGETHER with the assembler's crystal splice
+        // row (whose spec — PR #19's ASSEMBLER-FOLLOW-UP — carries the
+        // canonical entry text, plus the forward-compat requirement that
+        // non-selected entries tolerate unknown step keys so future
+        // languages can't re-break released assemblers).
     },
 }

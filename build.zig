@@ -1,8 +1,9 @@
 //! labelle-scripting build: the shared plugin glue plus exactly ONE
 //! language sub-module, selected at build time.
 //!
-//! Language selection is a build option (`-Dlanguage=lua|ruby|typescript`)
-//! rather than N sibling packages because every language binds the same
+//! Language selection is a build option (`-Dlanguage=lua|ruby|typescript|
+//! rust|crystal`) rather than N sibling packages because every language
+//! binds the same
 //! Script Runtime Contract and exposes the same Controller — one module
 //! name (`labelle_scripting`), one plugin entry in project.labelle, N
 //! interchangeable VMs behind it. Unchosen languages must not be
@@ -17,6 +18,10 @@
 
 const std = @import("std");
 
+/// `crystal env CRYSTAL_LIBRARY_PATH` splitting (colon-separated) —
+/// shared with the test suite as the `crystal_lib_paths` named module.
+const crystal_lib_paths = @import("tools/crystal_lib_paths.zig");
+
 /// The language sub-modules this plugin can embed. One per game — the
 /// choice is a whole-VM decision, so it lives in the build graph, not at
 /// runtime. Adding a language is additive: extend this enum, gate its
@@ -29,7 +34,15 @@ const std = @import("std");
 /// cargo in consumer games, this build.zig's test wiring runs it for
 /// the repo's own suite) and the selected sub-module is a thin
 /// dispatcher onto the crate's exported entry points.
-const Language = enum { lua, ruby, typescript, rust };
+///
+/// `crystal` is the second native entry, on rust's exact skeleton with
+/// one extra build step: crystal has no `--no-main`, so the object
+/// `crystal build --cross-compile` emits still carries a `main` that
+/// would collide with the game's — a localization pass (`ld -r
+/// -exported_symbols_list` on macOS, `objcopy --keep-global-symbols`
+/// on linux) demotes every symbol but the labelle_cr_* entries before
+/// the object links in (the labelle-engine#734 POC's recipe).
+const Language = enum { lua, ruby, typescript, rust, crystal };
 
 /// Lua 5.4.8 sources, minus the `lua.c`/`luac.c` executable mains
 /// (interpreter core + auxlib + all standard libraries).
@@ -234,6 +247,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The CRYSTAL_LIBRARY_PATH splitter, promoted the same way (this
+    // build script imports it directly; the eval shared suite unit-tests
+    // its multi-entry behavior through the named module — same file, so
+    // the code the wiring runs can never drift from the code under test).
+    const crystal_lib_paths_mod = b.createModule(.{
+        .root_source_file = b.path("tools/crystal_lib_paths.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Tests: the contract symbols are `extern` in src/contract.zig and the
     // test root provides them (tests/mock_world.zig `export`s a toy world),
     // mirroring production exactly — there the assembled game binary is the
@@ -252,84 +275,206 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all language suites against the mock host world");
     inline for (@typeInfo(Language).@"enum".fields) |field| {
         const lang: Language = @enumFromInt(field.value);
-        const lang_mod = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        configureLanguage(b, lang_mod, lang, lua_dep_opt, quickjs_dep_opt);
-        const tests_root_mod = b.createModule(.{
-            .root_source_file = b.path("tests/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "labelle_scripting", .module = lang_mod },
-                .{ .name = "declare_core", .module = declare_core_mod },
-            },
-        });
-        // The pack hook shim's SOURCE, for the eval shared suite's AstGen
-        // compile check (tests/eval_shared_suite.zig): the file itself can
-        // only compile inside a generated game (it imports labelle-engine),
-        // so the suite `@embedFile`s it through this anonymous import and
-        // runs parse + AstGen — the strongest engine-free verification.
-        tests_root_mod.addAnonymousImport("console_eval_shim_src", .{
-            .root_source_file = b.path("packs/scripting_console/hooks/console_eval.zig"),
-        });
-        // Both manifests, for the shared suite's packaging-consistency pin:
-        // every unit plugin.labelle references (bundled packs, convention
-        // dirs) must be covered by build.zig.zon's `.paths` whitelist — a
-        // referenced-but-unshipped directory would hand consumers a
-        // manifest pointing at content their fetched copy doesn't have.
-        tests_root_mod.addAnonymousImport("plugin_labelle_src", .{
-            .root_source_file = b.path("plugin.labelle"),
-        });
-        tests_root_mod.addAnonymousImport("build_zig_zon_src", .{
-            .root_source_file = b.path("build.zig.zon"),
-        });
-        const tests = b.addTest(.{
-            .root_module = tests_root_mod,
-        });
-
-        // The rust binary's staticlib (labelle-engine#741): the suite links
-        // the crate the tests drive — the SHIPPED glue + labelle module
-        // (native/src/, recomposed by #[path] around tests/rust/game/'s
-        // scenario scripts; see tests/rust/src/lib.rs). cargo builds it
-        // with a persistent --target-dir under the zig cache so edits
-        // rebuild in cargo-incremental time; the Run step declares no
-        // outputs, so zig re-runs it every build and cargo's own
-        // staleness check (a few ms when clean) is the cache. `--locked`
-        // pins the committed Cargo.lock (zero deps — no network, ever).
-        // Local dev needs a rust toolchain (rustc ≥ 1.82), same as CI.
-        if (lang == .rust) {
-            const rust_target_dir = b.cache_root.join(
-                b.allocator,
-                &.{"rust-suite-target"},
-            ) catch @panic("OOM");
-            const cargo = b.addSystemCommand(&.{
-                "cargo",     "build",
-                "--release", "--quiet",
-                "--locked",  "--manifest-path",
-            });
-            cargo.addFileArg(b.path("tests/rust/Cargo.toml"));
-            cargo.addArgs(&.{ "--target-dir", rust_target_dir });
-            tests.step.dependOn(&cargo.step);
-            tests_root_mod.addObjectFile(.{ .cwd_relative = b.fmt(
-                "{s}/release/liblabelle_rust_scripts_test.a",
-                .{rust_target_dir},
-            ) });
-            // panic = "unwind" (load-bearing — the glue's catch_unwind is
-            // under test) needs an unwinder at link time. macOS: libSystem
-            // carries it (link_libc). Linux-gnu: rustc links libgcc_s for
-            // its staticlibs' _Unwind_* — mirror it here.
-            if (target.result.os.tag == .linux) {
-                tests_root_mod.linkSystemLibrary("gcc_s", .{});
+        // Labeled runtime block, not `continue`: skipping an iteration on
+        // a RUNTIME condition is comptime control flow inside an inline
+        // for (compile error) — breaking out of a runtime block is not.
+        wire: {
+            if (lang == .crystal and crystalTriple(b, target.result) == null) {
+                // No crystal story for this target (Windows host, wasm
+                // cross, exotic arch): skip BOTH crystal test binaries
+                // instead of aborting configuration — every other
+                // language still wires; CI's macOS/linux lanes keep
+                // crystal covered.
+                break :wire;
             }
-        }
+            const lang_mod = b.createModule(.{
+                .root_source_file = b.path("src/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            configureLanguage(b, lang_mod, lang, lua_dep_opt, quickjs_dep_opt);
+            const tests_root_mod = b.createModule(.{
+                .root_source_file = b.path("tests/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "labelle_scripting", .module = lang_mod },
+                    .{ .name = "declare_core", .module = declare_core_mod },
+                    .{ .name = "crystal_lib_paths", .module = crystal_lib_paths_mod },
+                },
+            });
+            // The pack hook shim's SOURCE, for the eval shared suite's AstGen
+            // compile check (tests/eval_shared_suite.zig): the file itself can
+            // only compile inside a generated game (it imports labelle-engine),
+            // so the suite `@embedFile`s it through this anonymous import and
+            // runs parse + AstGen — the strongest engine-free verification.
+            tests_root_mod.addAnonymousImport("console_eval_shim_src", .{
+                .root_source_file = b.path("packs/scripting_console/hooks/console_eval.zig"),
+            });
+            // Both manifests, for the shared suite's packaging-consistency pin:
+            // every unit plugin.labelle references (bundled packs, convention
+            // dirs) must be covered by build.zig.zon's `.paths` whitelist — a
+            // referenced-but-unshipped directory would hand consumers a
+            // manifest pointing at content their fetched copy doesn't have.
+            tests_root_mod.addAnonymousImport("plugin_labelle_src", .{
+                .root_source_file = b.path("plugin.labelle"),
+            });
+            tests_root_mod.addAnonymousImport("build_zig_zon_src", .{
+                .root_source_file = b.path("build.zig.zon"),
+            });
+            const tests = b.addTest(.{
+                .root_module = tests_root_mod,
+            });
 
-        const run_tests = b.addRunArtifact(tests);
-        test_step.dependOn(&run_tests.step);
+            // The rust binary's staticlib (labelle-engine#741): the suite links
+            // the crate the tests drive — the SHIPPED glue + labelle module
+            // (native/src/, recomposed by #[path] around tests/rust/game/'s
+            // scenario scripts; see tests/rust/src/lib.rs). cargo builds it
+            // with a persistent --target-dir under the zig cache so edits
+            // rebuild in cargo-incremental time; the Run step declares no
+            // outputs, so zig re-runs it every build and cargo's own
+            // staleness check (a few ms when clean) is the cache. `--locked`
+            // pins the committed Cargo.lock (zero deps — no network, ever).
+            // Local dev needs a rust toolchain (rustc ≥ 1.82), same as CI.
+            if (lang == .rust) {
+                const rust_target_dir = b.cache_root.join(
+                    b.allocator,
+                    &.{"rust-suite-target"},
+                ) catch @panic("OOM");
+                const cargo = b.addSystemCommand(&.{
+                    "cargo",     "build",
+                    "--release", "--quiet",
+                    "--locked",  "--manifest-path",
+                });
+                cargo.addFileArg(b.path("tests/rust/Cargo.toml"));
+                cargo.addArgs(&.{ "--target-dir", rust_target_dir });
+                tests.step.dependOn(&cargo.step);
+                tests_root_mod.addObjectFile(.{ .cwd_relative = b.fmt(
+                    "{s}/release/liblabelle_rust_scripts_test.a",
+                    .{rust_target_dir},
+                ) });
+                // panic = "unwind" (load-bearing — the glue's catch_unwind is
+                // under test) needs an unwinder at link time. macOS: libSystem
+                // carries it (link_libc). Linux-gnu: rustc links libgcc_s for
+                // its staticlibs' _Unwind_* — mirror it here.
+                if (target.result.os.tag == .linux) {
+                    tests_root_mod.linkSystemLibrary("gcc_s", .{});
+                }
+            }
+
+            // The crystal binary's script object (labelle-engine#741, second
+            // native language): the SHIPPED glue + labelle module recomposed
+            // around tests/crystal/game/'s scenario scripts by relative
+            // `require`s (tests/crystal/main.cr — crystal's spelling of the
+            // rust suite's #[path] recomposition). Two chained steps, the
+            // POC-proven recipe: `crystal build --cross-compile` emits an
+            // object (crystal has no --no-main, so it carries a `main`), then
+            // a localization pass demotes every symbol except the entry
+            // points so nothing collides with the test binary's own `main`.
+            // Objects land under the zig cache; crystal's own source cache
+            // (CRYSTAL_CACHE_DIR) plays cargo's staleness-check role.
+            if (lang == .crystal) {
+                const crystal_cache = b.cache_root.join(
+                    b.allocator,
+                    &.{"crystal-suite-target"},
+                ) catch @panic("OOM");
+                b.cache_root.handle.createDirPath(b.graph.io, "crystal-suite-target") catch @panic("mkdir crystal-suite-target");
+                const obj_base = b.fmt("{s}/labelle_crystal_scripts_test", .{crystal_cache});
+                const obj_path = b.fmt("{s}.o", .{obj_base});
+                const lib_obj_path = b.fmt("{s}_lib.o", .{obj_base});
+
+                const crystal_build = b.addSystemCommand(&.{
+                    "crystal",                         "build",
+                    "--cross-compile",                 "--target",
+                    crystalTriple(b, target.result).?,
+                });
+                crystal_build.addFileArg(b.path("tests/crystal/main.cr"));
+                crystal_build.addArgs(&.{ "-o", obj_base });
+
+                // Localize `main` (and every other non-entry symbol): the
+                // per-OS tools differ but the semantics are identical — the
+                // listed labelle_cr_* symbols stay global, everything else
+                // (main, the whole crystal runtime) goes local; UNDEFINED
+                // symbols (the contract externs, the suite's test-scenario
+                // export) stay linkable on both tools. The SHIPPED lists
+                // are used on purpose — the suite proving them sufficient
+                // is part of the coverage. The two files differ only in
+                // macOS's leading-underscore mangling.
+                const localize = switch (target.result.os.tag) {
+                    .macos => blk: {
+                        const step = b.addSystemCommand(&.{
+                            "ld",         "-r",
+                            obj_path,     "-o",
+                            lib_obj_path, "-exported_symbols_list",
+                        });
+                        step.addFileArg(b.path("native-crystal/exported_symbols_macos.txt"));
+                        break :blk step;
+                    },
+                    .linux => blk: {
+                        const step = b.addSystemCommand(&.{"objcopy"});
+                        step.addPrefixedFileArg(
+                            "--keep-global-symbols=",
+                            b.path("native-crystal/exported_symbols_linux.txt"),
+                        );
+                        step.addArgs(&.{ obj_path, lib_obj_path });
+                        break :blk step;
+                    },
+                    else => @panic("crystal language tests: unsupported host OS (desktop-only, macOS/linux)"),
+                };
+                localize.step.dependOn(&crystal_build.step);
+                tests.step.dependOn(&localize.step);
+                tests_root_mod.addObjectFile(.{ .cwd_relative = lib_obj_path });
+
+                // The search paths come from `crystal env
+                // CRYSTAL_LIBRARY_PATH` — a COLON-SEPARATED list
+                // (tools/crystal_lib_paths.zig is the splitting point,
+                // tested in the eval shared suite): each entry is exactly
+                // where `crystal build` itself points its link line (brew's
+                // /opt/homebrew/lib, the official linux tarball's bundled
+                // lib/crystal/, any user-prepended dirs). Resolved only when
+                // crystal exists so a crystal-less `zig build --help` still
+                // configures — the crystal_build step above is what fails
+                // loudly then. Collected once: two binaries link the object
+                // (below).
+                var crystal_lib_dirs: std.ArrayList([]const u8) = .empty;
+                if (b.findProgram(&.{"crystal"}, &.{}) catch null) |crystal_exe| {
+                    const lib_path_raw = b.run(&.{ crystal_exe, "env", "CRYSTAL_LIBRARY_PATH" });
+                    var lib_paths = crystal_lib_paths.iterate(lib_path_raw);
+                    while (lib_paths.next()) |entry| {
+                        crystal_lib_dirs.append(b.allocator, entry) catch @panic("OOM");
+                    }
+                }
+                linkCrystalRuntime(tests_root_mod, target.result.os.tag, crystal_lib_dirs.items);
+
+                // The BOOT-containment binary (tests/crystal_boot_suite.zig):
+                // a failed boot POISONS crystal scripting process-wide (see
+                // src/crystal/vm.zig's runtime_boot_poisoned), so its pin
+                // cannot share a process with the main suite — same localized
+                // object, same mock world, its own test binary.
+                const boot_root_mod = b.createModule(.{
+                    .root_source_file = b.path("tests/crystal_boot_suite.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                    .imports = &.{
+                        .{ .name = "labelle_scripting", .module = lang_mod },
+                    },
+                });
+                boot_root_mod.addObjectFile(.{ .cwd_relative = lib_obj_path });
+                linkCrystalRuntime(boot_root_mod, target.result.os.tag, crystal_lib_dirs.items);
+                const boot_tests = b.addTest(.{
+                    .root_module = boot_root_mod,
+                });
+                boot_tests.step.dependOn(&localize.step);
+                const run_boot_tests = b.addRunArtifact(boot_tests);
+                test_step.dependOn(&run_boot_tests.step);
+            }
+
+            const run_tests = b.addRunArtifact(tests);
+            test_step.dependOn(&run_tests.step);
+        }
     }
 
     // ── labelle-declare: the declare-mode schema extractor ──────────────
@@ -452,5 +597,68 @@ fn configureLanguage(
             // the module means a consumer's `b.dependency` never shells
             // out — external builds stay declared, auditable steps.
         },
+        .crystal => {
+            // Native-compiled, rust's twin: src/crystal/vm.zig declares
+            // the glue's labelle_cr_* externs; the object that defines
+            // them (native-crystal/'s sources carrying the GAME's
+            // crystal/ dir as its `game` module) is built by the two
+            // declared steps — crystal build, then main-localization —
+            // and linked onto the final binary the same two ways (the
+            // assembler's `.language_builds` steps in consumer games,
+            // the test-loop wiring in this repo's suite).
+        },
     }
+}
+
+/// The crystal runtime's system libraries + search paths — mirror of
+/// plugin.labelle's crystal `.system_libs`/`.library_paths` (what the
+/// assembler row will link in consumer games): bdw-gc always, pcre2
+/// because game scripts may use Regex, iconv on macOS only (String
+/// encodings; glibc builds it in), gcc_s on linux (the unwinder —
+/// crystal's begin/rescue needs _Unwind_*, and the object's references
+/// are libgcc's because crystal links through the gcc driver; same
+/// spelling the rust wiring uses for panic=unwind, proven on this
+/// repo's ubuntu lane — see the plugin.labelle crystal entry's comment
+/// for the full rationale). crystal 1.15+'s event loop is
+/// kqueue/epoll-native — no libevent. Shared by the two crystal test
+/// binaries (main suite + boot suite).
+fn linkCrystalRuntime(mod: *std.Build.Module, os_tag: std.Target.Os.Tag, lib_dirs: []const []const u8) void {
+    for (lib_dirs) |dir| {
+        mod.addLibraryPath(.{ .cwd_relative = dir });
+    }
+    mod.linkSystemLibrary("gc", .{});
+    mod.linkSystemLibrary("pcre2-8", .{});
+    switch (os_tag) {
+        .macos => mod.linkSystemLibrary("iconv", .{}),
+        else => {
+            mod.linkSystemLibrary("gcc_s", .{});
+            // glibc-hosted: crystal's own link line adds these (modern
+            // glibc folds most in, the stubs stay safe).
+            mod.linkSystemLibrary("pthread", .{});
+            mod.linkSystemLibrary("dl", .{});
+            mod.linkSystemLibrary("rt", .{});
+            mod.linkSystemLibrary("m", .{});
+        },
+    }
+}
+
+/// The `--target` triple `crystal build --cross-compile` needs, from the
+/// zig target — desktop-only, matching the crystal `.language_builds`
+/// entry's platform allowlist in plugin.labelle.
+/// Null when the target has no crystal story (desktop-only, macOS/linux,
+/// aarch64/x86_64) — callers SKIP rather than fail: this runs at build-
+/// script configure time for every language's test graph, so a panic here
+/// would abort `zig build --help` on a Windows host or a wasm cross for a
+/// game that never selected crystal.
+fn crystalTriple(b: *std.Build, t: std.Target) ?[]const u8 {
+    const arch = switch (t.cpu.arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+        else => return null,
+    };
+    return switch (t.os.tag) {
+        .macos => b.fmt("{s}-apple-darwin", .{arch}),
+        .linux => b.fmt("{s}-linux-gnu", .{arch}),
+        else => null,
+    };
 }

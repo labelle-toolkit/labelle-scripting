@@ -12,6 +12,7 @@
 const std = @import("std");
 const scripting = @import("labelle_scripting");
 const mock = @import("mock_world.zig");
+const crystal_lib_paths = @import("crystal_lib_paths");
 const eval = scripting.eval;
 
 const expect = std.testing.expect;
@@ -287,6 +288,29 @@ test "packaging: build.zig.zon ships every directory plugin.labelle references" 
     for (pm.convention_dirs) |cd| {
         if (cd.mode == .ship_from_plugin) try expect(ships(bz.paths, cd.name));
     }
+    // Every `{package}/<dir>/…` reference in the manifest (the
+    // `.language_builds` steps' commands and symbol lists — rust's
+    // native/, crystal's native-crystal/) runs against the CONSUMER's
+    // fetched copy too. A raw-source scan beats modeling the whole step
+    // schema here: any first path segment after a {package}/ marker
+    // must be shipped — this catches the "declared a build step,
+    // forgot the tarball" gap for every current and future language.
+    {
+        var found_package_refs: usize = 0;
+        var search: []const u8 = plugin_src;
+        while (std.mem.indexOf(u8, search, "{package}/")) |at| {
+            const rest = search[at + "{package}/".len ..];
+            const seg_end = std.mem.indexOfAny(u8, rest, "/\"") orelse rest.len;
+            try expect(ships(bz.paths, rest[0..seg_end]));
+            found_package_refs += 1;
+            search = rest;
+        }
+        // The manifest DOES declare package-relative build inputs today
+        // (rust; crystal's entry is HELD for the assembler release that
+        // parses its schema features — see plugin.labelle's note) —
+        // keeps the scan meaningful.
+        try expect(found_package_refs >= 1);
+    }
 
     // And the manifest DOES reference the console pack today — keeps the
     // cross-check meaningful (deleting `.packs` should revisit this test).
@@ -366,4 +390,36 @@ test "packaging: the language schema vocabulary IS build.zig's Language enum" {
         }
     }
     try expect(found);
+}
+
+// ── build support: CRYSTAL_LIBRARY_PATH splitting ────────────────────
+
+test "crystal_lib_paths: colon-separated env values yield one path per entry" {
+    // `crystal env CRYSTAL_LIBRARY_PATH` is a colon-separated LIST (the
+    // brew/tarball single-dir case is just its one-entry degenerate);
+    // build.zig walks this iterator to addLibraryPath each entry, and
+    // the assembler's {crystal_env:CRYSTAL_LIBRARY_PATH} splice row owes
+    // the same split. A whole-value path would survive every single-dir
+    // machine and silently lose gc/pcre2 on the first multi-entry
+    // environment — exactly the drift this pin exists to catch.
+    const Case = struct { value: []const u8, want: []const []const u8 };
+    const cases = [_]Case{
+        // The multi-entry environment (a user override prepending a dir).
+        .{ .value = "/custom/libs:/opt/crystal/lib\n", .want = &.{ "/custom/libs", "/opt/crystal/lib" } },
+        // The common single-dir output, trailing newline included.
+        .{ .value = "/opt/homebrew/lib\n", .want = &.{"/opt/homebrew/lib"} },
+        // Empty segments (leading/doubled/trailing colons) are skipped,
+        // not handed to the linker as "" paths.
+        .{ .value = "::/a/b::\n", .want = &.{"/a/b"} },
+        // A blank value yields no paths at all.
+        .{ .value = "  \n", .want = &.{} },
+    };
+    for (cases) |case| {
+        var it = crystal_lib_paths.iterate(case.value);
+        for (case.want) |want| {
+            const got = it.next() orelse return error.TestExpectedEntry;
+            try expectEqualStrings(want, got);
+        }
+        try expectEqual(@as(?[]const u8, null), it.next());
+    }
 }

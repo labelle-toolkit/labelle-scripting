@@ -20,7 +20,7 @@ Every language binds the engine's **Script Runtime Contract** (`labelle-engine/c
 | `ruby` (mruby 3.4) | ✅ done (labelle-engine#742) — vendored mruby, controllers + Component.ref + FrameArray, tested against the same mock host |
 | `typescript` (QuickJS) | ✅ done (labelle-engine#745) — quickjs-ng 0.15, ES-module scripts, BigInt ids, typed via contract/labelle.d.ts, tested against the same mock host (plain JS at runtime; the TS→JS transpile hook is assembler#586) |
 | `rust` (staticlib) | ✅ done (labelle-engine#741) — first native-compiled sub-module: game `rust/` sources cargo-built into the shipped crate (`native/`), `Script` trait + safe wrappers, panics caught at every FFI entry, tested against the same mock host AND end-to-end (`examples/rust-game` through the assembler's native-language splice, labelle-assembler ≥ v0.84.0) |
-| `crystal` | planned (rust's build-hook + splice shape, plus the POC's embedding rules) |
+| `crystal` (localized object) | ✅ done (labelle-engine#741) — second native-compiled sub-module on rust's skeleton: game `crystal/` sources built by `crystal build --cross-compile` + a main-localization pass into a linkable object, `Labelle::Script` class + safe wrappers, every raise rescued at every FFI entry, GC collections enabled (host-thread runtime boot), tested against the same mock host (assembler crystal-splice row is the follow-up) |
 | `go` (c-archive) | planned |
 | `csharp` (CoreCLR) | planned — last |
 
@@ -432,6 +432,118 @@ native-language splice (labelle-assembler ≥ v0.84.0): it stages your
 `plugin.labelle` (`.language_builds` — cargo → staticlib →
 `addObjectFile`, desktop-first). `examples/rust-game` is the running
 proof. Needs a rust toolchain (rustc ≥ 1.82) wherever the game builds.
+
+## Using the crystal sub-module
+
+Build with `-Dlanguage=crystal` — the second **native-compiled**
+sub-module (labelle-engine#741), on rust's exact skeleton. One v1
+scope rule first: game scripts should stick to crystal's core stdlib
+(`Regex` included — pcre2 ships in the declared system libs). The
+OPTIONAL stdlib native deps (OpenSSL, YAML, Compress/zlib, …) need
+system libraries the plugin's fixed manifest list cannot predict —
+using them fails at final link with unresolved symbols naming the
+library; generate-time capture of crystal's printed link line is the
+planned follow-up. Your game's
+`crystal/` dir is compiled by `crystal build --cross-compile` together
+with the sources this plugin ships (`native-crystal/` — the `Labelle`
+module and the entry-point glue) as its `Game` module; because crystal
+has no `--no-main`, a second build step localizes the object's own
+`main` (and every other symbol) away — `ld -r -exported_symbols_list`
+on macOS, `objcopy --keep-global-symbols` on linux — leaving exactly
+the `labelle_cr_*` entry points, and the resulting object links into
+the game binary. The contract header IS the binding, exactly as for
+rust: `lib LibLabelle` declares the `labelle_*` symbols and they
+resolve against the host's exports in the same binary. The plugin's
+Zig side is the same thin dispatcher (`src/crystal/vm.zig`), plus one
+crystal-only leg: a ONE-TIME runtime boot at first setup (`GC.init` +
+`Crystal.init_runtime` + `Crystal.main_user_code` — GC stack
+registration on the game's main thread and the program's top-level
+constant initializers; the labelle-engine#734 POC's sharp edges, all
+institutionalized in the glue).
+
+Your `crystal/game.cr` implements one convention entry point; scripts
+are classes inheriting `Labelle::Script`, state in instance vars:
+
+```crystal
+class Player < Labelle::Script
+  @e : Labelle::EntityId = 0_u64
+  @pos = Labelle::Buffer.new # reused every tick — steady state allocates nothing
+
+  def init : Nil
+    @e = Labelle.create_entity
+    Labelle.set_component(@e, "Position", %({"x":0,"y":0}))
+    Labelle.subscribe("cargo__delivered")
+  end
+
+  def on_event(name : String, payload : String) : Nil
+    Labelle.log("got #{payload}") if name == "cargo__delivered"
+  end
+
+  def update(dt : Float32) : Nil
+    Labelle.get_component_into(@e, "Position", @pos)
+    # parse from @pos.to_slice, mutate, set — ids are UInt64 END TO END
+    # (no BigInt/bitcast caveats; never let one near to_i64 or a float).
+  end
+end
+
+module Game
+  def self.register(scripts : Labelle::Scripts)
+    scripts.add "player", Player.new
+  end
+end
+```
+
+**A failed runtime boot fails loudly and stays failed.** The boot
+reports which stage raised (GC.init / init_runtime / top-level
+initialization — a game constant initializer throwing lands here);
+setup errors, no scripts run, and crystal scripting stays disabled for
+the process — a partial boot cannot be retried (a top-level re-run
+over the half-initialized first pass crashes in GC collections; the
+boot suite pins this). Fix the reported stage and restart.
+
+**Exceptions never cross the FFI boundary.** Every glue entry point
+(and every script hook individually) runs under begin/rescue: a raise
+in `init` logs and EVICTS the script; a raise in `update`/`on_event`
+logs every tick and the script stays; siblings always keep running —
+the same isolation story as rust's panics (an escape would kill the
+process: crystal finds no handler in the host's foreign frames). You
+get the exception class and message in the game log; backtraces are
+deliberately dropped (their decode reads the executable image — an
+embedding hazard for near-zero value).
+
+**The GC runs with collections enabled** — the boot registers the host
+thread's stack with bdw-gc, and the suite forces `GC.collect` on every
+tick of a churn workload to keep it that way. Two rules of the road:
+no top-level statements with world side effects (the top level runs
+once at runtime boot, not at script setup), and hold reused
+`Labelle::Buffer`s in instance vars (`get_component_into`,
+`query_into` grow them at most once — the rust `Vec` idiom, crystal-
+spelled).
+
+**No console eval**: compiled code can't be evaluated — the studio
+Script Console gets a documented `ok:false` refusal.
+
+**End-to-end wiring** (generate → crystal build → localize → link)
+rides the assembler's native-language splice — the same #741 follow-up
+as rust: it stages your `crystal/` over the staged package's
+`native-crystal/src/game/`, passes `-Dlanguage=crystal`, and runs the
+two steps declared in this repo's `plugin.labelle` (`.language_builds`
+— crystal build → `ld -r`/objcopy → `addObjectFile`, desktop-first).
+Until that assembler release, the sub-module is fully usable against
+the mock host and via hand-wiring (build and localize the object
+yourself, as build.zig's own test wiring demonstrates). Needs a
+crystal toolchain (≥ 1.16 — `Crystal.init_runtime`) wherever the game
+builds.
+
+**A stability note, stated plainly**: crystal has no public embedding
+API — `Crystal.init_runtime` and `Crystal.main_user_code` are
+`:nodoc:` internals and may change between crystal releases. That is
+the deal the whole native-crystal story rides on (the POC chose them
+because nothing supported exists), and the guard is the version pin:
+CI builds against a pinned crystal (1.17), the boot handshake fails
+fast on drift, and any toolchain bump goes through this repo's full
+suite before consumers see it. Treat crystal version bumps as
+deliberate, reviewed changes — never incidental.
 
 ## Studio Script Console (eval)
 
