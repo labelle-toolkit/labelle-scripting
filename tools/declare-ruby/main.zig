@@ -39,7 +39,10 @@ const MAX_SCRIPT_BYTES = 4 * 1024 * 1024;
 const usage =
     \\labelle-declare-ruby — extract script-declared components as schema JSON
     \\
-    \\Usage: labelle-declare-ruby <script.rb> [more.rb ...]
+    \\Usage: labelle-declare-ruby [--cache-dir <dir>] <script.rb> [more.rb ...]
+    \\
+    \\--cache-dir is accepted and ignored (the assembler's generic declare
+    \\contract hands every runner a workspace; an embedded VM needs none).
     \\
     \\Runs each chunk body against the declare stub (only `Labelle` is in
     \\scope; init/update/controllers never run) and prints the schema on
@@ -68,6 +71,17 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try std.Io.File.stderr().writeStreamingAll(io, usage);
             return;
+        }
+        // The assembler's generic `.languages` declare invocation contract
+        // (RFC-LANGUAGE-PLUGINS rev 17 §7, labelle-engine#619) passes a
+        // persistent per-project workspace as a leading `--cache-dir <dir>`.
+        // A native compile-and-run probe uses it as a cargo target-dir; this
+        // embedded mruby extractor has no build to warm, so it ACCEPTS and
+        // IGNORES the flag + its value — the assembler stays language-blind,
+        // handing every runner (embedded or native) the identical argv.
+        if (std.mem.eql(u8, arg, "--cache-dir")) {
+            _ = args.next(); // skip the value; embedded VMs need no workspace
+            continue;
         }
         const path = try allocator.dupe(u8, arg);
         errdefer allocator.free(path);

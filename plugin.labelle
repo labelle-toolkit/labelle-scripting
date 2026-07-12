@@ -37,14 +37,35 @@
     // assembler changes). Old assemblers ignore this unknown key and keep
     // their hardcoded runner table (the documented forward-compat).
     //
-    // Only `rust` is listed today: it is the first native declare lane
-    // (#774), and its tool (tools/declare-rs) is a real self-contained exe
-    // (`zig build labelle-declare-rs`). The lua/ruby/typescript rows migrate
-    // off the assembler's hardcoded DECLARE_RUNNERS table with the rest of
-    // #619 — adding them here before the assembler's generic reader can
-    // distinguish "generic-path" from "fallback" rows would double-declare
-    // them, so they wait for that slice.
+    // The DECLARE-capable languages migrate here off the assembler's
+    // hardcoded DECLARE_RUNNERS table (labelle-engine#619 declare slice):
+    // `lua`, `ruby` (both embedded), and `rust` (native, #774) each declare
+    // through the IDENTICAL `.declare = { .tool, .dir, .events }` shape. An
+    // embedded VM's declare tool ignores the assembler's persistent
+    // `--cache-dir` (it has no build workspace to warm); a native probe uses
+    // it as a cargo target-dir — but the assembler passes the same argv to
+    // all three and never learns the difference. The `min_pin`/
+    // `events_min_pin` version tables the assembler used to carry dissolve
+    // into the self-describing `.events` flag: an old pin's manifest either
+    // predates `.languages` (→ the assembler's FROZEN fallback table handles
+    // it) or carries `.declare` without `.events`, and either way the
+    // events-support answer lives in the resolved manifest, not an
+    // assembler-side semver compare.
+    //
+    // `typescript` (embedded) has no `.languages` row yet: it ships no
+    // declare tool (its `components/*.zig` are hand-written), and its
+    // transpile toolchain-pin capability is a separate #619 slice still
+    // pending an RFC-pinned schema — adding a row with a `.declare` pointing
+    // at a non-existent tool, or a `.transpile` the assembler can't yet
+    // consume generically, would be inventing an unspecified contract.
+    // `crystal` lands its native declare row with #775.
     .languages = .{
+        .{ .name = "lua", .extensions = .{"lua"}, .kind = .embedded,
+           .declare = .{ .tool = "labelle-declare", .dir = "tools/declare",
+                         .events = true } }, // embedded VM ignores the probe cache dir
+        .{ .name = "ruby", .extensions = .{"rb"}, .kind = .embedded,
+           .declare = .{ .tool = "labelle-declare-ruby", .dir = "tools/declare-ruby",
+                         .events = true } },
         .{ .name = "rust", .extensions = .{"rs"}, .kind = .native,
            .module_root = "mod.rs", // scripts/mod.rs; build steps stay in .language_builds
            .declare = .{ .tool = "labelle-declare-rs", .dir = "tools/declare-rs",
