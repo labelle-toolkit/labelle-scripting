@@ -169,6 +169,44 @@ pub const crystal_events_source =
     \\Labelle.event "wave__spawned"
 ;
 
+// The typescript spelling (labelle-engine#773, rev 20). Like lua/ruby it runs
+// in-process — quickjs is embedded, so tests/declare_ts_tool.zig evals these
+// module sources DIRECTLY through the `declare_ts_core` extractor (no tsc in
+// scripting CI: the source is self-contained, annotation-free ESM). Under the
+// assembler's rev-20 option (b) the tool receives the EMITTED `.js`, but the
+// declaration DSL is plain runnable JS either way, so the golden evaluates the
+// authored ESM as-is. JS has ONE Number type, so the int/float split the
+// schema needs is spelled by JS types: a `number` literal (12.5, 1.0, 1e-05)
+// → f32, a `bigint` literal (3n, 7n) → i32, `labelle.id` → u64 — mirroring
+// lua/ruby's float/int inference and this codebase's "ids are BigInt"
+// convention. Game-shaped: NO `import` lines (the tool provides `labelle` as a
+// global; tests/declare_ts_tool.zig's drift pin proves the absence).
+pub const ts_path = "scripts/kinematics.ts";
+pub const ts_source =
+    \\export const Kinematics = labelle.component("Kinematics", {
+    \\  speed: 12.5,
+    \\  accel: 1.0,
+    \\  tiny: 1e-05,
+    \\  huge: 3.4e38,
+    \\  jump_count: 3n,
+    \\  min_i32: -2147483648n,
+    \\  max_i32: 2147483647n,
+    \\  grounded: true,
+    \\  home: { x: -0.5, y: 7n },
+    \\  label: "he said \"hi\"\n\ttab\\done",
+    \\  owner: labelle.id,
+    \\});
+    \\export const HungerFeed = labelle.event("hunger__feed", {
+    \\  entity: labelle.id,
+    \\  amount: 0.5,
+    \\  urgent: false,
+    \\  reason: "why \"now\"",
+    \\  at: { x: -1.5, y: 3n },
+    \\});
+    \\labelle.component("Dead", {}, { persist: "transient" });
+    \\labelle.event("wave__spawned", {});
+;
+
 pub const expected_json =
     \\{"components":[{"name":"Kinematics","persist":"persistent","fields":[{"name":"accel","type":"f32","default":1.0},{"name":"grounded","type":"bool","default":true},{"name":"home","type":"vec2","default":{"x":-0.5,"y":7}},{"name":"huge","type":"f32","default":3.4e+38},{"name":"jump_count","type":"i32","default":3},{"name":"label","type":"str","default":"he said \"hi\"\n\ttab\\done"},{"name":"max_i32","type":"i32","default":2147483647},{"name":"min_i32","type":"i32","default":-2147483648},{"name":"owner","type":"u64","default":0},{"name":"speed","type":"f32","default":12.5},{"name":"tiny","type":"f32","default":1e-05}]},{"name":"Dead","persist":"transient","fields":[]}],"events":[{"name":"hunger__feed","fields":[{"name":"amount","type":"f32","default":0.5},{"name":"at","type":"vec2","default":{"x":-1.5,"y":3}},{"name":"entity","type":"u64","default":0},{"name":"reason","type":"str","default":"why \"now\""},{"name":"urgent","type":"bool","default":false}]},{"name":"wave__spawned","fields":[]}]}
 ;

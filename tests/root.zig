@@ -55,6 +55,16 @@ comptime {
     if (scripting.language == .ruby) _ = @import("declare_ruby_tool.zig");
 }
 
+// The TYPESCRIPT declare runner's goldens (tools/declare-ts via
+// `declare_ts_core`) ride the TYPESCRIPT binary the same way (labelle-engine
+// #773, rev 20): its JS_* externs resolve against the quickjs objects the
+// typescript-language module compiled in. Like lua/ruby it RUNS in-process
+// (unlike the rust/crystal probes); the cross-runner byte-parity golden lives
+// in tests/declare_cross_golden.zig's shared expected-JSON literal.
+comptime {
+    if (scripting.language == .typescript) _ = @import("declare_ts_tool.zig");
+}
+
 // The RUST declare runner's golden (labelle-engine#774) rides the RUST binary
 // only. It needs no in-process externs — the runner is an out-of-process probe
 // build.zig cargo-builds and RUNS, `@embedFile`ing its stdout — but the gate

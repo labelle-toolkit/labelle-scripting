@@ -178,6 +178,20 @@ declare const labelle: {
   component(name: string, spec?: object, opts?: object): ComponentRef;
 
   /**
+   * Declare a custom event (build-time schema for the declare runner; the
+   * event-name string at runtime, usable anywhere emit/on take a name):
+   *   const HungerFeed = labelle.event("hunger__feed", { entity: labelle.id, amount: 0.5 });
+   *   labelle.emit(HungerFeed, { entity: e.id, amount: 1.0 });
+   */
+  event(name: string, spec?: object): string;
+
+  /**
+   * The entity-id field marker for declarations (`entity: labelle.id` ⇒ a
+   * u64 id field, default 0). Plain 0 at runtime — specs are ignored there.
+   */
+  id: number;
+
+  /**
    * An id's unsigned decimal string. BigInt ids already print unsigned
    * (`${e.id}`) — this ships for cross-language payload parity and for
    * Number-held ids.
