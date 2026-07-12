@@ -1,0 +1,44 @@
+// C# example game (labelle-engine#743) — the CoreCLR-hosted counterpart of
+// examples/rust-game and examples/crystal-game: scripts/*.cs drive the REAL
+// engine through the Script Runtime Contract from the assembler's generated
+// main, headless over the null backend. Unlike the native family, C# scripts
+// are not linked into the binary — the plugin's declared `.language_builds`
+// `dotnet publish` step compiles scripts/ (staged over the plugin package's
+// native-csharp/src/game/) into labelle_csharp_scripts.dll BESIDE the binary,
+// and src/csharp/vm.zig loads it at runtime through hostfxr.
+//
+// STATUS: this example is documentation-first. The assembler's native-language
+// splice does not yet recognize `csharp` (no released assembler row —
+// labelle-engine#743 tracks the assembler follow-up), so unlike ruby/rust/
+// crystal there is no CI job generating + building + running it YET. The
+// plugin side (src/csharp/, native-csharp/) IS verified end to end by
+// `zig build test` (the csharp suite drives the managed assembly through
+// hostfxr against the mock host). Wire a `csharp-example` CI job once the
+// assembler lands the csharp splice + EMBED/build row.
+.{
+    .name = "csharp_game",
+    .title = "LaBelle — C# Example Game (null backend)",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    // Headless: no window, no GPU, no input. Bounded by LABELLE_NULL_FRAMES.
+    .backend_package = .{ .name = "null", .repo = "local:../../../labelle-null" },
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    // The scripting plugin resolved from the repo root two levels up — the
+    // working tree under test — selecting csharp. C# has no declare mode
+    // (compiled assembly, no embedded source to extract); `Hunger` is a real
+    // components/*.zig file the C# scripts address by name over the contract.
+    .plugins = .{
+        .{
+            .name = "scripting",
+            .repo = "local:../..",
+            .params = .{ .language = "csharp" },
+        },
+    },
+    .core_version = "1.26.0",
+    .engine_version = "2.5.0",
+    .gfx_version = "1.28.1",
+}
