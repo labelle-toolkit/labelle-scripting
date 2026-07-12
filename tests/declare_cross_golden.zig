@@ -207,6 +207,59 @@ pub const ts_source =
     \\labelle.event("wave__spawned", {});
 ;
 
+// The C# spelling (labelle-scripting#27, labelle-engine#743) — rust's / crystal's
+// CoreCLR-family TWIN. C# is compiled, so its declare tool (labelle-declare-
+// csharp) is the same "compile-and-run probe": it `dotnet build`s the declaration
+// files it is handed. The assembler hands it components/*.cs then events/*.cs
+// (argv order = registration order), so the canonical spelling splits into a
+// GAME-SHAPED component file and event file — attributed `record`s with public-
+// field defaults and NO `using` lines (the declare surface `[LabelleComponent]`
+// / `[LabelleEvent]` / `Vec2` is GLOBAL; a real game omits imports, the tool
+// injects nothing). A float default is spelled `double` so its as-written decimal
+// formats at full f64 precision (schema type is still f32 — matching rust's
+// bind-to-f64 rule); `int`→i32, `bool`, `string`→str, `Vec2`→vec2, and `ulong`
+// stands where lua/ruby wrote the `labelle.id` marker (ids default 0). The record
+// TYPE NAME is the component/event name (a lowercase `record hunger__feed` is
+// legal — these records are DECLARE-ONLY, never a runtime type).
+// tests/declare_csharp_tool.zig runs the tool over the tools/declare-csharp/
+// testdata fixtures, pins its stdout against `expected_json`, and drift-pins each
+// fixture against the block below.
+pub const csharp_components_source =
+    \\[LabelleComponent]
+    \\record Kinematics
+    \\{
+    \\    public double speed = 12.5;
+    \\    public double accel = 1.0;
+    \\    public double tiny = 1e-05;
+    \\    public double huge = 3.4e38;
+    \\    public int jump_count = 3;
+    \\    public int min_i32 = -2147483648;
+    \\    public int max_i32 = 2147483647;
+    \\    public bool grounded = true;
+    \\    public Vec2 home = new(-0.5, 7.0);
+    \\    public string label = "he said \"hi\"\n\ttab\\done";
+    \\    public ulong owner = 0;
+    \\}
+    \\
+    \\[LabelleComponent(Persist.Transient)]
+    \\record Dead;
+;
+
+pub const csharp_events_source =
+    \\[LabelleEvent]
+    \\record hunger__feed
+    \\{
+    \\    public ulong entity = 0;
+    \\    public double amount = 0.5;
+    \\    public bool urgent = false;
+    \\    public string reason = "why \"now\"";
+    \\    public Vec2 at = new(-1.5, 3.0);
+    \\}
+    \\
+    \\[LabelleEvent]
+    \\record wave__spawned;
+;
+
 pub const expected_json =
     \\{"components":[{"name":"Kinematics","persist":"persistent","fields":[{"name":"accel","type":"f32","default":1.0},{"name":"grounded","type":"bool","default":true},{"name":"home","type":"vec2","default":{"x":-0.5,"y":7}},{"name":"huge","type":"f32","default":3.4e+38},{"name":"jump_count","type":"i32","default":3},{"name":"label","type":"str","default":"he said \"hi\"\n\ttab\\done"},{"name":"max_i32","type":"i32","default":2147483647},{"name":"min_i32","type":"i32","default":-2147483648},{"name":"owner","type":"u64","default":0},{"name":"speed","type":"f32","default":12.5},{"name":"tiny","type":"f32","default":1e-05}]},{"name":"Dead","persist":"transient","fields":[]}],"events":[{"name":"hunger__feed","fields":[{"name":"amount","type":"f32","default":0.5},{"name":"at","type":"vec2","default":{"x":-1.5,"y":3}},{"name":"entity","type":"u64","default":0},{"name":"reason","type":"str","default":"why \"now\""},{"name":"urgent","type":"bool","default":false}]},{"name":"wave__spawned","fields":[]}]}
 ;

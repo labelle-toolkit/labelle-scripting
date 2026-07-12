@@ -84,6 +84,18 @@ comptime {
     if (scripting.language == .crystal) _ = @import("declare_crystal_tool.zig");
 }
 
+// The CSHARP declare runner's golden (labelle-scripting#27, labelle-engine#743)
+// rides the CSHARP binary only — rust's / crystal's CoreCLR-family twin. Like
+// them it needs no in-process externs (the runner is an out-of-process probe
+// build.zig `dotnet build`s and RUNS, `@embedFile`ing its stdout), and build.zig
+// wires the three anonymous imports (captured output + the two compiled fixtures)
+// only where the .NET SDK exists and the target is desktop (lang == .csharp,
+// dotnet present) — the same gate that governs whether the csharp binary is
+// built at all.
+comptime {
+    if (scripting.language == .csharp) _ = @import("declare_csharp_tool.zig");
+}
+
 // The console-eval SHARED-code suite (response builder, params decoding,
 // hook-shim AstGen check — labelle-scripting#4) also rides the lua binary
 // only: the code under test is language-independent, so one mirror is the

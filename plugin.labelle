@@ -136,6 +136,30 @@
            .stage_subdir = "native-crystal/src/game",   // rev 19 B1: the plugin-crate dir game sources link over; build steps stay in .language_builds
            .declare = .{ .tool = "labelle-declare-crystal", .dir = "tools/declare-crystal",
                          .events = true } },
+        // csharp (labelle-engine#743, the epic's FINAL language) — a CoreCLR
+        // HOST in the SAME `.kind = .native` family as rust/crystal: the
+        // assembler stages the game's scripts/ over `.stage_subdir`
+        // (native-csharp/src/game) and runs the `.language_builds` `dotnet
+        // publish` step exactly as it stages+builds rust/crystal — the ONLY
+        // difference (a runtime hostfxr LOAD of the emitted managed .dll instead
+        // of a link-time staticlib) lives inside the plugin's src/csharp/vm.zig
+        // and the build step declaring no `.artifact`/`.link` (a `.link = .none`
+        // step just runs; the game binary depends on it), NEITHER of which the
+        // assembler's native consume path sees. So no new `.kind` and no RFC
+        // extension: the native staging + build + declare are identical. The
+        // module root is the game's `scripts/Game.cs` (its `Game.Register`
+        // entry, staged over the plugin's native-csharp/src/game/Game.cs
+        // placeholder). It DECLARES components + events through the IDENTICAL
+        // `.declare = { .tool, .dir, .events }` shape (labelle-scripting#27), its
+        // compile-and-run probe (labelle-declare-csharp) internal to the tool
+        // exe exactly as rust's/crystal's is — the assembler passes the same
+        // argv (declaration files + persistent --cache-dir) and never learns
+        // "csharp" or "dotnet".
+        .{ .name = "csharp", .extensions = .{".cs"}, .kind = .native,
+           .module_root = "Game.cs",                   // scripts/Game.cs (Game.Register — the CoreCLR game module root)
+           .stage_subdir = "native-csharp/src/game",   // rev 19 B1: the plugin-crate dir game sources stage over; build steps stay in .language_builds
+           .declare = .{ .tool = "labelle-declare-csharp", .dir = "tools/declare-csharp",
+                         .events = true } },
     },
     // Per-LANGUAGE build steps (labelle-engine#741, native-compiled
     // family) — the #586 `.build` Step schema, applied only when the
