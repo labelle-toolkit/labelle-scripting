@@ -604,6 +604,56 @@ test "Labelle.component at runtime: the declare DSL line yields a working ref-pa
     try expectComponent(1, "Tag", "{\"kind\":\"worker\"}");
 }
 
+test "view construction rejects >32 fields at the defining line, never as a late get/set raise" {
+    // The runtime half of the field-cap parity (the declare half is
+    // tests/declare_ruby_tool.zig's): the raw fast path sizes per-call
+    // buffers by bindings.zig's MAX_REF_FIELDS=32, so an over-wide view
+    // would construct fine and then raise inside EVERY get_into/set —
+    // Component.__view rejects it at construction instead, for both
+    // spellings, and the failing chunk is evicted with the pointed
+    // message naming the defining line.
+    fresh();
+    scripting.registerScript("wide_dsl",
+        \\spec = {}
+        \\33.times { |i| spec["f%02d" % i] = 0 }
+        \\WideDsl = Labelle.component("WideDsl", spec)
+    );
+    // The explicit-fields v0.2 spelling trips the same construction check.
+    scripting.registerScript("wide_ref",
+        \\fields = []
+        \\33.times { |i| fields << ("g%02d" % i).to_sym }
+        \\WideRef = Labelle::Component.ref("WideRef", *fields)
+    );
+    // Exactly 32 is the edge the raw fast path accepts: construct, fill
+    // by index, set from the view, refill into a fresh instance.
+    scripting.registerScript("cap_edge",
+        \\spec = {}
+        \\32.times { |i| spec["f%02d" % i] = 0 }
+        \\Wide32 = Labelle.component("Wide32", spec)
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  w = Wide32.new
+        \\  32.times { |i| w[i] = i }
+        \\  raise "wide set refused" unless e.set(w)
+        \\  w2 = Wide32.new
+        \\  raise "wide get_into failed" if e.get_into(Wide32, w2).nil?
+        \\  raise "wide field mismatch" unless w2.f00 == 0 && w2.f31 == 31
+        \\  e.set("CapOk", ok: true)
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Both over-wide scripts failed AT LOAD, message + defining line...
+    try expect(mock.logsContain("component 'WideDsl' has 33 fields"));
+    try expect(mock.logsContain("wide_dsl:3"));
+    try expect(mock.logsContain("component 'WideRef' has 33 fields"));
+    try expect(mock.logsContain("wide_ref:3"));
+    try expect(mock.logsContain("split the component"));
+    // ...and the 32-field edge drove the whole fast path.
+    try expectComponent(1, "CapOk", "{\"ok\":true}");
+}
+
 test "controllers: registration order, LIFO teardown, setup eviction" {
     fresh();
     scripting.registerScript("controller_alpha", @embedFile("ruby/controller_alpha.rb"));

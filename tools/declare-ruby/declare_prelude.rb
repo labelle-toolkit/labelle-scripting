@@ -85,6 +85,17 @@ module Labelle
   F32_MAX = 3.4028235e38
   INF = 1.0 / 0.0
 
+  # The ruby view fast path's field cap — MUST equal MAX_REF_FIELDS in
+  # src/ruby/bindings.zig (raw_component_get_into/set_from size their
+  # per-call field buffers by it) and the runtime prelude's twin literal
+  # (src/ruby/prelude.rb, the construction-time check). Declare mode
+  # enforces it too, so an over-wide component fails ON ITS DECLARATION
+  # LINE at build time, never as a late get/set raise at runtime — the
+  # dual-consumer contract must not split-brain. Different languages, so
+  # no shared source: tests/declare_ruby_tool.zig's drift pin reads all
+  # three literals out of their sources and asserts equality.
+  MAX_VIEW_FIELDS = 32
+
   # ── the Zig driver's three seams (extract.zig) ───────────────────────
 
   def self.__declare_seed(name, file)
@@ -277,6 +288,15 @@ module Labelle
         end
         persist = vs
       end
+    end
+
+    # The view fast path's cap, enforced where the failure can name the
+    # declaration: past it, the SAME line's runtime half would construct a
+    # view whose every get_into/set raises (bindings.zig MAX_REF_FIELDS).
+    if spec.size > MAX_VIEW_FIELDS
+      raise ArgumentError, "Labelle.component: component '" + name + "' has " + spec.size.to_s +
+                           " fields — the ruby view fast path supports at most " +
+                           MAX_VIEW_FIELDS.to_s + " fields; split the component"
     end
 
     fields = []      # [[name, type, default-json], ...] — sorted below
