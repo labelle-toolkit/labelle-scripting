@@ -30,7 +30,10 @@ const MAX_SCRIPT_BYTES = 4 * 1024 * 1024;
 const usage =
     \\labelle-declare — extract script-declared components as schema JSON
     \\
-    \\Usage: labelle-declare <script.lua> [more.lua ...]
+    \\Usage: labelle-declare [--cache-dir <dir>] <script.lua> [more.lua ...]
+    \\
+    \\--cache-dir is accepted and ignored (the assembler's generic declare
+    \\contract hands every runner a workspace; an embedded VM needs none).
     \\
     \\Runs each chunk body against the declare stub (only `labelle` is in
     \\scope; init/update never run) and prints the schema on stdout.
@@ -58,6 +61,23 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try std.Io.File.stderr().writeStreamingAll(io, usage);
             return;
+        }
+        // The assembler's generic `.languages` declare invocation contract
+        // (RFC-LANGUAGE-PLUGINS rev 17 §7, labelle-engine#619) passes a
+        // persistent per-project workspace as a leading `--cache-dir <dir>`.
+        // A native compile-and-run probe uses it as a cargo target-dir; this
+        // embedded Lua extractor has no build to warm, so it ACCEPTS and
+        // IGNORES the flag + its value — the assembler stays language-blind,
+        // handing every runner (embedded or native) the identical argv.
+        if (std.mem.eql(u8, arg, "--cache-dir")) {
+            // Skip the value; embedded VMs need no workspace. A missing
+            // value (flag as the final arg) is malformed — error rather
+            // than silently ending the loop with the flag consumed.
+            _ = args.next() orelse {
+                try std.Io.File.stderr().writeStreamingAll(io, "labelle-declare: --cache-dir needs an argument\n");
+                std.process.exit(2);
+            };
+            continue;
         }
         const path = try allocator.dupe(u8, arg);
         errdefer allocator.free(path);
