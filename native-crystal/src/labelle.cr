@@ -426,9 +426,26 @@ module Labelle
     # crystal's `sprintf` routes `%e`/`%f`/`%g` float conversions through
     # `LibC.snprintf`, so this IS the host libc's `%.14g` — the very formatter
     # the lua tool goes through. Our declared values are never -0.0.
+    #
+    # One portability fix on top: the exponent is normalized to C99's
+    # minimum-2-digit form. glibc/BSD already emit two (`3.4e+38`), which the
+    # golden pins; MSVC's `printf` pads to three (`3.4e+038`), so a windows
+    # crystal dev would drift — the strip keeps the schema platform-independent
+    # (rust's pure-Rust `%.14g` had the same goal) and is a no-op on the CI
+    # (linux/macos) that pins the golden.
     def self.g14(v : Float64) : String
       return "0" if v == 0.0
-      sprintf("%.14g", v)
+      s = sprintf("%.14g", v)
+      if e = s.index('e')
+        mant = s[0...e]
+        rest = s[(e + 1)..] # sign + digits, e.g. "+038" / "-05"
+        sign = rest[0]
+        digits = rest[1..].lstrip('0')
+        digits = "0" if digits.empty?
+        digits = "0" + digits if digits.size < 2
+        s = "#{mant}e#{sign}#{digits}"
+      end
+      s
     end
 
     # f32 default JSON: `%.14g`, then FORCE floatness ("1" -> "1.0") so the
@@ -455,13 +472,13 @@ module Labelle
         io << '"'
         s.each_byte do |b|
           case b
-          when 0x22 then io << "\\\""
-          when 0x5c then io << "\\\\"
-          when 0x08 then io << "\\b"
-          when 0x0c then io << "\\f"
-          when 0x0a then io << "\\n"
-          when 0x0d then io << "\\r"
-          when 0x09 then io << "\\t"
+          when 0x22             then io << "\\\""
+          when 0x5c             then io << "\\\\"
+          when 0x08             then io << "\\b"
+          when 0x0c             then io << "\\f"
+          when 0x0a             then io << "\\n"
+          when 0x0d             then io << "\\r"
+          when 0x09             then io << "\\t"
           when 0x00..0x1f, 0x7f then io << ("\\u%04x" % b)
           else                       io.write_byte(b)
           end
