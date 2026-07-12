@@ -83,11 +83,13 @@
 //! ## Platform note (why not std.DynLib / std.fs / std.process)
 //!
 //! This module reaches for libc / OS primitives (`std.c.dlopen`,
-//! `nethost`, `LoadLibraryW`, `GetModuleFileNameW`, `/proc/self/exe`,
-//! `_NSGetExecutablePath`) rather than the higher-level std wrappers: the
-//! plugin links libc, hosting is inherently a native-loader affair, and
-//! `std.DynLib` has no Windows arm while the current `std.fs`/`std.process`
-//! filesystem+env surface is mid-migration to `std.Io`. Keeping this to
+//! `std.c.opendir`/`readdir`, `std.c.getenv`, `LoadLibraryW`/`FindFirstFileW`,
+//! `GetModuleFileNameW`, `/proc/self/exe`, `_NSGetExecutablePath`) rather than
+//! the higher-level std wrappers: the plugin links libc, hosting is inherently
+//! a native-loader affair, and `std.DynLib` has no Windows arm while Zig
+//! 0.16's filesystem/env surface (`std.Io.Dir`/`std.Io.File`; `std.fs.cwd` is
+//! gone) is threaded through an `Io` instance this deep-in-`boot` code has no
+//! handle to. Keeping this to
 //! flat C calls makes the one platform-specific corner explicit.
 
 const std = @import("std");
@@ -190,6 +192,14 @@ const win = struct {
 
 // macOS: libSystem's executable-path query.
 extern fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
+
+// POSIX directory enumeration. `readdir` is not declared in this toolchain's
+// std.c (only opendir/closedir are), so declare it against std.c.dirent —
+// whose per-OS layouts (see std/c.zig) spell the entry-name field `name`, NOT
+// the C `d_name` (linux [256]u8, macOS [1024]u8, each NUL-terminated). Io-free
+// by design: `newestVersionDir` runs deep inside `boot` with no `Io` in scope,
+// so std.Io.Dir / std.fs (which this fork routes through Io) is not an option.
+extern "c" fn readdir(dp: *std.c.DIR) ?*std.c.dirent;
 
 /// hostfxr's platform library filename.
 const HOSTFXR_LIB = switch (builtin.os.tag) {
@@ -379,15 +389,19 @@ fn newestVersionDir(dir_utf8: []const u8, out: []u8) ?[]const u8 {
             if (win.FindNextFileW(h.?, &data) == 0) break;
         }
     } else {
-        // POSIX: enumerate via std.fs rather than raw opendir/readdir — the
-        // translated `dirent.d_name` field does not resolve on Linux under
-        // Zig 0.16's translate-c. `dir_utf8` is an absolute path
-        // (<root>/host/fxr).
-        var d = std.fs.cwd().openDir(dir_utf8, .{ .iterate = true }) catch return null;
-        defer d.close();
-        var it = d.iterate();
-        while (it.next() catch null) |ent| {
-            const name = ent.name;
+        // POSIX: enumerate via libc opendir/readdir (Io-free — no Io is in
+        // scope here). The dir-entry name lives in std.c.dirent's `name`
+        // field (see the `readdir` extern's note: this fork's std spells it
+        // `name`, not the C `d_name`); it is NUL-terminated. `dir_utf8` is an
+        // absolute path (<root>/host/fxr).
+        var dir_z: [1200]u8 = undefined;
+        if (dir_utf8.len + 1 > dir_z.len) return null;
+        @memcpy(dir_z[0..dir_utf8.len], dir_utf8);
+        dir_z[dir_utf8.len] = 0;
+        const dp = std.c.opendir(dir_z[0..dir_utf8.len :0]) orelse return null;
+        defer _ = std.c.closedir(dp);
+        while (readdir(dp)) |ent| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.name)));
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
             if ((best_len == 0 or versionLess(out[0..best_len], name)) and name.len <= out.len) {
                 @memcpy(out[0..name.len], name);
