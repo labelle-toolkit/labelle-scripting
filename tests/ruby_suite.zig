@@ -582,6 +582,28 @@ test "HungerController: the Component.ref into: pattern end to end" {
     try expect(mock.logsContain("ruby: hunger controller done"));
 }
 
+test "Labelle.component at runtime: the declare DSL line yields a working ref-parity view class" {
+    // One DSL, two consumers (the lua component-ref rule): the SAME
+    // chunk-scope `Labelle.component "Hunger", level: 0.875, ...` the
+    // declare runner (tools/declare-ruby, tests/declare_ruby_tool.zig)
+    // extracts as schema must, at runtime, hand the script a
+    // Component.ref-equivalent view class — get into it, set from it,
+    // interchangeable with the explicit-fields ref. The fixture raises on
+    // any mismatch: a raising init evicts the script, so DslOk landing IS
+    // the assertion.
+    fresh();
+    scripting.registerScript("component_dsl", @embedFile("ruby/component_dsl.rb"));
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expectComponent(1, "DslOk", "{\"ok\":true}");
+    // The final write-back went through the DSL view's set_from path
+    // (sorted keys, exact floats)...
+    try expectComponent(1, "Hunger", "{\"level\":0.25,\"starving\":true}");
+    // ...and the braced-spec + trailing-opts spelling wrote too.
+    try expectComponent(1, "Tag", "{\"kind\":\"worker\"}");
+}
+
 test "controllers: registration order, LIFO teardown, setup eviction" {
     fresh();
     scripting.registerScript("controller_alpha", @embedFile("ruby/controller_alpha.rb"));

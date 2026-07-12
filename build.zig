@@ -14,7 +14,10 @@
 //! provenance note in the README). Lua IS always fetched, whatever the
 //! language: the declare-mode extractor (tools/declare, `zig build
 //! labelle-declare`, labelle-assembler#585) is itself lua-based and ships
-//! with every install of the plugin.
+//! with every install of the plugin. Declare runners are PER-LANGUAGE
+//! siblings — tools/declare-ruby (`zig build labelle-declare-ruby`) is
+//! the mruby one; the assembler selects the step by the project's script
+//! language.
 
 const std = @import("std");
 
@@ -247,6 +250,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Its ruby twin (tools/declare-ruby): same promotion, same
+    // no-C-sources rule — within the RUBY test binary the mruby objects
+    // (and src/ruby/shim.c's flat exports) come from the ruby-language
+    // module; tests/root.zig's comptime gate keeps this module unanalyzed
+    // (and so unlinked) in every other language's binary.
+    const declare_ruby_core_mod = b.createModule(.{
+        .root_source_file = b.path("tools/declare-ruby/extract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The CRYSTAL_LIBRARY_PATH splitter, promoted the same way (this
     // build script imports it directly; the eval shared suite unit-tests
     // its multi-entry behavior through the named module — same file, so
@@ -302,6 +316,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "labelle_scripting", .module = lang_mod },
                     .{ .name = "declare_core", .module = declare_core_mod },
+                    .{ .name = "declare_ruby_core", .module = declare_ruby_core_mod },
                     .{ .name = "crystal_lib_paths", .module = crystal_lib_paths_mod },
                 },
             });
@@ -510,6 +525,44 @@ pub fn build(b: *std.Build) void {
             "Build the declare-mode schema extractor (zig-out/bin/labelle-declare)",
         );
         declare_step.dependOn(&b.addInstallArtifact(declare_exe, .{}).step);
+    }
+
+    // ── labelle-declare-ruby: the ruby declare-mode schema extractor ────
+    // The lua runner's per-language sibling — one runner exe per script
+    // language, selected by the assembler's declare phase through the
+    // per-language STEP NAME (a lua game never compiles mruby at generate
+    // time and vice versa; capability probes stay filesystem-simple:
+    // tools/declare-ruby exists ⇒ this step exists). Same shape as above:
+    // host-targeted, Debug-pinned, reached only through its named step —
+    // and no lazy-dep gate, because mruby is the in-repo vendor snapshot.
+    // The exe compiles its OWN copy of the mruby objects (+ shim.c), like
+    // the lua exe does with lua: a separate compilation, nothing doubled.
+    {
+        const declare_ruby_mod = b.createModule(.{
+            .root_source_file = b.path("tools/declare-ruby/main.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        });
+        declare_ruby_mod.addIncludePath(b.path("vendor/mruby/include"));
+        declare_ruby_mod.addCSourceFiles(.{
+            .root = b.path("vendor/mruby"),
+            .files = &mruby_sources,
+            .flags = &mruby_defines,
+        });
+        declare_ruby_mod.addCSourceFile(.{
+            .file = b.path("src/ruby/shim.c"),
+            .flags = &mruby_defines,
+        });
+        const declare_ruby_exe = b.addExecutable(.{
+            .name = "labelle-declare-ruby",
+            .root_module = declare_ruby_mod,
+        });
+        const declare_ruby_step = b.step(
+            "labelle-declare-ruby",
+            "Build the ruby declare-mode schema extractor (zig-out/bin/labelle-declare-ruby)",
+        );
+        declare_ruby_step.dependOn(&b.addInstallArtifact(declare_ruby_exe, .{}).step);
     }
 }
 

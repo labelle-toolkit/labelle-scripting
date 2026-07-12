@@ -223,8 +223,38 @@ end
 `Component.ref` builds a Struct-backed class whose fields map to the
 engine component's JSON keys; `get(Klass, into:)` decodes INTO the
 existing instance (string-name forms `e.get("Hunger")` → Hash and
-`e.set("Hunger", h)` also work). Forward compat: declare-mode-generated
-component classes will arrive as auto-created refs with this surface.
+`e.set("Hunger", h)` also work).
+
+**Declaring components in ruby** (one DSL, two consumers — the lua
+component-ref rule, ruby spelling): a chunk-scope
+
+```ruby
+# scripts/10_hunger.rb
+Hunger = Labelle.component "Hunger", level: 0.875, starving: false
+```
+
+is a SCHEMA DECLARATION at build time — `labelle generate` runs the
+ruby declare runner (`tools/declare-ruby`, built by `zig build
+labelle-declare-ruby`, the lua extractor's per-language sibling) over
+the game's scripts and the assembler codegens a real Zig registry
+component from the extracted schema (field types inferred from the
+defaults: Float→f32, Integer→i32, bool, String→str, `{ x:, y: }`→vec2;
+persist policy via a trailing options hash, exactly like lua's third
+argument: `Tag = Labelle.component "Tag", { kind: "none" }, persist:
+"transient"`). At RUNTIME the same line evaluates to a
+`Component.ref`-EQUIVALENT view class built from the spec's keys — spec
+values and options are the build-time contract and are ignored, because
+the component already exists in the game's registry. An empty spec
+(`Labelle.component "Dead", {}`) yields a zero-field marker view.
+`Component.ref` stays the explicit-fields spelling of the same class —
+the two are interchangeable. In declare mode only `Labelle.component`
+is live: every other `Labelle.*` call (and `Component.ref`,
+`Entity.create`, `FrameArray.new`, ...) is a no-op returning a sentinel
+the extractor REJECTS in spec positions — helpers-as-data fail the
+build — while `class Foo < Labelle::Controller` bodies define cleanly
+(nothing runs). Each script is extracted in a fresh interpreter, so
+top-level defs, constants and even a clobbered `Labelle` never leak
+between files.
 
 **Per-frame allocation** (the mruby homework): mruby's `Array#clear`
 FREES the heap buffer, so per-frame scratch cleared with `.clear`

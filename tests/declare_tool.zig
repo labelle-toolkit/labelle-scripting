@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const extract = @import("declare_core");
+const cross = @import("declare_cross_golden.zig");
 
 const testing = std.testing;
 const expect = testing.expect;
@@ -281,4 +282,15 @@ test "chunk envs are isolated: one script's top-level globals never leak into th
         .{ .path = "a.lua", .source = "function helper() end\nlabelle.component(\"A\", {})" },
         .{ .path = "b.lua", .source = "helper()" },
     }, &.{ "b.lua:1", "helper" });
+}
+
+test "cross-runner golden: the lua half — byte-identical to the ruby runner's schema" {
+    // The other half lives in tests/declare_ruby_tool.zig (the ruby
+    // binary); both assert the SAME expected literal from
+    // declare_cross_golden.zig — one logical declaration set, one schema,
+    // whatever the language.
+    try expectSchema(
+        &.{.{ .path = cross.lua_path, .source = cross.lua_source }},
+        cross.expected_json,
+    );
 }

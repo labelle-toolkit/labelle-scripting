@@ -66,6 +66,33 @@ module Labelle
     payload.nil? ? "" : json_encode(payload)
   end
 
+  # ── one DSL, two consumers (the lua component-ref rule, ruby spelling) ─
+  # `Hunger = Labelle.component "Hunger", level: 0.875, starving: false`
+  # is a SCHEMA DECLARATION at build time — the labelle-declare-ruby
+  # runner (tools/declare-ruby) extracts it at `labelle generate` and the
+  # assembler codegens a real Zig registry component — and, at runtime,
+  # evaluates to a Component.ref-EQUIVALENT view class built from the
+  # spec's KEYS (field order = spec insertion order; a spec-less or
+  # empty-spec call yields a zero-field marker view for set/has?/remove).
+  # The spec's VALUES and the opts hash are the build-time contract and
+  # are deliberately ignored here: the component already exists in the
+  # game's registry (fields, defaults, persist policy) because the build
+  # saw the same line. Options ride a separate trailing hash, exactly like
+  # lua's third argument:
+  #   Tag = Labelle.component "Tag", { kind: "none" }, persist: "transient"
+  # Component.ref (below) stays the explicit-fields spelling of the same
+  # view class — `Labelle.component "H", level: 0.0` and
+  # `Labelle::Component.ref("H", :level)` return interchangeable classes.
+  def self.component(name, spec = nil, opts = nil)
+    unless name.is_a?(String) && !name.empty?
+      raise ArgumentError, "Labelle.component: expected a non-empty component name string"
+    end
+    _ = opts # build-time contract; unused at runtime
+    fields = []
+    spec.each_key { |k| fields << k.to_sym } if spec.is_a?(Hash)
+    Component.__view(name, fields)
+  end
+
   # Spawn a prefab; params is an optional {x:, y:} Hash. Returns an Entity
   # or nil on failure.
   def self.spawn(prefab, params = nil)
@@ -509,12 +536,22 @@ module Labelle
     #   e.set(@h)                      # writes back to THIS entity
     #
     # Struct-backed (mruby-struct): fields map positionally to the
-    # component's JSON keys, with plain attribute accessors. Forward
-    # compat: declare-mode component classes will arrive as auto-created
-    # refs with this exact surface.
+    # component's JSON keys, with plain attribute accessors. This is the
+    # v0.2 explicit-fields API; `Labelle.component` (the declare-mode DSL's
+    # runtime leg) derives the fields from its spec hash and builds the
+    # SAME class through __view below.
     def self.ref(name, *fields)
       raise ArgumentError, "Component.ref needs at least one field" if fields.empty?
-      k = Struct.new(*fields)
+      __view(name, fields)
+    end
+
+    # The shared builder behind both spellings. Zero fields (a marker
+    # component — Labelle.component with an empty/absent spec; ref refuses
+    # the case) yields a plain class: `new` still mints instances that
+    # know their component (set/has?/remove), and the get/set fast paths
+    # simply have no fields to move.
+    def self.__view(name, fields)
+      k = fields.empty? ? Class.new : Struct.new(*fields)
       k.send(:include, ComponentInstance)
       k.extend(ComponentClass)
       k.instance_variable_set(:@__labelle_component_name, name)
