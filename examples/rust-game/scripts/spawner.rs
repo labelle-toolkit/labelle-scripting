@@ -72,9 +72,9 @@ impl Script for Spawner {
 
         // Command-as-event, CROSS-SCRIPT: this plain script commands the
         // HungerSystem (which subscribed in its init) to feed the worker.
-        // The id and the exact f32 0.5 amount round-trip
-        // events/hunger__feed.zig on the real engine bus; the handler
-        // sees them on tick 3's inbox.
+        // The id and the exact f32 0.5 amount round-trip the
+        // rust-declared hunger__feed (events/hunger__feed.rs) on the real
+        // engine bus; the handler sees them on tick 3's inbox.
         if self.tick == 2 {
             let payload = format!("{{\"entity\":{},\"amount\":0.5}}", self.worker);
             if labelle::emit("hunger__feed", &payload) {

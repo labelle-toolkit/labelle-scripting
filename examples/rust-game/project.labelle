@@ -39,10 +39,14 @@
     // The scripting plugin resolved from the repo root two levels up —
     // the working tree under test — with the one-language-per-project
     // param (labelle-assembler#584/#589) selecting rust: the FIRST
-    // native-compiled row (labelle-assembler v0.84.0). Rust has no
-    // declare mode (native splices skip the phase silently — zero
-    // embedded scripts); `Hunger` is a real components/*.zig file the
-    // rust scripts address by name over the contract at runtime.
+    // native-compiled row (labelle-assembler v0.84.0). Rust DECLARES too
+    // now (labelle-engine#774 / assembler v0.88.0's generic `.languages`
+    // reader): `Hunger`/`Worker` (components/*.rs) and the `hunger__feed`
+    // event (events/*.rs) are game-shaped rust declarations the assembler's
+    // `labelle-declare-rs` tool extracts into the generated
+    // scripting_components.zig / scripting_events.zig — only their SCHEMA
+    // travels (nothing embeds or compiles into the game), so the rust
+    // scripts still address them by name over the contract at runtime.
     .plugins = .{
         .{
             .name = "scripting",
