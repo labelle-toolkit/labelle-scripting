@@ -354,4 +354,222 @@ module Labelle
   def self.log(msg : String) : Nil
     LibLabelle.labelle_log(msg.to_unsafe, msg.bytesize)
   end
+
+  # ── Declarations: Labelle.component / Labelle.event (labelle-engine#775) ──
+  #
+  # The crystal spelling of the declare contract (RFC-LANGUAGE-PLUGINS §4,
+  # "Crystal: annotated struct, schema dumped by a declare-mode compile") —
+  # the native TWIN of rust's `labelle::component!`/`event!` (#774), sharing
+  # its "compile-and-run probe" extraction: `labelle-declare-crystal` stages
+  # THIS module + the game's declaration files, `crystal build -Ddeclare`s
+  # them, runs the probe, and relays the schema JSON — byte-identical to what
+  # the lua/ruby/rust runners emit (tests/declare_cross_golden.zig pins it).
+  #
+  # ONE difference from rust's macro: rust's `component!` ALWAYS expands to a
+  # typed `struct` (usable at runtime), gated by `#[cfg(feature="declare")]`
+  # only for the schema registration. Crystal's cannot mirror that — crystal
+  # type names must be Capitalized, so a lowercase event (`hunger__feed`)
+  # cannot back a struct — and it need not: declaration files carry ONLY
+  # schema (extracted at generate; nothing embeds or compiles into the game
+  # binary, exactly as rust-game's `.rs` declarations don't), and the runtime
+  # component/event surface is by-NAME over the contract
+  # (`Labelle.get_component_into(id, "Hunger", buf)`). So the macros expand to
+  # the schema registration UNDER `-Ddeclare` and to NOTHING in a game build —
+  # the whole declare machinery below is compiled only into the probe.
+  #
+  # Field types are the schema vocabulary: f32 / i32 / u64 / bool / vec2 /
+  # str. `u64` is the entity-id type (the lua/ruby `labelle.id` marker's
+  # crystal twin — spelled as a type keyword here; ids always default 0).
+
+  {% if flag?(:declare) %}
+    # One field's schema triple; the macro classifies + formats, the emitter
+    # sorts by name and joins.
+    struct FieldSpec
+      getter name : String
+      getter type : String
+      getter json : String
+
+      def initialize(@name : String, @type : String, @json : String)
+      end
+    end
+
+    # The declaration registry (declare mode only). Insertion order IS
+    # declaration order: the probe `require`s the game's declaration files in
+    # argv order and crystal runs their top-level `component`/`event` calls in
+    # that order, so — unlike rust, which sorts on (file, line) because
+    # inventory's collection order is unspecified — no position sort is needed.
+    # Components and events are separate namespaces (a `Hunger` component and a
+    # `hunger` event may coexist).
+    module DeclareRegistry
+      @@components = [] of Tuple(String, String, Array(FieldSpec))
+      @@events = [] of Tuple(String, Array(FieldSpec))
+
+      def self.add_component(name : String, persist : String, fields : Array(FieldSpec)) : Nil
+        @@components << {name, persist, fields}
+      end
+
+      def self.add_event(name : String, fields : Array(FieldSpec)) : Nil
+        @@events << {name, fields}
+      end
+
+      def self.components : Array(Tuple(String, String, Array(FieldSpec)))
+        @@components
+      end
+
+      def self.events : Array(Tuple(String, Array(FieldSpec)))
+        @@events
+      end
+    end
+
+    # `%.14g` of a finite double — byte-identical to C `printf`, the portable
+    # pin the lua/ruby/rust runners all agree on (tests/declare_cross_golden).
+    # crystal's `sprintf` routes `%e`/`%f`/`%g` float conversions through
+    # `LibC.snprintf`, so this IS the host libc's `%.14g` — the very formatter
+    # the lua tool goes through. Our declared values are never -0.0.
+    #
+    # One portability fix on top: the exponent is normalized to C99's
+    # minimum-2-digit form. glibc/BSD already emit two (`3.4e+38`), which the
+    # golden pins; MSVC's `printf` pads to three (`3.4e+038`), so a windows
+    # crystal dev would drift — the strip keeps the schema platform-independent
+    # (rust's pure-Rust `%.14g` had the same goal) and is a no-op on the CI
+    # (linux/macos) that pins the golden.
+    def self.g14(v : Float64) : String
+      return "0" if v == 0.0
+      s = sprintf("%.14g", v)
+      if e = s.index('e')
+        mant = s[0...e]
+        rest = s[(e + 1)..] # sign + digits, e.g. "+038" / "-05"
+        sign = rest[0]
+        digits = rest[1..].lstrip('0')
+        digits = "0" if digits.empty?
+        digits = "0" + digits if digits.size < 2
+        s = "#{mant}e#{sign}#{digits}"
+      end
+      s
+    end
+
+    # f32 default JSON: `%.14g`, then FORCE floatness ("1" -> "1.0") so the
+    # schema reads unambiguously — the lua/ruby `number_json` rule.
+    def self.fmt_f32(v : Float64) : String
+      s = g14(v)
+      s += ".0" unless s.includes?('.') || s.includes?('e') || s.includes?('E')
+      s
+    end
+
+    # vec2 default JSON — each component through `g14` (NOT `fmt_f32`: a vec2
+    # field formats AS-WRITTEN, so `7.0` renders `7`, matching the lua/ruby
+    # table form and rust's `Vec2` emitter).
+    def self.vec2_json(x : Float64, y : Float64) : String
+      "{\"x\":#{g14(x)},\"y\":#{g14(y)}}"
+    end
+
+    # JSON string escaping, byte-for-byte the lua `quote()` / ruby `__quote` /
+    # rust `quote`: named escapes for `"` `\` `\b` `\f` `\n` `\r` `\t`;
+    # `\u%04x` for other control bytes (<0x20 and 0x7f); every other byte
+    # passes through raw.
+    def self.quote(s : String) : String
+      String.build do |io|
+        io << '"'
+        s.each_byte do |b|
+          case b
+          when 0x22             then io << "\\\""
+          when 0x5c             then io << "\\\\"
+          when 0x08             then io << "\\b"
+          when 0x0c             then io << "\\f"
+          when 0x0a             then io << "\\n"
+          when 0x0d             then io << "\\r"
+          when 0x09             then io << "\\t"
+          when 0x00..0x1f, 0x7f then io << ("\\u%04x" % b)
+          else                       io.write_byte(b)
+          end
+        end
+        io << '"'
+      end
+    end
+
+    private def self.push_field(io : IO, f : FieldSpec) : Nil
+      io << "{\"name\":" << quote(f.name) << ",\"type\":\"" << f.type << "\",\"default\":" << f.json << "}"
+    end
+
+    # `{"name":..,"persist":..,"fields":[..]}` — fields sorted by name.
+    def self.component_fragment(name : String, persist : String, fields : Array(FieldSpec)) : String
+      String.build do |io|
+        io << "{\"name\":" << quote(name) << ",\"persist\":\"" << persist << "\",\"fields\":["
+        fields.sort_by(&.name).each_with_index do |f, i|
+          io << ',' if i > 0
+          push_field(io, f)
+        end
+        io << "]}"
+      end
+    end
+
+    # `{"name":..,"fields":[..]}` — no persist key (events are never saved).
+    def self.event_fragment(name : String, fields : Array(FieldSpec)) : String
+      String.build do |io|
+        io << "{\"name\":" << quote(name) << ",\"fields\":["
+        fields.sort_by(&.name).each_with_index do |f, i|
+          io << ',' if i > 0
+          push_field(io, f)
+        end
+        io << "]}"
+      end
+    end
+
+    # Assemble the whole schema line, exactly as the lua `__declare_emit`:
+    # `{"components":[...]}` + (`,"events":[...]` ONLY when non-empty) + `}`.
+    def self.emit_schema : String
+      String.build do |io|
+        io << "{\"components\":["
+        DeclareRegistry.components.each_with_index do |(name, persist, fields), i|
+          io << ',' if i > 0
+          io << component_fragment(name, persist, fields)
+        end
+        io << ']'
+        events = DeclareRegistry.events
+        unless events.empty?
+          io << ",\"events\":["
+          events.each_with_index do |(name, fields), i|
+            io << ',' if i > 0
+            io << event_fragment(name, fields)
+          end
+          io << ']'
+        end
+        io << '}'
+      end
+    end
+  {% end %}
+
+  # `Labelle.component "Name", { field: {type, default}, ... }` (optional
+  # `persist: "transient"`) and `Labelle.event "name", { field: {type,
+  # default}, ... }`. Each `{type, default}` pairs a type keyword (bare
+  # `f32`/`i32`/`u64`/`bool`/`vec2`/`str` — never evaluated, only read as
+  # macro AST) with its default expr; a vec2 default is a `{x, y}` tuple.
+  # Omit the fields hash for a zero-field declaration (`Labelle.component
+  # "Worker"`, `Labelle.event "wave__spawned"`).
+  #
+  # Under `-Ddeclare` this registers a schema declaration; a normal build
+  # expands it to NOTHING (see the section doc — declaration files are never
+  # compiled into the game). The registration body references the declare-only
+  # `DeclareRegistry`/`FieldSpec`, so it is emitted only inside the flag guard.
+  macro component(name, fields = nil, persist = "persistent")
+    {% if flag?(:declare) %}
+      ::Labelle::DeclareRegistry.add_component({{name}}, {{persist}}, [
+        {% if fields %}{% for fname, fspec in fields %}{% t = fspec[0].stringify %}
+          ::Labelle::FieldSpec.new({{fname.id.stringify}}, {{t}},
+            {% if t == "f32" %}::Labelle.fmt_f32(({{fspec[1]}}).to_f64){% elsif t == "i32" %}({{fspec[1]}}).to_i32.to_s{% elsif t == "u64" %}"0"{% elsif t == "bool" %}(({{fspec[1]}}) ? "true" : "false"){% elsif t == "str" %}::Labelle.quote({{fspec[1]}}){% elsif t == "vec2" %}::Labelle.vec2_json(({{fspec[1]}})[0].to_f64, ({{fspec[1]}})[1].to_f64){% else %}{% raise "labelle: unknown declared field type #{t} (expected f32/i32/u64/bool/vec2/str)" %}{% end %}),
+        {% end %}{% end %}
+      ] of ::Labelle::FieldSpec)
+    {% end %}
+  end
+
+  macro event(name, fields = nil)
+    {% if flag?(:declare) %}
+      ::Labelle::DeclareRegistry.add_event({{name}}, [
+        {% if fields %}{% for fname, fspec in fields %}{% t = fspec[0].stringify %}
+          ::Labelle::FieldSpec.new({{fname.id.stringify}}, {{t}},
+            {% if t == "f32" %}::Labelle.fmt_f32(({{fspec[1]}}).to_f64){% elsif t == "i32" %}({{fspec[1]}}).to_i32.to_s{% elsif t == "u64" %}"0"{% elsif t == "bool" %}(({{fspec[1]}}) ? "true" : "false"){% elsif t == "str" %}::Labelle.quote({{fspec[1]}}){% elsif t == "vec2" %}::Labelle.vec2_json(({{fspec[1]}})[0].to_f64, ({{fspec[1]}})[1].to_f64){% else %}{% raise "labelle: unknown declared field type #{t} (expected f32/i32/u64/bool/vec2/str)" %}{% end %}),
+        {% end %}{% end %}
+      ] of ::Labelle::FieldSpec)
+    {% end %}
+  end
 end

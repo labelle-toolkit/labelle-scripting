@@ -76,8 +76,8 @@
     // invented — so a pre-`.transpile` assembler (its `TSC_PLATFORMS`
     // fallback) and the generic reader fetch byte-identical tarballs. Old
     // assemblers ignore this unknown key and keep their frozen pin table
-    // (the documented forward-compat). `crystal` lands its native declare
-    // row with #775.
+    // (the documented forward-compat). `crystal` landed its native declare
+    // row with #775 (below) — rust's twin.
     .languages = .{
         .{ .name = "lua", .extensions = .{"lua"}, .kind = .embedded,
            .declare = .{ .tool = "labelle-declare", .dir = "tools/declare",
@@ -113,6 +113,16 @@
                    .{ .os = "windows", .arch = "x86_64",  .platform = "win32-x64",    .binary = "lib/tsc.exe", .sha512 = "0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g==" },
                },
            } },
+        // crystal (labelle-engine#775) — rust's native TWIN: declares through
+        // the IDENTICAL `.declare = { .tool, .dir, .events }` shape, its
+        // compile-and-run probe (labelle-declare-crystal) internal to the tool
+        // exe exactly as rust's is. The assembler passes the same argv
+        // (declaration files + persistent --cache-dir) and never learns
+        // "crystal" or "crystal build". Build steps stay in .language_builds.
+        .{ .name = "crystal", .extensions = .{"cr"}, .kind = .native,
+           .module_root = "game.cr", // scripts/game.cr; build steps stay in .language_builds
+           .declare = .{ .tool = "labelle-declare-crystal", .dir = "tools/declare-crystal",
+                         .events = true } },
     },
     // Per-LANGUAGE build steps (labelle-engine#741, native-compiled
     // family) — the #586 `.build` Step schema, applied only when the

@@ -42,10 +42,15 @@
     // The scripting plugin resolved from the repo root two levels up —
     // the working tree under test — with the one-language-per-project
     // param (labelle-assembler#584/#589) selecting crystal: the SECOND
-    // native-compiled row (labelle-assembler v0.85.0). Crystal has no
-    // declare mode (native splices skip the phase silently — zero
-    // embedded scripts); `Hunger` is a real components/*.zig file the
-    // crystal scripts address by name over the contract at runtime.
+    // native-compiled row (labelle-assembler v0.85.0). Crystal DECLARES
+    // too now (labelle-engine#775 / assembler v0.88.0's generic
+    // `.languages` reader, rust's twin): `Hunger`/`Worker`
+    // (components/*.cr) and the `hunger__feed` event (events/*.cr) are
+    // game-shaped crystal declarations the assembler's
+    // `labelle-declare-crystal` tool extracts into the generated
+    // scripting_components.zig / scripting_events.zig — only their SCHEMA
+    // travels (nothing embeds or compiles into the game), so the crystal
+    // scripts still address them by name over the contract at runtime.
     .plugins = .{
         .{
             .name = "scripting",

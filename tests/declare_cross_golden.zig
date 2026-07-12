@@ -126,6 +126,49 @@ pub const rust_events_source =
     \\}
 ;
 
+// The crystal spelling (labelle-engine#775) — rust's native-family TWIN.
+// Crystal has no interpreter either, so its declare tool (labelle-declare-
+// crystal) is the same "compile-and-run probe" as rust's: it `crystal build`s
+// the declaration files it is handed. The assembler hands it components/*.cr
+// then events/*.cr (argv order = registration order), so the canonical
+// spelling splits into a GAME-SHAPED component file and event file — bare
+// `Labelle.component "…"` / `Labelle.event "…"` with NO `require` lines (a real
+// game omits them; the tool injects `require "./labelle"`). Each field is a
+// `{type, default}` tuple whose type keyword (f32/bool/i32/u64/vec2/str) is
+// read only as macro AST, never evaluated — `u64` standing where lua/ruby wrote
+// the `labelle.id` marker (ids default 0). tests/declare_crystal_tool.zig runs
+// the tool over the tools/declare-crystal/testdata fixtures, pins its stdout
+// against `expected_json`, and drift-pins each fixture against the block below.
+pub const crystal_components_source =
+    \\Labelle.component "Kinematics", {
+    \\  speed:      {f32, 12.5},
+    \\  accel:      {f32, 1.0},
+    \\  tiny:       {f32, 1e-05},
+    \\  huge:       {f32, 3.4e38},
+    \\  jump_count: {i32, 3},
+    \\  min_i32:    {i32, -2147483648},
+    \\  max_i32:    {i32, 2147483647},
+    \\  grounded:   {bool, true},
+    \\  home:       {vec2, {-0.5, 7.0}},
+    \\  label:      {str, "he said \"hi\"\n\ttab\\done"},
+    \\  owner:      {u64, 0},
+    \\}
+    \\
+    \\Labelle.component "Dead", persist: "transient"
+;
+
+pub const crystal_events_source =
+    \\Labelle.event "hunger__feed", {
+    \\  entity: {u64, 0},
+    \\  amount: {f32, 0.5},
+    \\  urgent: {bool, false},
+    \\  reason: {str, "why \"now\""},
+    \\  at:     {vec2, {-1.5, 3.0}},
+    \\}
+    \\
+    \\Labelle.event "wave__spawned"
+;
+
 pub const expected_json =
     \\{"components":[{"name":"Kinematics","persist":"persistent","fields":[{"name":"accel","type":"f32","default":1.0},{"name":"grounded","type":"bool","default":true},{"name":"home","type":"vec2","default":{"x":-0.5,"y":7}},{"name":"huge","type":"f32","default":3.4e+38},{"name":"jump_count","type":"i32","default":3},{"name":"label","type":"str","default":"he said \"hi\"\n\ttab\\done"},{"name":"max_i32","type":"i32","default":2147483647},{"name":"min_i32","type":"i32","default":-2147483648},{"name":"owner","type":"u64","default":0},{"name":"speed","type":"f32","default":12.5},{"name":"tiny","type":"f32","default":1e-05}]},{"name":"Dead","persist":"transient","fields":[]}],"events":[{"name":"hunger__feed","fields":[{"name":"amount","type":"f32","default":0.5},{"name":"at","type":"vec2","default":{"x":-1.5,"y":3}},{"name":"entity","type":"u64","default":0},{"name":"reason","type":"str","default":"why \"now\""},{"name":"urgent","type":"bool","default":false}]},{"name":"wave__spawned","fields":[]}]}
 ;
