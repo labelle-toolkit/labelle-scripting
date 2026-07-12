@@ -7,3 +7,6 @@ zig-pkg/
 # crates (the wired builds all --target-dir into the zig cache).
 native/target/
 tests/rust/target/
+# The ts-example negative test's scratch copy (CI creates it beside the
+# example so the relative local: pins keep resolving; never committed).
+examples/ts-game-typo-scratch/

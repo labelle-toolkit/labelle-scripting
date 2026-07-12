@@ -1,0 +1,8 @@
+{
+    // Minimal scene — no entities, no assets. The typescript scripts
+    // create their own entities through the Script Runtime Contract; the
+    // scene exists so `g.setScene("main")` has a name to bind to during
+    // setup.
+    "name": "main",
+    "children": []
+}

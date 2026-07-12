@@ -70,7 +70,12 @@ jobs:
           fi
 
       - name: Formatting
-        run: zig fmt --check build.zig src tests
+        # examples/ts-game rides along for its game-root .zig files
+        # (components/events/hooks — `zig fmt` walks dirs and touches only
+        # .zig, so the .ts sources are ignored; there is no canonical
+        # no-toolchain TS formatter, and prettier/npm stay out of CI by
+        # design — tsc 7 checks, it doesn't format).
+        run: zig fmt --check build.zig src tests examples/ts-game
 
       - name: Rust formatting
         run: |
@@ -816,3 +821,308 @@ jobs:
             exit 1
           fi
           echo "PASS: crystal drove the real engine — Labelle::Script classes compiled by the plugin's crystal-build step and localized by objcopy, Buffer-reuse wrappers, cross-script hunger__feed (crystal AND native Zig hook off one bus) + engine__tick over 5 headless frames, against this repo's HEAD"
+
+  # TypeScript example game (labelle-engine#745) — the TYPED counterpart of
+  # ruby-example, living in THIS repo so every push runs a real typescript
+  # game through the real assembler against the real engine:
+  # examples/ts-game pins its scripting plugin `local:../..` (the CURRENT
+  # checkout), so contract/labelle.d.ts, the prelude, the bindings and the
+  # quickjs VM under review are exactly what the generated game embeds.
+  # TypeScript's permanent regression net — and the end-to-end proof of the
+  # assembler's transpile phase (labelle-assembler#613): the pinned tsc
+  # 7.0.2 NATIVE binary checks the game's .ts sources against a
+  # labelle-components.d.ts GENERATED from the game's real component
+  # registry, type errors fail generate (the negative step below), and the
+  # emitted plain-JS twins are what the main embeds.
+  ts-example:
+    runs-on: ubuntu-latest
+    # Cold toolkit fetch + engine compile + one ~9 MB tsc fetch normally
+    # lands well under 15; bound a wedged runner far below GitHub's 6h
+    # default.
+    timeout-minutes: 30
+    env:
+      # The pinned labelle-assembler release the example generates with —
+      # a BINARY release (tag → release.yml assets). v0.86.0 is the HARD
+      # floor for this example: the transpile phase itself ships in it
+      # (labelle-assembler#613 — check+emit at generate, the generated
+      # labelle-components.d.ts, the shared tool cache), alongside the
+      # `scripts/` convention dir (labelle-assembler#614). Older releases
+      # hard-fail on `.ts` sources (#586's placeholder gate). Bump
+      # deliberately, never float.
+      ASSEMBLER_VERSION: v0.86.0
+    steps:
+      # Checkout into a subdir so the example's sibling pins resolve:
+      # examples/ts-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
+      - uses: actions/checkout@v4
+        with:
+          path: labelle-scripting
+          # Read-only job: never persist the GITHUB_TOKEN in .git/config.
+          persist-credentials: false
+
+      # Sibling checkout for the null backend — same reason and same
+      # pattern as ruby-example above (the `script_contract.bind`
+      # touchpoint is on labelle-null main, unreleased).
+      - name: Checkout labelle-null (bind touchpoint is unreleased)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Download the pinned labelle-assembler release binary
+        run: |
+          curl -fL -o labelle-assembler \
+            "https://github.com/labelle-toolkit/labelle-assembler/releases/download/${ASSEMBLER_VERSION}/labelle-assembler-linux-x86_64"
+          chmod +x labelle-assembler
+
+      # Mirrors ruby-example's flow with the transpile-phase deltas:
+      # generate (typecheck + emit) → d.ts + codegen greps → build
+      # (fingerprint dance) → bounded headless run → ordered-transcript
+      # diff. Frame-by-frame timeline: scripts/20_hunger_controller.ts's
+      # header. NOTE the deliberate deltas from ruby-example's greps: no
+      # tsc means no node/npm setup step (the assembler fetches the pinned
+      # native binary itself — asserted below), and the declare-phase
+      # notes flip (typescript has no declare mode).
+      - name: Generate (typecheck at generate) + build + run the typescript example game
+        run: |
+          # Actions' default shell has no pipefail — without it the tee
+          # below masks a failed generate with exit 0.
+          set -o pipefail
+
+          # Fresh HOME for the whole flow: the assembler keeps its package
+          # cache AND the shared tsc tool cache under ~/.labelle — never
+          # let a runner's (or, when run locally, a developer's) real one
+          # leak into the run. A fresh HOME also forces the transpile
+          # phase's COLD-fetch path, pinned below (the negative step then
+          # pins the WARM path against the same HOME).
+          export HOME="$RUNNER_TEMP/labelle-home"
+          mkdir -p "$HOME"
+
+          cd labelle-scripting/examples/ts-game
+          ASM=$GITHUB_WORKSPACE/labelle-assembler
+
+          # Fetch core/engine/gfx releases into the package cache. The
+          # scripting plugin needs no fetch (`local:../..` — this
+          # checkout) and neither does the backend (`backend_package`
+          # pins the sibling labelle-null clone above).
+          $ASM install --project-root .
+          $ASM generate --project-root . 2>&1 | tee generate.log
+
+          # Belt and braces on top of the exit code (pipefail set at the
+          # top of this step): never trust artifacts past a failed
+          # generate.
+          if grep -q 'generate failed' generate.log; then
+            echo "E: generate reported failure"
+            exit 1
+          fi
+          # The transpile phase cold-fetched the ASSEMBLER-pinned tsc
+          # 7.0.2 native compiler (registry tarball, sha512-verified, no
+          # node/npm anywhere) into the fresh HOME's SHARED tool cache:
+          # the evidence line, then the cached binary itself.
+          grep -q 'fetching the typescript 7.0.2 native compiler' generate.log
+          test -x "$HOME/.labelle/tools/typescript/7.0.2/linux-x64/lib/tsc"
+          # TypeScript has NO declare mode (DECLARE_RUNNERS is lua+ruby)
+          # AND a pure-.ts project collects zero embeddable .js at
+          # declare time, so the phase no-ops SILENTLY — before even its
+          # runner-row gate prints the pointed skip note. Its presence
+          # here would mean stray runnable .js sources leaked into
+          # scripts/ (this example is all-.ts by design).
+          if grep -q 'script-declared components' generate.log; then
+            echo "E: declare-phase note printed — a pure-.ts project must skip the phase silently"
+            exit 1
+          fi
+          # This example is BORN on scripts/ — the legacy-dir grace note
+          # must not appear (its presence means a ts/ dir leaked in, or
+          # the resolve probe regressed).
+          if grep -q 'keeps working for one release of grace' generate.log; then
+            echo "E: legacy script-dir deprecation note printed"
+            exit 1
+          fi
+
+          # THE #613 assertion: labelle-components.d.ts GENERATED from
+          # the game's real component registry, next to the materialized
+          # scripts — the name-keyed map with the REAL field types
+          # (f32 → number, bool → boolean) plus the keyof-constrained
+          # Entity get/get-into/set overloads the scripts type against.
+          D=.labelle/null_desktop/scripts/labelle-components.d.ts
+          grep -qF 'interface LabelleComponents' $D
+          grep -qF '"Hunger": { level: number; starving: boolean };' $D
+          grep -qF '"Worker": {};' $D
+          grep -qF 'get<K extends keyof LabelleComponents>(name: K, into: LabelleComponents[K]): LabelleComponents[K] | null;' $D
+          grep -qF 'set<K extends keyof LabelleComponents>(name: K, obj?: Partial<LabelleComponents[K]> | null): boolean;' $D
+          # The generated compiler config at the target root — an author
+          # can reproduce CI's exact check with `tsc -p`.
+          test -f .labelle/null_desktop/tsconfig.json
+
+          # Codegen assertions — each is one link of the chain; fail
+          # loudly if a regression drops it.
+          M=.labelle/null_desktop/main.zig
+          # THE transpile-family assertion: the embeds are the EMITTED
+          # plain-JS twins out of the MATERIALIZED target dir (a real
+          # dir — the phase traded linkAndScan's symlink away), ordering
+          # prefixes stripped/ordered exactly like the first collection;
+          # a .ts embed means the emit rewrite fell through.
+          test ! -L .labelle/null_desktop/scripts
+          test -f .labelle/null_desktop/scripts/10_spawner.js
+          grep -qF 'scripting.registerScript("spawner", @embedFile("scripts/10_spawner.js"));' $M
+          grep -qF 'scripting.registerScript("hunger_controller", @embedFile("scripts/20_hunger_controller.js"));' $M
+          grep -qF 'scripting.registerScript("feed_watcher", @embedFile("scripts/feed_watcher.js"));' $M
+          if grep -qE '@embedFile\("scripts/[^"]+\.ts"\)' $M; then
+            echo "E: a .ts source got embedded — the transpile rewrite regressed"
+            exit 1
+          fi
+          grep -oE 'registerScript\("[a-z_0-9]+"' $M | cut -d'"' -f2 > .labelle/reg_order.txt
+          printf '%s\n' spawner hunger_controller feed_watcher > .labelle/reg_expected.txt
+          diff .labelle/reg_expected.txt .labelle/reg_order.txt
+          # Splice: the generated flag half of the templates' double-gate.
+          grep -qF 'const scripting_enabled = true;' $M
+          # labelle-null template: the bind touchpoint (proves the sibling
+          # checkout — not the stale v0.3.0 release — was staged).
+          grep -qF 'engine.script_contract.bind(&g);' $M
+          # Splice: the VM tick that actually advances the scripts.
+          grep -qF 'scripting.Controller.tick(&g, scaled_dt);' $M
+          # Splice: the event tap between plugin ticks and dispatchEvents.
+          grep -qF 'engine.script_contract.drainEvents(&g);' $M
+          # Game-root hooks scan: the native hunger__feed subscriber
+          # (hooks/feed_watcher.zig) folded into the GameHooks receiver
+          # tuple — the Zig half of the cross-layer events interop.
+          grep -qF 'feed_u_watcher.FeedWatcher' $M
+          # Build wiring: the plugin's -Dlanguage option selects quickjs.
+          grep -qF '.language = .typescript' .labelle/null_desktop/build.zig
+
+          cd .labelle/null_desktop
+
+          # labelle-cli-equivalent fixFingerprint dance — the assembler
+          # emits a placeholder fingerprint.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          # `|| true`: with pipefail on, a NO-MATCH grep would otherwise
+          # exit 1 and set -e kills the step silently — and the happy path
+          # (first build succeeds, ERR empty, nothing to fix) is real: this
+          # example's fingerprint has never actually needed the dance.
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # Headless bounded run: no window, no GL — the binary runs to
+          # completion (rc=0) or crashes.
+          LABELLE_NULL_FRAMES=5 ./zig-out/bin/ts_game > run.log 2>&1
+
+          # Pin the exact ordered milestone sequence — the ruby
+          # transcript's shape, so the cross-language story is diffable
+          # by eye. Tokens carry BEHAVIOR: the 0.875 the chain starts
+          # from is the spawner's TYPED write (typescript has no declare
+          # mode — the Zig-declared default is 1.0, so the value proves
+          # the script-side write traveled the contract); every
+          # TS_LEVEL_* value is the level the controller wrote through
+          # the real ECS that tick (each one reachable only via the
+          # previous tick's persisted write); TS_FED_LEVEL_0.875 is
+          # re-READ after the feed handler's write — the emitted BigInt
+          # id and f32 0.5 amount round-tripped the engine bus bit-exact;
+          # ZIG_FEED_SEEN_0.5 is the NATIVE game-root hook consuming the
+          # same emit at tick 2's dispatchEvents (frame end, one tick
+          # BEFORE the typescript handlers' inbox — the cross-layer
+          # latency is part of the pin); TS_WATCHER_SAW_0.5 is the THIRD
+          # subscriber (scripts/feed_watcher.ts, a top-level module-load
+          # sub) on tick 3's inbox BEFORE the controller's handler
+          # (handlers run in subscription order and module bodies load
+          # before any init runs); TS_FRAMEARRAY_OK pins the warmed
+          # labelle.FrameArray scratch flat (growthCount === 0). Tail
+          # delta vs ruby, deliberate: typescript has no controller tier
+          # with LIFO teardown — per-script deinits run in REGISTRATION
+          # order, so TS_DEINIT (spawner) precedes TS_CTRL_DONE. The char
+          # class includes '.' for exactly the value-carrying tokens.
+          # Timeline: scripts/20_hunger_controller.ts.
+          grep -oE '(TS|ZIG)_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          TS_INIT
+          TS_CTRL_READY
+          TS_LEVEL_0.625
+          TS_FEED_SENT
+          TS_LEVEL_0.375
+          ZIG_FEED_SEEN_0.5
+          TS_ENGINE_TICK_SEEN
+          TS_WATCHER_SAW_0.5
+          TS_FED_LEVEL_0.875
+          TS_LEVEL_0.625
+          TS_LEVEL_0.375
+          TS_LEVEL_0.125
+          TS_STARVING
+          TS_FRAMEARRAY_OK
+          TS_DEINIT
+          TS_CTRL_DONE
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: ts-example milestone sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: typescript drove the real engine — .ts sources checked+emitted at generate by the pinned tsc 7.0.2 against the GENERATED labelle-components.d.ts, typed component access + BigInt ids, plain hooks + module controller + cross-script hunger__feed (controller, pure-ts watcher AND native Zig hook off one bus) + FrameArray + engine__tick over 5 headless frames, against this repo's HEAD"
+
+      # THE #613 acceptance, negatively: a typo'd component-field access
+      # must FAIL `labelle generate` with tsc's diagnostic relayed
+      # verbatim. Runs against a SCRATCH COPY beside the example (the
+      # relative `local:` pins keep resolving; the real example is never
+      # touched, so there is nothing to restore) and the SAME HOME as the
+      # step above — which also pins the shared tool cache's WARM path
+      # (no second tsc fetch).
+      - name: Negative — a typo'd field access fails generate with the tsc diagnostic
+        run: |
+          set -o pipefail
+          export HOME="$RUNNER_TEMP/labelle-home"
+
+          cd labelle-scripting/examples
+          rm -rf ts-game-typo-scratch
+          mkdir ts-game-typo-scratch
+          # Copy sans the generated .labelle tree (zig-out inside it is
+          # huge) — tar excludes beat cp for that.
+          tar -C ts-game --exclude='.labelle' --exclude='generate.log' -cf - . \
+            | tar -C ts-game-typo-scratch -xf -
+          cd ts-game-typo-scratch
+
+          # The typo: `h.level` → `h.levl` on the controller's decay line.
+          sed -i 's/h\.level -= DECAY_PER_TICK/h.levl -= DECAY_PER_TICK/' scripts/20_hunger_controller.ts
+          grep -q 'h\.levl -= DECAY_PER_TICK' scripts/20_hunger_controller.ts
+
+          ASM=$GITHUB_WORKSPACE/labelle-assembler
+          set +e
+          $ASM generate --project-root . > typo.log 2>&1
+          RC=$?
+          set -e
+          if [ "$RC" -eq 0 ]; then
+            echo "E: generate SUCCEEDED on a typo'd component field — the #613 typecheck gate regressed"
+            cat typo.log
+            exit 1
+          fi
+          # The diagnostic, verbatim from tsc 7.0.2 (deterministic:
+          # `levl` is edit distance 1 from `level`, so tsc picks TS2551 —
+          # the did-you-mean variant of property-does-not-exist —
+          # against the GENERATED d.ts's real Hunger shape):
+          #   scripts/20_hunger_controller.ts(<line>,<col>): error TS2551:
+          #   Property 'levl' does not exist on type '{ level: number;
+          #   starving: boolean; }'. Did you mean 'level'?
+          grep -q "error TS2551: Property 'levl' does not exist" typo.log
+          grep -qF "Did you mean 'level'?" typo.log
+          grep -q 'typescript check failed' typo.log
+          grep -q 'generate failed' typo.log
+          # noEmitOnError: a failed check must emit NOTHING embeddable.
+          if ls .labelle/null_desktop/scripts/*.js >/dev/null 2>&1; then
+            echo "E: emitted .js exists despite the failed typecheck (noEmitOnError regressed)"
+            exit 1
+          fi
+          # Warm shared tool cache: the tsc fetched by the previous step
+          # was REUSED — a second fetch line means the cache key broke.
+          if grep -q 'fetching the typescript' typo.log; then
+            echo "E: the shared tool cache was not reused (a second tsc fetch ran)"
+            exit 1
+          fi
+          echo "PASS: the typo'd field failed generate with tsc's TS2551 relayed verbatim, nothing was emitted, and the warm tool cache was reused"

@@ -1,0 +1,69 @@
+// TypeScript example game (labelle-engine#745) — the TYPED counterpart of
+// examples/ruby-game: scripts/*.ts drive the REAL engine through the
+// Script Runtime Contract from the assembler's generated main, headless
+// over the null backend. The sources are CHECKED AND EMITTED at `labelle
+// generate` by the assembler's pinned TypeScript 7.0.2 NATIVE compiler
+// (labelle-assembler#613, v0.86.0): type errors FAIL generate with tsc's
+// diagnostics verbatim, and the check runs against a GENERATED
+// `labelle-components.d.ts` built from this game's real component
+// registry — a typo'd `h.levl` is a TS2551 before anything builds. The
+// emitted plain-JS twins are what the generated main embeds
+// (`registerScript("spawner", @embedFile("scripts/10_spawner.js"))`);
+// quickjs-ng runs them as ES modules with BigInt entity ids.
+//
+// TypeScript has NO declare mode (DECLARE_RUNNERS is lua+ruby): the
+// components stay Zig (components/hunger.zig beside components/worker.zig,
+// the rust-game shape) and the TS story is TYPED ACCESS against the
+// generated d.ts instead — same registry, opposite direction.
+//
+// THE point of living in this repo: the scripting plugin is pinned
+// `local:../..` — THIS checkout — so every CI run exercises the CURRENT
+// tree (contract/labelle.d.ts, prelude, bindings, the quickjs VM), not a
+// release. TypeScript's permanent regression net: generate (typecheck +
+// transpile) + build + run bounded frames (`LABELLE_NULL_FRAMES=5`) and
+// assert the ordered `TS_*` milestone tokens — see
+// `.github/workflows/ci.yml` → `ts-example`.
+.{
+    .name = "ts_game",
+    .title = "LaBelle — TypeScript Example Game (null backend)",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    // Headless: no window, no GPU, no input. The built binary runs a
+    // fixed-dt tick loop bounded by LABELLE_NULL_FRAMES and exits cleanly.
+    // Pinned as an EXPLICIT external `backend_package` to a SIBLING
+    // checkout rather than the registry `.backend = .null` shorthand: the
+    // generated main's `script_contract.bind` touchpoint lives in
+    // labelle-null's `templates/headless.txt` (labelle-null#5, on main)
+    // and the latest release (v0.3.0) predates it. CI clones labelle-null
+    // beside this repo — the same pattern as the assembler's own
+    // scripting-smoke job. Switch to a registry pin once labelle-null
+    // cuts a release carrying the touchpoint.
+    .backend_package = .{ .name = "null", .repo = "local:../../../labelle-null" },
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    // The scripting plugin resolved from the repo root two levels up —
+    // the working tree under test — with the one-language-per-project
+    // param (labelle-assembler#584/#589) selecting typescript. At
+    // generate the assembler's transpile phase (labelle-assembler#613)
+    // resolves tsc 7.0.2 from the shared tool cache
+    // (~/.labelle/tools/typescript/7.0.2/ — hash-pinned registry
+    // tarball, fetched once per machine, no npm CLI anywhere),
+    // materializes the target's scripts/ dir, generates
+    // labelle-components.d.ts + tsconfig.json, and runs check+emit.
+    .plugins = .{
+        .{
+            .name = "scripting",
+            .repo = "local:../..",
+            .params = .{ .language = "typescript" },
+        },
+    },
+    // Registry-resolved toolkit releases (this repo has no toolkit
+    // siblings to pin — the one `local:` dep is the plugin itself, plus
+    // the labelle-null sibling above).
+    .core_version = "1.26.0",
+    .engine_version = "2.5.0",
+    .gfx_version = "1.28.1",
+}
