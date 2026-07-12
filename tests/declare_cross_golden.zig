@@ -75,6 +75,51 @@ pub const ruby_source =
     \\Labelle.event("wave__spawned", {})
 ;
 
+// The rust spelling (labelle-engine#774). Unlike lua/ruby — interpreted, so
+// their runner RUNS this source string — rust has no interpreter: the declare
+// "runner" is a probe cargo-BUILDS this source into (tools/declare-rs, whose
+// src/decls.rs carries exactly the block below) and executes. Types are
+// EXPLICIT here (rust is typed): the schema's f32/bool/i32/u64/vec2/str
+// vocabulary is spelled directly, `u64` standing where lua/ruby wrote the
+// `labelle.id` marker (ids default 0). tests/declare_rust_tool.zig pins the
+// probe's stdout against `expected_json` and drift-pins decls.rs against this.
+pub const rust_path = "components/kinematics.rs";
+pub const rust_source =
+    \\labelle::component! {
+    \\    Kinematics {
+    \\        speed: f32 = 12.5,
+    \\        accel: f32 = 1.0,
+    \\        tiny: f32 = 1e-05,
+    \\        huge: f32 = 3.4e38,
+    \\        jump_count: i32 = 3,
+    \\        min_i32: i32 = -2147483648,
+    \\        max_i32: i32 = 2147483647,
+    \\        grounded: bool = true,
+    \\        home: vec2 = vec2(-0.5, 7.0),
+    \\        label: str = "he said \"hi\"\n\ttab\\done",
+    \\        owner: u64 = 0,
+    \\    }
+    \\}
+    \\
+    \\labelle::event! {
+    \\    hunger__feed {
+    \\        entity: u64 = 0,
+    \\        amount: f32 = 0.5,
+    \\        urgent: bool = false,
+    \\        reason: str = "why \"now\"",
+    \\        at: vec2 = vec2(-1.5, 3.0),
+    \\    }
+    \\}
+    \\
+    \\labelle::component! {
+    \\    transient Dead {}
+    \\}
+    \\
+    \\labelle::event! {
+    \\    wave__spawned {}
+    \\}
+;
+
 pub const expected_json =
     \\{"components":[{"name":"Kinematics","persist":"persistent","fields":[{"name":"accel","type":"f32","default":1.0},{"name":"grounded","type":"bool","default":true},{"name":"home","type":"vec2","default":{"x":-0.5,"y":7}},{"name":"huge","type":"f32","default":3.4e+38},{"name":"jump_count","type":"i32","default":3},{"name":"label","type":"str","default":"he said \"hi\"\n\ttab\\done"},{"name":"max_i32","type":"i32","default":2147483647},{"name":"min_i32","type":"i32","default":-2147483648},{"name":"owner","type":"u64","default":0},{"name":"speed","type":"f32","default":12.5},{"name":"tiny","type":"f32","default":1e-05}]},{"name":"Dead","persist":"transient","fields":[]}],"events":[{"name":"hunger__feed","fields":[{"name":"amount","type":"f32","default":0.5},{"name":"at","type":"vec2","default":{"x":-1.5,"y":3}},{"name":"entity","type":"u64","default":0},{"name":"reason","type":"str","default":"why \"now\""},{"name":"urgent","type":"bool","default":false}]},{"name":"wave__spawned","fields":[]}]}
 ;

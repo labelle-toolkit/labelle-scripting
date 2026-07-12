@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "labelle_rust_scripts_test"
+name = "labelle_declare_rs"
 version = "0.1.0"
 dependencies = [
  "inventory",

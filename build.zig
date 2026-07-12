@@ -416,6 +416,45 @@ pub fn build(b: *std.Build) void {
                 if (target.result.os.tag == .linux) {
                     tests_root_mod.linkSystemLibrary("gcc_s", .{});
                 }
+
+                // The declare probe (labelle-engine#774): the rust member of
+                // the cross-runner byte-parity contract. Rust has no
+                // interpreter, so — unlike lua/ruby, RUN in-process through the
+                // declare_core externs — the runner is a probe cargo-BUILDS and
+                // RUNS: tools/declare-rs recomposes the SHIPPED
+                // labelle::component!/event! macros (#[path]) around the
+                // cross-runner golden fixture (src/decls.rs) under the `declare`
+                // feature, and its main prints the schema JSON. Its captured
+                // stdout is `@embedFile`d by tests/declare_rust_tool.zig and
+                // pinned byte-identical to the lua/ruby runners' schema. Own
+                // persistent --target-dir (cargo-incremental on edits);
+                // --locked pins the committed lockfile (inventory is the sole,
+                // declare-only dep). Host-targeted: the probe runs at build
+                // time on the dev/CI machine, whatever the game targets.
+                const declare_rs_target = b.cache_root.join(
+                    b.allocator,
+                    &.{"rust-declare-target"},
+                ) catch @panic("OOM");
+                const cargo_declare = b.addSystemCommand(&.{
+                    "cargo",     "build",
+                    "--release", "--quiet",
+                    "--locked",  "--manifest-path",
+                });
+                cargo_declare.addFileArg(b.path("tools/declare-rs/Cargo.toml"));
+                cargo_declare.addArgs(&.{ "--target-dir", declare_rs_target });
+                const probe_exe = b.fmt("{s}/release/labelle-declare-rs{s}", .{
+                    declare_rs_target,
+                    if (b.graph.host.result.os.tag == .windows) ".exe" else "",
+                });
+                const run_probe = b.addSystemCommand(&.{probe_exe});
+                run_probe.step.dependOn(&cargo_declare.step);
+                const probe_out = run_probe.captureStdOut(.{});
+                tests_root_mod.addAnonymousImport("rust_declare_schema_out", .{
+                    .root_source_file = probe_out,
+                });
+                tests_root_mod.addAnonymousImport("declare_rs_decls_src", .{
+                    .root_source_file = b.path("tools/declare-rs/src/decls.rs"),
+                });
             }
 
             // The crystal binary's script object (labelle-engine#741, second

@@ -1,0 +1,30 @@
+# labelle-declare-rs — the rust declare-mode schema extractor
+# (labelle-engine#774, the "compile-and-run probe" route).
+#
+# The lua/ruby declare tools are zig exes that RUN scripts against a stub;
+# rust has no interpreter, so its declare "tool" is a probe the assembler
+# CARGO-BUILDS at generate: the shipped `labelle` module's component!/event!
+# macros (native/src/labelle.rs, #[path]-recomposed here — the tests/rust
+# pattern) register schemas under the `declare` feature, and this binary's
+# main prints the accumulated schema JSON.
+#
+# In a consumer game the assembler generates the module list from the game's
+# components/*.rs + events/*.rs; in THIS repo the probe includes the
+# cross-runner golden fixture so `zig build test` can pin byte-parity with the
+# lua/ruby runners (tests/declare_cross_golden.zig).
+[package]
+name = "labelle_declare_rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[[bin]]
+name = "labelle-declare-rs"
+path = "src/main.rs"
+
+[features]
+default = ["declare"]
+declare = ["dep:inventory"]
+
+[dependencies]
+inventory = { version = "0.3", optional = true }

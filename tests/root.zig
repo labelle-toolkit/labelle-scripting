@@ -55,6 +55,15 @@ comptime {
     if (scripting.language == .ruby) _ = @import("declare_ruby_tool.zig");
 }
 
+// The RUST declare runner's golden (labelle-engine#774) rides the RUST binary
+// only. It needs no in-process externs — the runner is an out-of-process probe
+// build.zig cargo-builds and RUNS, `@embedFile`ing its stdout — but the gate
+// keeps the two anonymous imports (the probe's captured output + the compiled
+// fixture) analyzed only where build.zig actually wired them (lang == .rust).
+comptime {
+    if (scripting.language == .rust) _ = @import("declare_rust_tool.zig");
+}
+
 // The console-eval SHARED-code suite (response builder, params decoding,
 // hook-shim AstGen check — labelle-scripting#4) also rides the lua binary
 // only: the code under test is language-independent, so one mirror is the
