@@ -13,5 +13,16 @@ rust-version = "1.82"
 [lib]
 crate-type = ["staticlib"]
 
+# Mirror native/Cargo.toml's declare feature so the shipped labelle.rs's
+# `#[cfg(feature = "declare")]` blocks are a KNOWN cfg here too (the suite
+# builds the shipped path — no features — but the cfg name must be declared or
+# rustc's check-cfg lint warns). The suite never enables it; the declare
+# probe (tools/declare-rs) is where the schema half is exercised.
+[features]
+declare = ["dep:inventory"]
+
+[dependencies]
+inventory = { version = "0.3", optional = true }
+
 [profile.release]
 panic = "unwind"

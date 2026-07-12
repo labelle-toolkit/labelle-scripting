@@ -19,6 +19,19 @@ rust-version = "1.82"
 [lib]
 crate-type = ["staticlib"]
 
+# The declare-mode schema extraction (labelle-engine#774): under this feature
+# the labelle::component!/event! macros ALSO register a schema and the declare
+# probe prints it. `inventory` is OPTIONAL and activated ONLY by this feature,
+# so the SHIPPED staticlib (built with no features) keeps its zero-dependency,
+# offline-with-just-a-toolchain property — cargo never fetches inventory for a
+# game build. Only the assembler's generate-time probe (which already has
+# network for the first fetch, like the lua dep) compiles it.
+[features]
+declare = ["dep:inventory"]
+
+[dependencies]
+inventory = { version = "0.3", optional = true }
+
 # panic = "unwind" (the default) is LOAD-BEARING, spelled out so nobody
 # "optimizes" it to abort: the glue catches script panics at every FFI
 # entry (catch_unwind) — one panicking script logs and the tick
