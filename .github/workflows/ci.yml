@@ -1347,7 +1347,10 @@ jobs:
           # toolchain by its manifest `.toolchain` ("tsc") in both the fetch
           # diagnostic AND the cache segment (tools/<toolchain>/<version>/).
           grep -qE 'fetching the tsc 7\.0\.2 .*compiler' generate.log
-          test -x "$HOME/.labelle/tools/tsc/7.0.2/linux-x64/lib/tsc"
+          # The cached binary itself — the per-platform dir binds the pin's
+          # sha512 (rev 18), so it is `linux-x64-<hash>/lib/tsc`; match by
+          # find rather than an exact path.
+          find "$HOME/.labelle/tools/tsc/7.0.2" -path '*/lib/tsc' -type f | grep -q .
           # THE declare assertions (rev 20 option (b), labelle-engine#773):
           # components/hunger.ts is transpiled BEFORE the declare phase and
           # its emitted .js extracted into a real generated registry
