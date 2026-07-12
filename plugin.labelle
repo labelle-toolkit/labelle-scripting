@@ -79,14 +79,15 @@
     // (the documented forward-compat). `crystal` landed its native declare
     // row with #775 (below) — rust's twin.
     .languages = .{
-        .{ .name = "lua", .extensions = .{"lua"}, .kind = .embedded,
+        .{ .name = "lua", .extensions = .{".lua"}, .kind = .embedded,
            .declare = .{ .tool = "labelle-declare", .dir = "tools/declare",
                          .events = true } }, // embedded VM ignores the probe cache dir
-        .{ .name = "ruby", .extensions = .{"rb"}, .kind = .embedded,
+        .{ .name = "ruby", .extensions = .{".rb"}, .kind = .embedded,
            .declare = .{ .tool = "labelle-declare-ruby", .dir = "tools/declare-ruby",
                          .events = true } },
-        .{ .name = "rust", .extensions = .{"rs"}, .kind = .native,
-           .module_root = "mod.rs", // scripts/mod.rs; build steps stay in .language_builds
+        .{ .name = "rust", .extensions = .{".rs"}, .kind = .native,
+           .module_root = "mod.rs",              // scripts/mod.rs (the crate module root)
+           .stage_subdir = "native/src/game",    // rev 19 B1: the plugin-crate dir game sources link over; build steps stay in .language_builds
            .declare = .{ .tool = "labelle-declare-rs", .dir = "tools/declare-rs",
                          .events = true } }, // native languages declare too — probe is internal to the tool
         // typescript: NO `.declare` (its `components/*.zig` are hand-written;
@@ -99,7 +100,7 @@
         // `.sha512` is the npm `dist.integrity` digest, RAW base64. Lifted
         // verbatim from the assembler's frozen `TSC_PLATFORMS` (7.0.2) so
         // both readers fetch identical bytes.
-        .{ .name = "typescript", .extensions = .{"ts"}, .kind = .embedded,
+        .{ .name = "typescript", .extensions = .{".ts"}, .kind = .embedded,
            .transpile = .{
                .emits = "js",
                .toolchain = "tsc",
@@ -119,8 +120,9 @@
         // exe exactly as rust's is. The assembler passes the same argv
         // (declaration files + persistent --cache-dir) and never learns
         // "crystal" or "crystal build". Build steps stay in .language_builds.
-        .{ .name = "crystal", .extensions = .{"cr"}, .kind = .native,
-           .module_root = "game.cr", // scripts/game.cr; build steps stay in .language_builds
+        .{ .name = "crystal", .extensions = .{".cr"}, .kind = .native,
+           .module_root = "game.cr",                    // scripts/game.cr (the crate module root)
+           .stage_subdir = "native-crystal/src/game",   // rev 19 B1: the plugin-crate dir game sources link over; build steps stay in .language_builds
            .declare = .{ .tool = "labelle-declare-crystal", .dir = "tools/declare-crystal",
                          .events = true } },
     },
