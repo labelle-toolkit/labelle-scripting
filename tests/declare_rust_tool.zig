@@ -58,16 +58,23 @@ test "drift pin: the compiled rust fixtures carry the golden's declarations verb
         );
         return error.RustFixtureDrifted;
     }
-    // The fixtures must be game-shaped: no `use crate::labelle` lines (the tool
-    // injects the prelude). A fixture that hand-added them would pass the byte
-    // test while HIDING a broken injection.
-    if (std.mem.indexOf(u8, components_src, "use crate::labelle") != null or
-        std.mem.indexOf(u8, events_src, "use crate::labelle") != null)
-    {
-        std.debug.print(
-            "a rust fixture hand-added a `use crate::labelle` line — that hides a broken prelude injection\n",
-            .{},
-        );
-        return error.RustFixtureNotGameShaped;
+    // The fixtures must be game-shaped: no `use crate::labelle` STATEMENT (the
+    // tool injects the prelude). A fixture that hand-added it would pass the byte
+    // test while HIDING a broken injection. Line-based, not substring: a header
+    // COMMENT explaining the injected prelude (which necessarily mentions `use
+    // crate::labelle`) must not trip this — only a real statement line does. The
+    // per-line trim also drops any `\r`, so the check is line-ending-agnostic.
+    for ([_][]const u8{ components_src, events_src }) |src| {
+        var lines = std.mem.splitScalar(u8, src, '\n');
+        while (lines.next()) |line| {
+            const stripped = std.mem.trim(u8, line, " \t\r");
+            if (std.mem.startsWith(u8, stripped, "use crate::labelle")) {
+                std.debug.print(
+                    "a rust fixture hand-added a `use crate::labelle` statement — that hides a broken prelude injection\n",
+                    .{},
+                );
+                return error.RustFixtureNotGameShaped;
+            }
+        }
     }
 }
