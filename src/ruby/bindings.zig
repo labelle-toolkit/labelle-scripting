@@ -297,8 +297,13 @@ fn getIntoArgs(mrb: ?*c.State) IntoArgs {
     var fields: c.Value = undefined;
     _ = c.mrb_get_args(mrb, "isoA", &i, &np, &nl, &inst, &fields);
     const nfields = c.labelle_mrb_ary_len(fields);
+    // Defense in depth: the prelude's __view rejects over-wide views at
+    // CONSTRUCTION (and the declare runner at build time), so a prelude-
+    // built view can never trip this — it guards direct raw_* callers
+    // with hand-built field arrays. Message digits ride the constant.
     if (nfields > MAX_REF_FIELDS)
-        raiseError(mrb, "ArgumentError", "labelle: Component.ref supports at most 32 fields");
+        raiseError(mrb, "ArgumentError", "labelle: Component.ref supports at most " ++
+            std.fmt.comptimePrint("{d}", .{MAX_REF_FIELDS}) ++ " fields");
     return .{ .id = idFromInt(i), .name = np[0..@intCast(nl)], .inst = inst, .fields = fields };
 }
 

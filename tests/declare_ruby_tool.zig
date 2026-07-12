@@ -373,3 +373,94 @@ test "cross-runner golden: the ruby half — byte-identical to the lua runner's 
         cross.expected_json,
     );
 }
+
+test "the view fast path's field cap fails on the declaration line: 33 rejected, 32 passes" {
+    // 33 fields: the declaration itself must fail — past declare, the
+    // SAME line's runtime half would construct a view whose every
+    // get_into/set raises (bindings.zig MAX_REF_FIELDS), and declare-time
+    // success + runtime failure is exactly the split-brain the
+    // dual-consumer design must not have. The spec is built with core
+    // ruby (a Hash is a value however it was made; 33 literal keys would
+    // pin nothing extra).
+    try expectFailure(&.{.{
+        .path = "scripts/wide.rb",
+        .source =
+        \\spec = {}
+        \\33.times { |i| spec["f%02d" % i] = 0 }
+        \\Labelle.component("Wide", spec)
+        ,
+    }}, &.{
+        "scripts/wide.rb:3", // the declaration site, not a get/set frame
+        "component 'Wide' has 33 fields",
+        "at most 32 fields; split the component",
+    });
+
+    // Exactly 32 is the edge the raw fast path accepts — still a legal
+    // declaration. Expected JSON is generated to match: fields f00..f31,
+    // where zero-padding makes numeric order lexicographic (= sorted).
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(testing.allocator);
+    try expected.appendSlice(
+        testing.allocator,
+        "{\"components\":[{\"name\":\"Wide32\",\"persist\":\"persistent\",\"fields\":[",
+    );
+    for (0..32) |i| {
+        if (i > 0) try expected.append(testing.allocator, ',');
+        const field = try std.fmt.allocPrint(
+            testing.allocator,
+            "{{\"name\":\"f{d:0>2}\",\"type\":\"i32\",\"default\":0}}",
+            .{i},
+        );
+        defer testing.allocator.free(field);
+        try expected.appendSlice(testing.allocator, field);
+    }
+    try expected.appendSlice(testing.allocator, "]}]}");
+    try expectSchema(&.{.{
+        .path = "scripts/wide32.rb",
+        .source =
+        \\spec = {}
+        \\32.times { |i| spec["f%02d" % i] = 0 }
+        \\Labelle.component("Wide32", spec)
+        ,
+    }}, expected.items);
+}
+
+/// Parse the integer literal following `needle` in `src` — the field-cap
+/// drift pin's source scanner (the packaging pins' technique: read the
+/// shipped sources, not a copy of the value).
+fn scanCapLiteral(src: []const u8, needle: []const u8) !u32 {
+    const at = std.mem.indexOf(u8, src, needle) orelse return error.NeedleNotFound;
+    var i = at + needle.len;
+    var v: u32 = 0;
+    var digits: usize = 0;
+    while (i < src.len and std.ascii.isDigit(src[i])) : (i += 1) {
+        v = v * 10 + (src[i] - '0');
+        digits += 1;
+    }
+    if (digits == 0) return error.NoDigits;
+    return v;
+}
+
+test "field-cap drift pin: bindings' MAX_REF_FIELDS equals both preludes' MAX_VIEW_FIELDS" {
+    // One number, three languages, no shared source possible: the Zig
+    // constant sizes the raw fast path's per-call buffers, the runtime
+    // prelude rejects over-wide views at construction, the declare
+    // prelude rejects the declaration at build time. If any literal
+    // drifts, either declares start passing what runtime rejects (the
+    // codex split-brain) or views start rejecting what the raw path
+    // accepts — both are this pin.
+    const zig_cap = try scanCapLiteral(
+        @embedFile("ruby_bindings_src"),
+        "const MAX_REF_FIELDS = ",
+    );
+    const runtime_cap = try scanCapLiteral(
+        @embedFile("ruby_prelude_src"),
+        "MAX_VIEW_FIELDS = ",
+    );
+    const declare_cap = try scanCapLiteral(
+        @embedFile("declare_ruby_prelude_src"),
+        "MAX_VIEW_FIELDS = ",
+    );
+    try testing.expectEqual(zig_cap, runtime_cap);
+    try testing.expectEqual(zig_cap, declare_cap);
+}

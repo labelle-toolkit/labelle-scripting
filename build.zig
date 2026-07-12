@@ -339,6 +339,21 @@ pub fn build(b: *std.Build) void {
             tests_root_mod.addAnonymousImport("build_zig_zon_src", .{
                 .root_source_file = b.path("build.zig.zon"),
             });
+            // The three sources carrying the ruby view fast path's field
+            // cap, for tests/declare_ruby_tool.zig's drift pin: the cap is
+            // one number spelled in three languages (Zig buffer sizing,
+            // runtime construction check, declare-time check), so the pin
+            // reads each literal out of its source and asserts equality —
+            // the packaging pins' technique.
+            tests_root_mod.addAnonymousImport("ruby_bindings_src", .{
+                .root_source_file = b.path("src/ruby/bindings.zig"),
+            });
+            tests_root_mod.addAnonymousImport("ruby_prelude_src", .{
+                .root_source_file = b.path("src/ruby/prelude.rb"),
+            });
+            tests_root_mod.addAnonymousImport("declare_ruby_prelude_src", .{
+                .root_source_file = b.path("tools/declare-ruby/declare_prelude.rb"),
+            });
             const tests = b.addTest(.{
                 .root_module = tests_root_mod,
             });

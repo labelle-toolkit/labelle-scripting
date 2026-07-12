@@ -527,6 +527,17 @@ module Labelle
   end
 
   class Component
+    # The view fast path's field cap — MUST equal MAX_REF_FIELDS in
+    # src/ruby/bindings.zig (raw_component_get_into/set_from size their
+    # per-call field buffers by it) and the declare prelude's twin literal
+    # (tools/declare-ruby/declare_prelude.rb). Enforced at CONSTRUCTION so
+    # an over-wide view fails on its defining line, not as a late raise
+    # inside every get/set; the declare runner rejects the same
+    # declaration at build time. Different languages, so no shared source:
+    # tests/declare_ruby_tool.zig's drift pin reads all three literals out
+    # of their sources and asserts equality.
+    MAX_VIEW_FIELDS = 32
+
     # Build a VM-side view class for an engine component:
     #
     #   Hunger = Labelle::Component.ref("Hunger", :level, :starving)
@@ -551,6 +562,11 @@ module Labelle
     # know their component (set/has?/remove), and the get/set fast paths
     # simply have no fields to move.
     def self.__view(name, fields)
+      if fields.size > MAX_VIEW_FIELDS
+        raise ArgumentError, "labelle: component '#{name}' has #{fields.size} fields — " \
+                             "the ruby view fast path supports at most #{MAX_VIEW_FIELDS} fields; " \
+                             "split the component"
+      end
       k = fields.empty? ? Class.new : Struct.new(*fields)
       k.send(:include, ComponentInstance)
       k.extend(ComponentClass)
