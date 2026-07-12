@@ -544,10 +544,10 @@ pub fn build(b: *std.Build) void {
             if (lang == .csharp) {
                 csharp_out_dir = b.cache_root.join(b.allocator, &.{"csharp-suite-out"}) catch @panic("OOM");
                 const dotnet = b.addSystemCommand(&.{
-                    "dotnet",     "build",
-                    "-c",         "Release",
-                    "--nologo",   "-v",
-                    "quiet",      "-o",
+                    "dotnet",       "build",
+                    "-c",           "Release",
+                    "--nologo",     "-v",
+                    "quiet",        "-o",
                     csharp_out_dir,
                 });
                 dotnet.addFileArg(b.path("tests/csharp/LabelleScriptsTest.csproj"));
