@@ -20,6 +20,36 @@
     .params_schema = .{
         .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript", "rust", "crystal", "csharp" }, .required = true },
     },
+    // Per-LANGUAGE capability rows (RFC-LANGUAGE-PLUGINS rev 17 §7,
+    // labelle-engine#619/#774). Each row is everything the assembler needs
+    // to know per language: name, source extensions, embed KIND, and — when
+    // the language supports declared components/events — a `.declare` row
+    // naming the tool to build, the dir whose presence gates it, and whether
+    // it handles events. The assembler reads these GENERICALLY: it builds
+    // `.declare.tool` via `zig build <tool>`, runs it passing the declaration
+    // files + a persistent per-project cache dir, and reads schema JSON from
+    // stdout — learning NOTHING language-specific. A native language declares
+    // via the IDENTICAL shape (no new field, no mechanism discriminant): the
+    // compile-and-run probe is internal to the tool exe, so `rust`'s row is
+    // the same `.{ .tool, .dir, .events }` an embedded language carries; the
+    // assembler never learns "rust" or "cargo" (the litmus test: a native
+    // declaring language adds a tools/declare-<lang> exe + this row, zero
+    // assembler changes). Old assemblers ignore this unknown key and keep
+    // their hardcoded runner table (the documented forward-compat).
+    //
+    // Only `rust` is listed today: it is the first native declare lane
+    // (#774), and its tool (tools/declare-rs) is a real self-contained exe
+    // (`zig build labelle-declare-rs`). The lua/ruby/typescript rows migrate
+    // off the assembler's hardcoded DECLARE_RUNNERS table with the rest of
+    // #619 — adding them here before the assembler's generic reader can
+    // distinguish "generic-path" from "fallback" rows would double-declare
+    // them, so they wait for that slice.
+    .languages = .{
+        .{ .name = "rust", .extensions = .{"rs"}, .kind = .native,
+           .module_root = "mod.rs", // scripts/mod.rs; build steps stay in .language_builds
+           .declare = .{ .tool = "labelle-declare-rs", .dir = "tools/declare-rs",
+                         .events = true } }, // native languages declare too — probe is internal to the tool
+    },
     // Per-LANGUAGE build steps (labelle-engine#741, native-compiled
     // family) — the #586 `.build` Step schema, applied only when the
     // project's declared `.params.language` matches an entry's language.

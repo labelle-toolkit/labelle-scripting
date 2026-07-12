@@ -75,16 +75,20 @@ pub const ruby_source =
     \\Labelle.event("wave__spawned", {})
 ;
 
-// The rust spelling (labelle-engine#774). Unlike lua/ruby — interpreted, so
-// their runner RUNS this source string — rust has no interpreter: the declare
-// "runner" is a probe cargo-BUILDS this source into (tools/declare-rs, whose
-// src/decls.rs carries exactly the block below) and executes. Types are
-// EXPLICIT here (rust is typed): the schema's f32/bool/i32/u64/vec2/str
+// The rust spelling (labelle-engine#774, rev 17). Unlike lua/ruby —
+// interpreted, so their runner RUNS one source string in-process — rust has no
+// interpreter: the declare tool (labelle-declare-rs) is a probe that
+// cargo-BUILDS the declaration files it is handed. The assembler hands it
+// components/*.rs then events/*.rs (argv order = registration order), so the
+// canonical spelling splits into a GAME-SHAPED component file and event file —
+// bare `labelle::component!{…}` / `vec2(…)` with NO `use` lines (a real game
+// omits them; the tool injects `use crate::labelle; use crate::labelle::vec2;`).
+// Types are EXPLICIT (rust is typed): the schema's f32/bool/i32/u64/vec2/str
 // vocabulary is spelled directly, `u64` standing where lua/ruby wrote the
-// `labelle.id` marker (ids default 0). tests/declare_rust_tool.zig pins the
-// probe's stdout against `expected_json` and drift-pins decls.rs against this.
-pub const rust_path = "components/kinematics.rs";
-pub const rust_source =
+// `labelle.id` marker (ids default 0). tests/declare_rust_tool.zig runs the
+// tool over the tools/declare-rs/testdata fixtures, pins its stdout against
+// `expected_json`, and drift-pins each fixture against the block below.
+pub const rust_components_source =
     \\labelle::component! {
     \\    Kinematics {
     \\        speed: f32 = 12.5,
@@ -101,6 +105,12 @@ pub const rust_source =
     \\    }
     \\}
     \\
+    \\labelle::component! {
+    \\    transient Dead {}
+    \\}
+;
+
+pub const rust_events_source =
     \\labelle::event! {
     \\    hunger__feed {
     \\        entity: u64 = 0,
@@ -109,10 +119,6 @@ pub const rust_source =
     \\        reason: str = "why \"now\"",
     \\        at: vec2 = vec2(-1.5, 3.0),
     \\    }
-    \\}
-    \\
-    \\labelle::component! {
-    \\    transient Dead {}
     \\}
     \\
     \\labelle::event! {
