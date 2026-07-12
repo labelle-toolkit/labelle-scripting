@@ -136,7 +136,7 @@ jobs:
       # `Labelle.event`, satisfied here by the `local:../..` pin). The
       # other three example jobs pin the same release — one assembler
       # generates all four examples. Bump deliberately, never float.
-      ASSEMBLER_VERSION: v0.87.0
+      ASSEMBLER_VERSION: v0.88.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/ruby-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
@@ -480,9 +480,11 @@ jobs:
       # the legacy rust/ dir — absent here, so nothing stages and the
       # greps below fail loudly. Bump deliberately, never float.
       # (Pinned one notch above this job's own floor: all four example
-      # jobs ride ONE assembler release — the ruby example's events/*.rb
-      # declarations set the repo-wide v0.87.0 pin.)
-      ASSEMBLER_VERSION: v0.87.0
+      # jobs ride ONE assembler release — the rust example's NATIVE
+      # `.languages` declarations (labelle-engine#774) now set the
+      # repo-wide v0.88.0 pin, the first release with the generic
+      # `.languages` declare reader.)
+      ASSEMBLER_VERSION: v0.88.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/rust-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
@@ -559,12 +561,52 @@ jobs:
             echo "E: generate reported failure"
             exit 1
           fi
-          # Native splices skip the declare phase SILENTLY (zero embedded
-          # scripts — the phase no-ops before its language gate), unlike
-          # the embed family's pointed notes. Its presence would mean the
-          # splice got misclassified as an embed family.
+          # Rust DECLARES now (labelle-engine#774 / assembler v0.88.0's
+          # generic `.languages` reader + this repo's tools/declare-rs): NO
+          # declare-phase skip note may appear — its presence means the
+          # plugin.labelle `.languages` rust row or the in-package tool probe
+          # regressed (the pre-v0.88.0 assertion was the INVERSE: rust was a
+          # non-declaring native splice and CI pinned the silent skip).
           if grep -q 'script-declared components' generate.log; then
-            echo "E: declare-phase note printed for a native splice"
+            echo "E: declare-phase skip note printed — rust declares since v0.88.0"
+            exit 1
+          fi
+          # THE declare assertions (the native declare lane's whole point):
+          # components/hunger.rs's schema landed as a real generated registry
+          # component — the declared default renders `1` (`{d}` of f32 1.0),
+          # DELIBERATELY not the 0.875 the spawner WRITES, so the transcript's
+          # decay chain proves the rust write traveled, not the default —
+          # components/worker.rs's zero-field tag beside it, and
+          # events/hunger__feed.rs's schema as the generated event struct (ONE
+          # scripting_events.zig at the target root — fields sorted by name,
+          # u64 id default 0). Extracted by labelle-declare-rs at generate:
+          # NOTHING embeds (the registerScript-absent assertion below), only
+          # the SCHEMA travels — the native-family distinction from ruby.
+          grep -qF 'pub const Hunger' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'level: f32 = 1,' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'starving: bool = false,' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const Worker' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const HungerFeed' .labelle/null_desktop/scripting_events.zig
+          grep -qF 'amount: f32 = 0.5,' .labelle/null_desktop/scripting_events.zig
+          grep -qF 'entity: u64 = 0,' .labelle/null_desktop/scripting_events.zig
+          # The declared components wired into the game's component registry —
+          # scenes/saves/typed queries reach them like any components/*.zig.
+          grep -qF '.Hunger = @import("scripting_components.zig").Hunger,' .labelle/null_desktop/main.zig
+          grep -qF '.Worker = @import("scripting_components.zig").Worker,' .labelle/null_desktop/main.zig
+          # The declared EVENT's union row — byte-for-byte the shape the
+          # former events/hunger__feed.zig produced, so the bus, the sidecars
+          # and the native hook consume it unchanged.
+          grep -qF 'hunger__feed: @import("scripting_events.zig").HungerFeed,' .labelle/null_desktop/main.zig
+          # Purity inventory (labelle-engine#772's mandate: every shipped
+          # language can go 100% selected-language): the ONLY authored .zig
+          # in this example is the OPTIONAL native escape hatch. If a new
+          # .zig sneaks in as load-bearing, this fails and the purity story is
+          # void — make it a .rs, or consciously move it into hooks/ and
+          # update the variant below.
+          ZIGS=$(git ls-files -- '*.zig')
+          if [ "$ZIGS" != "hooks/feed_watcher.zig" ]; then
+            echo "E: examples/rust-game .zig inventory changed (expected exactly hooks/feed_watcher.zig):"
+            printf '%s\n' "$ZIGS"
             exit 1
           fi
           # This example is MIGRATED to scripts/ — the legacy-dir grace
@@ -693,6 +735,102 @@ jobs:
           fi
           echo "PASS: rust drove the real engine — Script-trait structs compiled by the plugin's cargo step, buffer-reuse wrappers, cross-script hunger__feed (rust AND native Zig hook off one bus) + engine__tick over 5 headless frames, against this repo's HEAD"
 
+      # THE PURITY PROOF (labelle-engine#772's mandate: "every shipped
+      # language must be able to go 100% selected-language — no Zig at
+      # all"). The native declare lane (labelle-engine#774) makes rust the
+      # native-family peer of ruby here: components + event + scripts are all
+      # .rs, and hooks/feed_watcher.zig is the example's OPTIONAL native
+      # escape hatch — kept above as the interop demo — so purity is proven
+      # by deletion: scratch-copy the example, rm -rf the copy's hooks/,
+      # regenerate + rebuild + rerun. The copy is a ZERO-.zig game
+      # (asserted), the generated main folds no FeedWatcher, and the
+      # transcript is the SAME 15-token run minus exactly ZIG_FEED_SEEN_0.5 —
+      # nothing else moves, so the native Zig layer is demonstrably additive,
+      # never load-bearing. Reuses the main step's warm package/zig caches
+      # (same redirected HOME + rustup/cargo homes).
+      - name: Purity variant — delete hooks/, rerun 100% rust
+        run: |
+          set -o pipefail
+          # cargo must survive the fresh-HOME swap (see the main step): pin
+          # the rustup/cargo homes to the real locations first, then redirect
+          # HOME to the isolated package cache the main step warmed.
+          export RUSTUP_HOME="$HOME/.rustup"
+          export CARGO_HOME="$HOME/.cargo"
+          export HOME="$RUNNER_TEMP/labelle-home"
+
+          cd labelle-scripting/examples
+          rm -rf rust-game-pure && mkdir rust-game-pure
+          (cd rust-game && tar cf - --exclude .labelle --exclude generate.log .) | (cd rust-game-pure && tar xf -)
+          rm -rf rust-game-pure/hooks
+          cd rust-game-pure
+
+          # 100% rust, provably: not one .zig file in the authored tree.
+          if [ -n "$(find . -name '*.zig' -not -path './.labelle/*')" ]; then
+            echo "E: purity copy still contains .zig files:"
+            find . -name '*.zig' -not -path './.labelle/*'
+            exit 1
+          fi
+
+          ASM=$GITHUB_WORKSPACE/labelle-assembler
+          $ASM install --project-root .
+          $ASM generate --project-root . 2>&1 | tee generate.log
+          if grep -q 'generate failed' generate.log; then
+            echo "E: generate reported failure"
+            exit 1
+          fi
+
+          # The rust-declared component + event still generate; the hooks
+          # scan folds nothing (no receiver, no native subscriber).
+          grep -qF 'pub const Hunger' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const HungerFeed' .labelle/null_desktop/scripting_events.zig
+          if grep -q 'FeedWatcher' .labelle/null_desktop/main.zig; then
+            echo "E: FeedWatcher receiver generated for a hooks-less game"
+            exit 1
+          fi
+
+          cd .labelle/null_desktop
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          LABELLE_NULL_FRAMES=5 ./zig-out/bin/rust_game > run.log 2>&1
+
+          # The full job's pinned sequence minus exactly the native hook's
+          # token — every rust-side milestone, position and value, survives
+          # the deletion untouched.
+          grep -oE '(RUST|ZIG)_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          RUST_INIT
+          RUST_CTRL_READY
+          RUST_LEVEL_0.625
+          RUST_FEED_SENT
+          RUST_LEVEL_0.375
+          RUST_ENGINE_TICK_SEEN
+          RUST_FED_LEVEL_0.875
+          RUST_LEVEL_0.625
+          RUST_LEVEL_0.375
+          RUST_LEVEL_0.125
+          RUST_STARVING
+          RUST_BUFFERS_OK
+          RUST_CTRL_DONE
+          RUST_DEINIT
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: purity-variant milestone sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: the 100% rust game (zero .zig) generated, built and ran green — hooks/ is proven OPTIONAL (14 tokens, ZIG_FEED_SEEN_0.5 alone gone)"
+
   # Crystal example game (labelle-engine#741) — the SECOND native-compiled
   # example, rust-example's crystal twin, living in THIS repo so every push
   # runs a real crystal game through the real assembler against the real
@@ -724,9 +862,11 @@ jobs:
       # crystal/ dir — absent here, so nothing stages and the greps below
       # fail loudly. Bump deliberately, never float.
       # (Pinned one notch above this job's own floor: all four example
-      # jobs ride ONE assembler release — the ruby example's events/*.rb
-      # declarations set the repo-wide v0.87.0 pin.)
-      ASSEMBLER_VERSION: v0.87.0
+      # jobs ride ONE assembler release — the rust example's NATIVE
+      # `.languages` declarations (labelle-engine#774) now set the
+      # repo-wide v0.88.0 pin, the first release with the generic
+      # `.languages` declare reader.)
+      ASSEMBLER_VERSION: v0.88.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/crystal-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
@@ -997,9 +1137,11 @@ jobs:
       # hard-fail on `.ts` sources (#586's placeholder gate). Bump
       # deliberately, never float.
       # (Pinned one notch above this job's own floor: all four example
-      # jobs ride ONE assembler release — the ruby example's events/*.rb
-      # declarations set the repo-wide v0.87.0 pin.)
-      ASSEMBLER_VERSION: v0.87.0
+      # jobs ride ONE assembler release — the rust example's NATIVE
+      # `.languages` declarations (labelle-engine#774) now set the
+      # repo-wide v0.88.0 pin, the first release with the generic
+      # `.languages` declare reader.)
+      ASSEMBLER_VERSION: v0.88.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/ts-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.

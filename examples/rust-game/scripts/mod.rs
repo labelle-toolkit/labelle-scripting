@@ -11,9 +11,9 @@
 //!
 //! The game mirrors examples/ruby-game's hunger sawtooth so the
 //! cross-language story is visible token-for-token: same Hunger/Worker
-//! component shapes (Zig files here — rust has no declare mode; the ruby
-//! game declares Hunger in ruby), same command-event
-//! (events/hunger__feed.zig), same native Zig hook
+//! component shapes (rust-DECLARED here — components/*.rs, like the ruby
+//! game declares them in ruby), same command-event
+//! (events/hunger__feed.rs), same native Zig hook
 //! (hooks/feed_watcher.zig) — only the script layer swaps ruby for rust
 //! (ruby's transcript carries one extra token, its pure-ruby
 //! feed-watcher's).

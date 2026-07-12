@@ -11,15 +11,16 @@
 //!     `String` for the write-back JSON — rust's FrameArray equivalent
 //!     is exactly this clear-retains-capacity discipline, pinned flat
 //!     by RUST_BUFFERS_OK at tick 5,
-//!   - command-as-event feeding (`hunger__feed`, events/hunger__feed.zig)
+//!   - command-as-event feeding (`hunger__feed`, events/hunger__feed.rs)
 //!     subscribed in `init` — emitted by scripts/spawner.rs on tick 2,
 //!     so the cross-script round-trip over the engine bus is part of the
 //!     pinned transcript,
 //!   - a NATIVE game-root Zig hook (hooks/feed_watcher.zig) consumes the
 //!     SAME hunger__feed from the same bus — the two-layer interop.
 //!
-//! `Hunger` is a real engine component (components/hunger.zig) — rust
-//! has no declare mode, so every call addresses it by name over the
+//! `Hunger` is a rust-DECLARED component (components/hunger.rs — the
+//! native declare lane, labelle-engine#774): its schema is extracted into
+//! the generated registry, and every call addresses it by name over the
 //! contract at runtime. Timeline: scripts/mod.rs's header.
 
 use super::{f32_field, u64_field};
