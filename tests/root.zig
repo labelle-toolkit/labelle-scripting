@@ -44,6 +44,16 @@ comptime {
     if (scripting.language == .lua) _ = @import("declare_tool.zig");
 }
 
+// The RUBY declare runner's goldens (tools/declare-ruby via
+// `declare_ruby_core`) ride the RUBY binary the same way: its mrb_* and
+// labelle_mrb_* externs resolve against the mruby objects (+ shim.c) the
+// ruby-language module compiled in. The cross-runner byte-parity golden
+// lives in BOTH files through tests/declare_cross_golden.zig's shared
+// expected-JSON literal — each binary pins its own runner against it.
+comptime {
+    if (scripting.language == .ruby) _ = @import("declare_ruby_tool.zig");
+}
+
 // The console-eval SHARED-code suite (response builder, params decoding,
 // hook-shim AstGen check — labelle-scripting#4) also rides the lua binary
 // only: the code under test is language-independent, so one mirror is the
