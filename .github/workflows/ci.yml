@@ -112,7 +112,11 @@ jobs:
   # engine: examples/ruby-game pins its scripting plugin `local:../..`
   # (the CURRENT checkout), so the vendored mruby, prelude, bindings and
   # Controller under review are exactly what the generated game embeds.
-  # Ruby's permanent regression net.
+  # Ruby's permanent regression net — and the toolkit's first
+  # PROVABLY-PURE game (labelle-engine#772): scripts, components and the
+  # custom event are all .rb; the one .zig (hooks/feed_watcher.zig) is
+  # the optional native escape hatch, and the second step deletes it in
+  # a scratch copy and runs the game green without it.
   ruby-example:
     runs-on: ubuntu-latest
     # Cold toolkit fetch + engine/mruby compile normally lands well under
@@ -120,16 +124,19 @@ jobs:
     timeout-minutes: 30
     env:
       # The pinned labelle-assembler release the example generates with —
-      # a BINARY release (tag → release.yml assets). v0.86.0 is the HARD
-      # floor for this example's layout (labelle-engine#237's two
-      # convention refinements): the shared `scripts/` dir with ordering
-      # prefixes (labelle-assembler#614) and ruby component DECLARATIONS
+      # a BINARY release (tag → release.yml assets). v0.87.0 is the HARD
+      # floor for this example: it collects EVENT declarations in
+      # `events/*.rb` (labelle-assembler#618 — labelle-engine#772's
+      # assembler slice; older releases fail generate up front naming the
+      # events files), on top of v0.86.0's layout floor
+      # (labelle-engine#237): the shared `scripts/` dir with ordering
+      # prefixes (labelle-assembler#614) and ruby COMPONENT declarations
       # in `components/*.rb` (labelle-assembler#615's DECLARE_RUNNERS row,
-      # wiring this repo's tools/declare-ruby, v0.9.0+). Older releases
-      # read only the legacy ruby/ dir (empty here — nothing embeds, the
-      # registerScript greps fail loudly) and skip the declare phase.
-      # Bump deliberately, never float.
-      ASSEMBLER_VERSION: v0.86.0
+      # wiring this repo's tools/declare-ruby — events need its v0.10.0
+      # `Labelle.event`, satisfied here by the `local:../..` pin). The
+      # other three example jobs pin the same release — one assembler
+      # generates all four examples. Bump deliberately, never float.
+      ASSEMBLER_VERSION: v0.87.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/ruby-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
@@ -211,31 +218,63 @@ jobs:
             echo "E: legacy script-dir deprecation note printed for a migrated example"
             exit 1
           fi
-          # THE declare assertion: components/hunger.rb's schema landed
+          # THE declare assertions: components/hunger.rb's schema landed
           # as a real generated registry component (field defaults
-          # included — the transcript's 0.875 seed comes from HERE).
+          # included — the transcript's 0.875 seed comes from HERE),
+          # components/worker.rb's zero-field tag beside it, and
+          # events/hunger__feed.rb's schema as the generated event struct
+          # (labelle-engine#772 / assembler v0.87.0: ONE
+          # scripting_events.zig at the target root — fields sorted by
+          # name, Labelle.id classified u64).
           grep -qF 'pub const Hunger' .labelle/null_desktop/scripting_components.zig
           grep -qF 'level: f32 = 0.875,' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const Worker' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const HungerFeed' .labelle/null_desktop/scripting_events.zig
+          grep -qF 'amount: f32 = 0.5,' .labelle/null_desktop/scripting_events.zig
+          grep -qF 'entity: u64 = 0,' .labelle/null_desktop/scripting_events.zig
 
           # Codegen assertions — each is one link of the chain; fail
           # loudly if a regression drops it.
           M=.labelle/null_desktop/main.zig
-          # The declared component wired into the game's component
-          # registry — scenes/saves/typed queries reach it like any
+          # The declared components wired into the game's component
+          # registry — scenes/saves/typed queries reach them like any
           # components/*.zig file.
           grep -qF '.Hunger = @import("scripting_components.zig").Hunger,' $M
-          # Splice: all four ruby chunks registered before the VM boots —
-          # the components/ DECLARATION first (its view constant must
-          # exist when scripts load), then scripts/ in ordering-prefix
-          # order (stems stripped: 10_spawner → "spawner"), unnumbered
-          # last. The ORDER is the contract, so diff it, don't just grep.
+          grep -qF '.Worker = @import("scripting_components.zig").Worker,' $M
+          # The declared EVENT's union row — byte-for-byte the shape a
+          # Zig-authored events/hunger__feed.zig produced, so the bus,
+          # the sidecars and the native hook consume it unchanged.
+          grep -qF 'hunger__feed: @import("scripting_events.zig").HungerFeed,' $M
+          # Splice: all six ruby chunks registered before the VM boots —
+          # components/ DECLARATIONS first (their view constants must
+          # exist when scripts load), then events/ (the `HungerFeed`
+          # constant scripts/feed_watcher.rb subscribes with), then
+          # scripts/ in ordering-prefix order (stems stripped:
+          # 10_spawner → "spawner"), unnumbered last. The ORDER is the
+          # contract (components → events → scripts, pinned by the
+          # assembler), so diff it, don't just grep.
           grep -qF 'scripting.registerScript("hunger", @embedFile("components/hunger.rb"));' $M
+          grep -qF 'scripting.registerScript("worker", @embedFile("components/worker.rb"));' $M
+          grep -qF 'scripting.registerScript("hunger__feed", @embedFile("events/hunger__feed.rb"));' $M
           grep -qF 'scripting.registerScript("spawner", @embedFile("scripts/10_spawner.rb"));' $M
           grep -qF 'scripting.registerScript("hunger_controller", @embedFile("scripts/20_hunger_controller.rb"));' $M
           grep -qF 'scripting.registerScript("feed_watcher", @embedFile("scripts/feed_watcher.rb"));' $M
           grep -oE 'registerScript\("[a-z_0-9]+"' $M | cut -d'"' -f2 > .labelle/reg_order.txt
-          printf '%s\n' hunger spawner hunger_controller feed_watcher > .labelle/reg_expected.txt
+          printf '%s\n' hunger worker hunger__feed spawner hunger_controller feed_watcher > .labelle/reg_expected.txt
           diff .labelle/reg_expected.txt .labelle/reg_order.txt
+
+          # Purity inventory (labelle-engine#772's mandate: every shipped
+          # language can go 100% selected-language): the ONLY authored
+          # .zig in this example is the OPTIONAL native escape hatch. If
+          # a new .zig sneaks in as a load-bearing part of the example,
+          # this fails and the purity story is void — make it a .rb, or
+          # consciously move it into hooks/ and update the variant below.
+          ZIGS=$(git ls-files -- '*.zig')
+          if [ "$ZIGS" != "hooks/feed_watcher.zig" ]; then
+            echo "E: examples/ruby-game .zig inventory changed (expected exactly hooks/feed_watcher.zig):"
+            printf '%s\n' "$ZIGS"
+            exit 1
+          fi
           # Splice: the generated flag half of the templates' double-gate.
           grep -qF 'const scripting_enabled = true;' $M
           # labelle-null template: the bind touchpoint (proves the sibling
@@ -322,7 +361,96 @@ jobs:
             cat run.log
             exit 1
           fi
-          echo "PASS: ruby drove the real engine — ruby-DECLARED Hunger component (components/hunger.rb, defaults through the ECS) + plain hooks + controller + cross-script hunger__feed (controller, pure-ruby watcher AND native Zig hook off one bus) + FrameArray + engine__tick over 5 headless frames, against this repo's HEAD"
+          echo "PASS: ruby drove the real engine — ruby-DECLARED components (hunger.rb defaults through the ECS, worker.rb tag) + ruby-DECLARED hunger__feed event (events/hunger__feed.rb through the generated union, consumed natively: ZIG_FEED_SEEN_0.5) + plain hooks + controller + three subscribers off one bus + FrameArray + engine__tick over 5 headless frames, against this repo's HEAD"
+
+      # THE PURITY PROOF (labelle-engine#772's mandate: "every shipped
+      # language must be able to go 100% selected-language — no Zig at
+      # all"). hooks/feed_watcher.zig is the example's OPTIONAL native
+      # escape hatch — kept above as the interop demo — so purity is
+      # proven by deletion: scratch-copy the example, rm -rf the copy's
+      # hooks/, regenerate + rebuild + rerun. The copy is a ZERO-.zig
+      # game (asserted), the generated main folds no FeedWatcher, and
+      # the transcript is the SAME 16-token run minus exactly
+      # ZIG_FEED_SEEN_0.5 — nothing else moves, so the native layer is
+      # demonstrably additive, never load-bearing. Reuses the main
+      # step's warm package/zig caches (same redirected HOME).
+      - name: Purity variant — delete hooks/, rerun 100% ruby
+        run: |
+          set -o pipefail
+          export HOME="$RUNNER_TEMP/labelle-home"
+
+          cd labelle-scripting/examples
+          rm -rf ruby-game-pure && mkdir ruby-game-pure
+          (cd ruby-game && tar cf - --exclude .labelle --exclude generate.log .) | (cd ruby-game-pure && tar xf -)
+          rm -rf ruby-game-pure/hooks
+          cd ruby-game-pure
+
+          # 100% ruby, provably: not one .zig file in the authored tree.
+          if [ -n "$(find . -name '*.zig' -not -path './.labelle/*')" ]; then
+            echo "E: purity copy still contains .zig files:"
+            find . -name '*.zig' -not -path './.labelle/*'
+            exit 1
+          fi
+
+          ASM=$GITHUB_WORKSPACE/labelle-assembler
+          $ASM install --project-root .
+          $ASM generate --project-root . 2>&1 | tee generate.log
+          if grep -q 'generate failed' generate.log; then
+            echo "E: generate reported failure"
+            exit 1
+          fi
+
+          # The ruby-declared event still generates; the hooks scan folds
+          # nothing (no receiver, no native subscriber).
+          grep -qF 'pub const HungerFeed' .labelle/null_desktop/scripting_events.zig
+          if grep -q 'FeedWatcher' .labelle/null_desktop/main.zig; then
+            echo "E: FeedWatcher receiver generated for a hooks-less game"
+            exit 1
+          fi
+
+          cd .labelle/null_desktop
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          LABELLE_NULL_FRAMES=5 ./zig-out/bin/ruby_game > run.log 2>&1
+
+          # The full job's pinned sequence minus exactly the native
+          # hook's token — every ruby-side milestone, position and value,
+          # survives the deletion untouched.
+          grep -oE '(RUBY|ZIG)_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          RUBY_INIT
+          RUBY_CTRL_READY
+          RUBY_LEVEL_0.625
+          RUBY_FEED_SENT
+          RUBY_LEVEL_0.375
+          RUBY_ENGINE_TICK_SEEN
+          RUBY_WATCHER_SAW_0.5
+          RUBY_FED_LEVEL_0.875
+          RUBY_LEVEL_0.625
+          RUBY_LEVEL_0.375
+          RUBY_LEVEL_0.125
+          RUBY_STARVING
+          RUBY_FRAMEARRAY_OK
+          RUBY_CTRL_DONE
+          RUBY_DEINIT
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: purity-variant milestone sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: the 100% ruby game (zero .zig) generated, built and ran green — hooks/ is proven OPTIONAL (15 tokens, ZIG_FEED_SEEN_0.5 alone gone)"
 
   # Rust example game (labelle-engine#741) — the NATIVE-COMPILED counterpart
   # of ruby-example, living in THIS repo so every push runs a real rust game
@@ -351,7 +479,10 @@ jobs:
       # forward-compat the crystal entry needs.) Older releases read only
       # the legacy rust/ dir — absent here, so nothing stages and the
       # greps below fail loudly. Bump deliberately, never float.
-      ASSEMBLER_VERSION: v0.86.0
+      # (Pinned one notch above this job's own floor: all four example
+      # jobs ride ONE assembler release — the ruby example's events/*.rb
+      # declarations set the repo-wide v0.87.0 pin.)
+      ASSEMBLER_VERSION: v0.87.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/rust-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
@@ -592,7 +723,10 @@ jobs:
       # labelle-assembler#612.) Older releases read only the legacy
       # crystal/ dir — absent here, so nothing stages and the greps below
       # fail loudly. Bump deliberately, never float.
-      ASSEMBLER_VERSION: v0.86.0
+      # (Pinned one notch above this job's own floor: all four example
+      # jobs ride ONE assembler release — the ruby example's events/*.rb
+      # declarations set the repo-wide v0.87.0 pin.)
+      ASSEMBLER_VERSION: v0.87.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/crystal-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
@@ -862,7 +996,10 @@ jobs:
       # `scripts/` convention dir (labelle-assembler#614). Older releases
       # hard-fail on `.ts` sources (#586's placeholder gate). Bump
       # deliberately, never float.
-      ASSEMBLER_VERSION: v0.86.0
+      # (Pinned one notch above this job's own floor: all four example
+      # jobs ride ONE assembler release — the ruby example's events/*.rb
+      # declarations set the repo-wide v0.87.0 pin.)
+      ASSEMBLER_VERSION: v0.87.0
     steps:
       # Checkout into a subdir so the example's sibling pins resolve:
       # examples/ts-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.

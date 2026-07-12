@@ -30,6 +30,14 @@
 # SUBSCRIPTION order, and this file-scope sub happened at chunk load —
 # before the controller's setup-time `on`), one tick after the native
 # hook's ZIG_FEED_SEEN_0.5.
-Labelle.on("hunger__feed") do |ev|
+#
+# `HungerFeed` is the DECLARED constant — defined in
+# events/hunger__feed.rb, visible here because events register first
+# (components → events → scripts, pinned) and ruby top-level constants
+# are VM-global. `Labelle.event` returned the frozen event-name string,
+# so this subscription and the spawner's string-spelled
+# `Labelle.emit("hunger__feed", …)` meet on the same bus — both
+# spellings of one event, coexisting deliberately.
+Labelle.on(HungerFeed) do |ev|
   Labelle.log("RUBY_WATCHER_SAW_#{ev[:amount]}")
 end

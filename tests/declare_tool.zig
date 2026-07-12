@@ -284,6 +284,66 @@ test "chunk envs are isolated: one script's top-level globals never leak into th
     }, &.{ "b.lua:1", "helper" });
 }
 
+test "a component ref where an event name belongs fails at generate (the on/emit shims)" {
+    // The ruby runner's codex finding (#28) exists here too:
+    // `labelle.on(Worker)` — a real constant of the WRONG KIND (the
+    // component ref table, not an event-name string) — used to pass a
+    // blind no-op and only die at RUNTIME, where raw_event_subscribe
+    // reads the name through lua_tolstring (strings and numbers only) and
+    // the raise evicts the script. The declare stub's on/emit shims now
+    // validate the name at generate, naming the component.
+    try expectFailure(&.{.{
+        .path = "scripts/bad.lua",
+        .source =
+        \\local Worker = labelle.component("Worker", { hp = 1 })
+        \\labelle.on(Worker, function(ev) end)
+        ,
+    }}, &.{
+        "scripts/bad.lua:2",
+        "labelle.on: expected an event-name string",
+        "the component 'Worker'",
+    });
+    try expectFailure(&.{.{
+        .path = "scripts/bad.lua",
+        .source =
+        \\local Worker = labelle.component("Worker", { hp = 1 })
+        \\labelle.emit(Worker, { amount = 1 })
+        ,
+    }}, &.{
+        "scripts/bad.lua:2",
+        "labelle.emit: expected an event-name string",
+        "the component 'Worker'",
+    });
+    // nil rides the same rejection: an undefined global (a typo, or a
+    // cross-file global — runtime script envs SHADOW _G, so those never
+    // resolve there either) raises identically at runtime.
+    try expectFailure(&.{.{
+        .path = "scripts/bad.lua",
+        .source = "labelle.on(HungerFed, function(ev) end)",
+    }}, &.{ "scripts/bad.lua:1", "labelle.on: expected an event-name string", "got nil" });
+    // A helper result names its own source; the runtime would raise on
+    // the non-string all the same.
+    try expectFailure(&.{.{
+        .path = "scripts/bad.lua",
+        .source = "labelle.emit(labelle.array({}))",
+    }}, &.{ "scripts/bad.lua:1", "labelle.emit", "a labelle.* helper result" });
+    // The shims mirror the runtime's ACCEPTANCE too, not a stricter rule:
+    // the same-file event constant is the name string (the RFC line), and
+    // numbers pass because lua_tolstring coerces them at runtime.
+    try expectSchema(&.{.{
+        .path = "scripts/ok.lua",
+        .source =
+        \\local HungerFeed = labelle.event("hunger__feed", {})
+        \\labelle.on(HungerFeed, function(ev) end)
+        \\labelle.emit(HungerFeed, { amount = 1 })
+        \\labelle.on(42, function(ev) end)
+        \\labelle.emit(7)
+        ,
+    }},
+        \\{"components":[],"events":[{"name":"hunger__feed","fields":[]}]}
+    );
+}
+
 test "cross-runner golden: the lua half — byte-identical to the ruby runner's schema" {
     // The other half lives in tests/declare_ruby_tool.zig (the ruby
     // binary); both assert the SAME expected literal from

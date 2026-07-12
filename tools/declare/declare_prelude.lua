@@ -9,10 +9,13 @@
 -- string at runtime is, here, an event-schema declaration
 -- (labelle-engine#772). Each script chunk runs under a private _ENV whose
 -- ONLY entry is its own FRESH stub `labelle` table — `component` and
--- `event` record declarations, `id` is the u64 field marker, every other
--- `labelle.*` is a silent no-op (returning a sentinel that the recorders
--- reject if it lands in a spec), and no other global (not even the stdlib)
--- is visible. Scripts' init/update are merely DEFINED by the chunk body,
+-- `event` record declarations, `id` is the u64 field marker, `on` and
+-- `emit` are no-ops that still validate the event NAME the way the
+-- runtime bindings do (a component ref where an event name belongs must
+-- fail at generate, not evict at runtime), every other `labelle.*` is a
+-- silent no-op (returning a sentinel that the recorders reject if it
+-- lands in a spec), and no other global (not even the stdlib) is
+-- visible. Scripts' init/update are merely DEFINED by the chunk body,
 -- never called, so only chunk-scope code executes — exactly where
 -- declarations sit.
 --
@@ -314,10 +317,49 @@ local function declare_event(name, spec, ...)
   return name
 end
 
+-- Declare-mode labelle.on/labelle.emit: name-checked no-ops. Still
+-- no-ops — nothing subscribes, handlers never run, extra arguments are
+-- swallowed, and both return the spec-position-rejected sentinel like
+-- every other stub call — but the event NAME is validated exactly the
+-- way the RUNTIME bindings validate it: raw_event_subscribe/
+-- raw_event_emit read the name through lua_tolstring
+-- (src/lua/bindings.zig checkString), which accepts strings AND numbers
+-- (Lua's own coercion) and raises for everything else. Without this
+-- check a real constant of the WRONG KIND — a component ref where an
+-- event name belongs, `labelle.on(Worker)` — passed generate as a blind
+-- no-op and only died in the running game as a script eviction (the
+-- same-file `local HungerFeed = labelle.event(...)` pattern passes by
+-- construction: labelle.event returns the name string). Level 3:
+-- check_event_name(1) → declare_on/declare_emit(2) → the script's
+-- labelle.on/emit line (3).
+local function check_event_name(callee, name)
+  local t = type(name)
+  if t == "string" or t == "number" then return end
+  local got = t
+  if rawequal(name, noop_result) then
+    got = "a labelle.* helper result"
+  elseif t == "table" and rawget(name, "__labelle_component") ~= nil then
+    got = "the component '" .. tostring(rawget(name, "__labelle_component")) .. "'"
+  end
+  error("labelle." .. callee .. ": expected an event-name string — got " .. got ..
+    " (events subscribe and emit by name; a component constant is not an event name)", 3)
+end
+
+local function declare_on(name, ...)
+  check_event_name("on", name)
+  return noop_result
+end
+
+local function declare_emit(name, ...)
+  check_event_name("emit", name)
+  return noop_result
+end
+
 -- The stub `labelle`: `component` and `event` are live, `id` is the u64
--- field marker, EVERY other key resolves to the shared sentinel-returning
--- no-op — `labelle.on`/`log`/`emit`/... at chunk scope neither run nor
--- error, mirroring "only declarations matter at build time".
+-- field marker, `on` and `emit` are the name-checked no-ops above, and
+-- EVERY other key resolves to the shared sentinel-returning no-op —
+-- `labelle.log`/`array`/... at chunk scope neither run nor error,
+-- mirroring "only declarations matter at build time".
 --
 -- __declare_stub is a FACTORY, not one table: extract.zig calls it once
 -- per chunk, so each chunk's env gets its OWN stub. With a single shared
@@ -331,7 +373,13 @@ end
 local stub_mt = { __index = function() return noop end }
 function _G.__declare_stub()
   return setmetatable(
-    { component = declare_component, event = declare_event, id = id_sentinel },
+    {
+      component = declare_component,
+      event = declare_event,
+      id = id_sentinel,
+      on = declare_on,
+      emit = declare_emit,
+    },
     stub_mt
   )
 end

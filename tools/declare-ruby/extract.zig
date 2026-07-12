@@ -19,7 +19,9 @@
 //! chunk environments (top-level defs, constants and module mutations are
 //! process-global), so this extractor opens a FRESH mrb_state PER CHUNK.
 //! A chunk clobbering `Labelle.component`, defining helpers, or binding
-//! constants dies with its interpreter — later files never see it. That
+//! constants dies with its interpreter — later files never see any of
+//! its VALUES (constant names alone travel, as inert sentinels — the
+//! ledger below). That
 //! is affordable precisely because extraction is a BUILD step (an
 //! mrb_open is sub-millisecond; scripts are dozens, not millions) and it
 //! buys a stronger guarantee than the lua factory-stub: NOTHING survives
@@ -27,6 +29,38 @@
 //! duplicate detection, emitted fragments for the final schema) lives on
 //! THIS side and is threaded into each fresh state through the prelude's
 //! __declare_seed/__declare_begin/__declare_take seams.
+//!
+//! Constant ledger — the one deliberate softening of that isolation
+//! (labelle-engine#772): at runtime ONE shared VM loads every file, so a
+//! later file legally references an earlier file's top-level constants
+//! at chunk scope (`Labelle.on(HungerFeed)` in a script, HungerFeed
+//! declared in an events file). After each clean chunk the driver
+//! harvests the FULL post-eval constant snapshot (__declare_take_consts,
+//! a baseline diff of that state's Object with seeded names included at
+//! current values — the ledger is REPLACED, so reassignments and
+//! remove_const behave like the runtime's one shared VM) as
+//! name→TAGGED-VALUE pairs —
+//! primitives (String, Integer, Float, true, false, nil) travel
+//! VERBATIM, everything else (classes incl. component view stubs,
+//! arrays, hashes, procs) degrades to a sentinel tag — and re-binds them
+//! into every LATER chunk's fresh state (__declare_seed_const):
+//! primitives to their real values, MIRRORING the runtime's shared VM
+//! (a cross-file event constant reaches Labelle.on as the actual name
+//! string; a shared `SHARED_DEFAULT = 0.5` classifies in a spec exactly
+//! as it would resolve at runtime), the non-primitive rest to the inert
+//! sentinel — resolvable in call positions, rejected in spec positions
+//! and by the on/emit name checks, answering no methods (isolation
+//! holds: only VALUES that are plain data ever cross states). A constant
+//! NO earlier input defined (a typo) stays unresolved and NameErrors at
+//! extract with the chunk's file:line, and a reference to a LATER file's
+//! constant fails the same way — both matching the runtime, where
+//! file-scope code runs before later files load. "Earlier" is meaningful
+//! because argv order IS the runtime registration order: the assembler
+//! collects `components/*.<ext>`, then `events/*.<ext>`, then the script
+//! dir, and hands this tool that exact list (verified against
+//! labelle-assembler v0.87.0 — root.zig's concatEmbeds3 builds the
+//! components → events → scripts slice and scripting_declare.zig's
+//! runDeclareTool appends opts.script_files to the argv verbatim).
 //!
 //! Separate from src/ruby/vm.zig on purpose (the lua extract.zig rule):
 //! vm.zig's error paths log through the Script Runtime Contract's
@@ -112,6 +146,25 @@ const c = struct {
 
         pub fn module(p: *RClass) Value {
             return .{ .value = .{ .p = p }, .tt = .module };
+        }
+
+        // The immediate-value constructors (vm.zig's spellings of
+        // mruby's SET_*_VALUE macros under MRB_NO_BOXING) — how the
+        // ledger's primitive seeds re-enter a fresh state.
+        pub fn nil() Value {
+            return .{ .value = .{ .i = 0 }, .tt = .false };
+        }
+
+        pub fn boolean(b: bool) Value {
+            return .{ .value = .{ .i = 1 }, .tt = if (b) .true else .false };
+        }
+
+        pub fn int(i: Int) Value {
+            return .{ .value = .{ .i = i }, .tt = .integer };
+        }
+
+        pub fn float(f: f64) Value {
+            return .{ .value = .{ .f = f }, .tt = .float };
         }
 
         pub fn isNil(v: Value) bool {
@@ -200,6 +253,26 @@ const Decl = struct {
     const Kind = enum { component, event };
 };
 
+/// One constant-ledger entry: a top-level constant an earlier chunk
+/// defined, held as the TAGGED value it carried when its chunk finished.
+/// Primitives seed later chunks verbatim (the runtime's shared VM makes
+/// them genuinely visible there — an event constant IS its name string);
+/// `.sentinel` is the non-primitive rest (view classes, collections,
+/// procs), seeded as the prelude's inert NOOP_RESULT.
+const Const = struct {
+    name: []u8,
+    value: Tagged,
+
+    const Tagged = union(enum) {
+        sentinel,
+        nil,
+        boolean: bool,
+        integer: i64,
+        float: f64,
+        string: []u8,
+    };
+};
+
 /// Borrowed view of an mruby String's bytes (valid while its state lives).
 fn strSlice(v: c.Value) []const u8 {
     const len: usize = @intCast(c.labelle_mrb_str_len(v));
@@ -223,8 +296,29 @@ pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
         decls.deinit(allocator);
     }
 
+    // The constant ledger: the game-level constants alive after the last
+    // chunk ran — name plus tagged value (primitives verbatim,
+    // `.sentinel` for the rest). Seeded into each later chunk's fresh
+    // state before its body runs, then REPLACED wholesale with that
+    // chunk's post-eval snapshot (seeds included, at current values) —
+    // so a reassignment or remove_const is reflected for every later
+    // chunk, exactly like the runtime's one shared VM. Input (= argv =
+    // runtime registration) order makes "earlier" mean what it means at
+    // runtime — see the module doc.
+    var consts: std.ArrayList(Const) = .empty;
+    defer {
+        for (consts.items) |entry| {
+            allocator.free(entry.name);
+            switch (entry.value) {
+                .string => |s| allocator.free(s),
+                else => {},
+            }
+        }
+        consts.deinit(allocator);
+    }
+
     for (inputs) |input| {
-        if (try runChunk(allocator, input, &decls)) |failure|
+        if (try runChunk(allocator, input, &decls, &consts)) |failure|
             return .{ .failure = failure };
     }
 
@@ -260,10 +354,17 @@ pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
 }
 
 /// One chunk, one interpreter: open, install the prelude, seed the
-/// accumulated recorder state, run the body, harvest. Returns a failure
-/// message (allocator-owned) when the chunk itself misbehaved, null when
-/// it ran clean (its declarations appended to `decls`).
-fn runChunk(allocator: std.mem.Allocator, input: Input, decls: *std.ArrayList(Decl)) Error!?[]u8 {
+/// accumulated recorder state (declarations AND the constant ledger),
+/// run the body, harvest. Returns a failure message (allocator-owned)
+/// when the chunk itself misbehaved, null when it ran clean (its
+/// declarations appended to `decls`, its top-level constant names to
+/// `consts`).
+fn runChunk(
+    allocator: std.mem.Allocator,
+    input: Input,
+    decls: *std.ArrayList(Decl),
+    consts: *std.ArrayList(Const),
+) Error!?[]u8 {
     const mrb = c.mrb_open() orelse return error.RubyStateInit;
     defer c.mrb_close(mrb);
 
@@ -285,9 +386,11 @@ fn runChunk(allocator: std.mem.Allocator, input: Input, decls: *std.ArrayList(De
     // Fresh state, fresh symbols (syms are per-state).
     const sym_seed = c.mrb_intern(mrb, "__declare_seed", "__declare_seed".len);
     const sym_seed_event = c.mrb_intern(mrb, "__declare_seed_event", "__declare_seed_event".len);
+    const sym_seed_const = c.mrb_intern(mrb, "__declare_seed_const", "__declare_seed_const".len);
     const sym_begin = c.mrb_intern(mrb, "__declare_begin", "__declare_begin".len);
     const sym_take = c.mrb_intern(mrb, "__declare_take", "__declare_take".len);
     const sym_take_events = c.mrb_intern(mrb, "__declare_take_events", "__declare_take_events".len);
+    const sym_take_consts = c.mrb_intern(mrb, "__declare_take_consts", "__declare_take_consts".len);
 
     // Replay earlier files' declarations into this state's duplicate
     // detectors (per kind — separate namespaces), then stamp the current
@@ -306,6 +409,41 @@ fn runChunk(allocator: std.mem.Allocator, input: Input, decls: *std.ArrayList(De
             .event => sym_seed_event,
         };
         _ = c.mrb_funcall_argv(mrb, modv, sym, args.len, &args);
+        if (excPending(mrb)) return error.DeclarePrelude;
+    }
+    // Replay the constant ledger: every top-level constant an EARLIER
+    // file defined, re-bound so the legal cross-file reference
+    // (labelle-engine#772: file-scope `Labelle.on(HungerFeed)` with
+    // HungerFeed declared in an events file) resolves in this fresh
+    // state — a primitive to its REAL value (2-arg seed; the runtime's
+    // shared VM makes it genuinely visible, so `Labelle.on(HungerFeed)`
+    // sees the actual name string and a shared primitive default
+    // classifies like the literal it holds), the non-primitive rest to
+    // the inert sentinel (1-arg seed). Strictly forward — a constant
+    // only a LATER file defines stays unresolved and NameErrors like the
+    // runtime, where file-scope code runs before later files load; a
+    // constant NO file defines (a typo) NameErrors at extract with this
+    // chunk's file:line instead of extracting silently. Argv order makes
+    // "earlier" mean what it means at runtime — see the module doc.
+    for (consts.items) |entry| {
+        const arena = c.labelle_mrb_gc_arena_save(mrb);
+        defer c.labelle_mrb_gc_arena_restore(mrb, arena);
+        const namev = c.mrb_str_new(mrb, entry.name.ptr, @intCast(entry.name.len));
+        const valuev: ?c.Value = switch (entry.value) {
+            .sentinel => null,
+            .nil => c.Value.nil(),
+            .boolean => |b| c.Value.boolean(b),
+            .integer => |x| c.Value.int(x),
+            .float => |x| c.Value.float(x),
+            .string => |s| c.mrb_str_new(mrb, s.ptr, @intCast(s.len)),
+        };
+        if (valuev) |v| {
+            const args = [_]c.Value{ namev, v };
+            _ = c.mrb_funcall_argv(mrb, modv, sym_seed_const, args.len, &args);
+        } else {
+            const args = [_]c.Value{namev};
+            _ = c.mrb_funcall_argv(mrb, modv, sym_seed_const, args.len, &args);
+        }
         if (excPending(mrb)) return error.DeclarePrelude;
     }
     {
@@ -342,10 +480,93 @@ fn runChunk(allocator: std.mem.Allocator, input: Input, decls: *std.ArrayList(De
 
     // Harvest this chunk's declarations — the component channel, then the
     // event channel: each a flat [name, fragment, ...] array, copied out
-    // before the state closes.
+    // before the state closes — and its post-eval constant snapshot
+    // (name→tagged-value), which REPLACES the ledger later chunks are
+    // seeded from.
     try harvestChannel(allocator, mrb, modv, sym_take, .component, input.path, decls);
     try harvestChannel(allocator, mrb, modv, sym_take_events, .event, input.path, decls);
+    try harvestConsts(allocator, mrb, modv, sym_take_consts, consts);
     return null;
+}
+
+/// Pull the chunk's post-eval constant snapshot (the
+/// __declare_take_consts seam — flat [name, value, ...] pairs, the FULL
+/// non-baseline set with seeded names at their CURRENT values) out of
+/// its interpreter, copied before the state closes, and REPLACE the
+/// driver's cross-chunk ledger with it — so a chunk reassigning a
+/// cross-file constant (X = 2 over a seeded 1) or removing one
+/// (remove_const) is reflected for every later chunk, exactly like the
+/// runtime's one shared VM. The old skip-seeded-and-append spelling
+/// froze the ledger at first definition. The ruby side degraded every
+/// value to the tag vocabulary: a primitive travels verbatim;
+/// SENTINEL_TAG — a Symbol, which no real value on this channel can be
+/// (Symbol is not a primitive, so symbol-valued constants degrade to
+/// the tag themselves) — marks the non-primitive rest, recognized here
+/// by TYPE alone. Anything outside that vocabulary, a non-string name,
+/// or an odd length means a tampered/shadowed seam — the same
+/// prelude-integrity class as harvestChannel's rejections (a tampered
+/// ledger must hard-error, not seed lies into later chunks); on that
+/// error the ledger keeps its previous contents (irrelevant — the run
+/// aborts).
+fn harvestConsts(
+    allocator: std.mem.Allocator,
+    mrb: ?*c.State,
+    modv: c.Value,
+    sym: c.Sym,
+    consts: *std.ArrayList(Const),
+) Error!void {
+    const arena = c.labelle_mrb_gc_arena_save(mrb);
+    defer c.labelle_mrb_gc_arena_restore(mrb, arena);
+    const flat = c.mrb_funcall_argv(mrb, modv, sym, 0, null);
+    if (excPending(mrb) or flat.tt != .array) return error.DeclarePrelude;
+    const len = c.labelle_mrb_ary_len(flat);
+    if (@mod(len, 2) != 0) return error.DeclarePrelude;
+
+    var snapshot: std.ArrayList(Const) = .empty;
+    errdefer {
+        for (snapshot.items) |entry| {
+            allocator.free(entry.name);
+            switch (entry.value) {
+                .string => |s| allocator.free(s),
+                else => {},
+            }
+        }
+        snapshot.deinit(allocator);
+    }
+
+    var i: c.Int = 0;
+    while (i + 1 < len) : (i += 2) {
+        const nv = c.mrb_ary_entry(flat, i);
+        const vv = c.mrb_ary_entry(flat, i + 1);
+        if (nv.tt != .string) return error.DeclarePrelude;
+        const value: Const.Tagged = switch (vv.tt) {
+            .symbol => .sentinel,
+            .true => .{ .boolean = true },
+            .false => if (vv.isNil()) .nil else .{ .boolean = false },
+            .integer => .{ .integer = vv.value.i },
+            .float => .{ .float = vv.value.f },
+            .string => .{ .string = try allocator.dupe(u8, strSlice(vv)) },
+            else => return error.DeclarePrelude,
+        };
+        errdefer switch (value) {
+            .string => |s| allocator.free(s),
+            else => {},
+        };
+        const name = try allocator.dupe(u8, strSlice(nv));
+        errdefer allocator.free(name);
+        try snapshot.append(allocator, .{ .name = name, .value = value });
+    }
+
+    // Snapshot parsed clean — swap it in.
+    for (consts.items) |entry| {
+        allocator.free(entry.name);
+        switch (entry.value) {
+            .string => |s| allocator.free(s),
+            else => {},
+        }
+    }
+    consts.deinit(allocator);
+    consts.* = snapshot;
 }
 
 /// Pull one flat [name, fragment, ...] declaration channel (the

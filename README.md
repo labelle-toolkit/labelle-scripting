@@ -10,7 +10,7 @@ Script [labelle](https://github.com/labelle-toolkit) games in **Lua, TypeScript,
 },
 ```
 
-Drop scripts in the game's `scripts/` dir — the same structure Zig scripts use (numeric ordering prefixes and all, extension-keyed coexistence: `10_spawner.rb` next to `01_move.zig`; assembler ≥ v0.86.0, the legacy per-language dirs work for one release of grace) — and declare components in `components/` beside the Zig ones (`components/hunger.rb` next to `components/worker.zig`, for the declare-mode languages). One language per project (validated at `labelle generate`); unchosen languages cost nothing — never fetched (lua and quickjs, lazy dependencies) or never compiled (ruby, an in-repo vendor snapshot).
+Drop scripts in the game's `scripts/` dir — the same structure Zig scripts use (numeric ordering prefixes and all, extension-keyed coexistence: `10_spawner.rb` next to `01_move.zig`; assembler ≥ v0.86.0, the legacy per-language dirs work for one release of grace) — and declare components in `components/` and events in `events/`, beside any Zig ones (`components/hunger.rb` next to `components/*.zig`, `events/hunger__feed.rb` likewise; declare-mode languages, events since assembler v0.87.0). Zig is never REQUIRED: a game can be 100% script-language (`examples/ruby-game` is, provably — CI deletes its one optional native hook and it still runs). One language per project (validated at `labelle generate`); unchosen languages cost nothing — never fetched (lua and quickjs, lazy dependencies) or never compiled (ruby, an in-repo vendor snapshot).
 
 Every language binds the engine's **Script Runtime Contract** (`labelle-engine/contract/labelle_script.h`, `LABELLE_CONTRACT_VERSION 1`): entities, components-by-name (JSON), events (subscribe + poll-drain), queries, prefabs, input, time. Both integration families — embedded-VM (lua, ruby/mruby, typescript/QuickJS, csharp/CoreCLR) and native-compiled (rust, crystal, go) — consume the identical surface, proven end to end by the [POC](https://github.com/labelle-toolkit/labelle-engine/pull/734).
 
@@ -233,7 +233,7 @@ kind lives — in `components/`, beside the Zig ones (the components dir
 is extension-keyed and mixed-language; assembler ≥ v0.86.0):
 
 ```ruby
-# components/hunger.rb — next to components/worker.zig
+# components/hunger.rb — a components/*.zig may sit right beside it
 Hunger = Labelle.component "Hunger", level: 0.875, starving: false
 ```
 
@@ -298,8 +298,10 @@ build needs host ruby+rake, which consumers never see).
 Custom bus events follow the component pattern — one line, two
 consumers (labelle-engine#772). Declaration files live where their kind
 lives: `events/*.rb|lua` beside `events/*.zig` (the events dir is
-extension-keyed and mixed-language, like `components/`; assembler
-support for collecting them lands with assembler v0.87.0):
+extension-keyed and mixed-language, like `components/`; the assembler
+collects them since v0.87.0, and `examples/ruby-game/events/hunger__feed.rb`
+is the live file-form example — the event the whole example fans out
+over):
 
 ```ruby
 # events/hunger__feed.rb — next to events/other_event.zig
@@ -312,11 +314,16 @@ local HungerFeed = labelle.event("hunger__feed", { entity = labelle.id, amount =
 ```
 
 At BUILD time the line is a SCHEMA DECLARATION: `labelle generate` runs
-the language's declare runner over it and the assembler materializes a
-real `events/hunger__feed.zig` in the staged tree — so the generated
-game's event union, sidecars, and any native Zig hook consuming the
-event are byte-identical to the Zig-authored case (a Zig hook needs
-zero changes when an event migrates from `.zig` to `.rb`). Field types
+the language's declare runner over it and the assembler codegens the
+schema into ONE generated `scripting_events.zig` at the target root
+(staged convention dirs are live links, so per-event files can't be
+materialized into `events/`) — the generated game's event union,
+sidecars and routing come out exactly as if the `.zig` file existed.
+One consequence for NATIVE consumers: a game-root hook consuming a
+declared event spells its payload parameter `anytype` instead of
+importing a per-event file — dispatch stays comptime-typed and field
+access is unchanged (`examples/ruby-game/hooks/feed_watcher.zig` is the
+live example: a Zig hook consuming the ruby-declared event). Field types
 infer from the defaults exactly like components (Float→f32,
 Integer→i32, bool, String→str, `{ x:, y: }`→vec2) with one addition:
 **`Labelle.id`** (lua: `labelle.id`) marks an entity-id field —
@@ -341,6 +348,16 @@ drives both legs of the bus:
 Labelle.on(HungerFeed) { |ev| feed(ev[:entity], ev[:amount]) }
 Labelle.emit(HungerFeed, entity: Labelle.u64str(e.id), amount: 0.5)
 ```
+
+Event files register BETWEEN components and scripts (components →
+events → scripts, pinned), and ruby top-level constants are VM-global —
+so `HungerFeed` is already defined when every script chunk loads, and a
+FILE-SCOPE `Labelle.on(HungerFeed)` in another file is legal (the
+declare phase tolerates the cross-file reference too: its
+per-chunk-isolated stub resolves unknown constants to the inert
+sentinel, so the subscription no-ops at extract time and still fails
+pointedly if a typo'd constant lands in a spec position). The plain
+string spelling stays equivalent — the constant IS the name.
 
 One file may declare several events (stem == name is style, not
 enforced), and a chunk-scope declaration inside a regular script stays
@@ -784,33 +801,47 @@ The plugin handles the studio Script Console's
 
 - **`examples/ruby-game/`** — a headless (null-backend) game whose
   `scripts/` ruby files drive the real engine end-to-end through the
-  Script Runtime Contract, in the labelle-engine#237 convention layout:
+  Script Runtime Contract — and the toolkit's first **provably 100%
+  ruby game** (labelle-engine#772: every shipped language must be able
+  to go fully selected-language). Scripts, COMPONENTS and the custom
+  EVENT are all `.rb` in the labelle-engine#237 convention layout:
   ordering-prefixed scripts (`10_spawner.rb`, `20_hunger_controller.rb`
   — stems strip, prefixes order registration) beside an unnumbered one
-  (`feed_watcher.rb`), and the Hunger component DECLARED IN RUBY
-  (`components/hunger.rb`, one `Labelle.component` line beside the Zig
-  `components/worker.zig`) — the assembler codegens the real registry
-  component from its schema, the spawner attaches it BARE, and the
-  transcript's 0.875-seeded decay chain proves the declared defaults
-  traveled through the ECS. On top: the `#742` HungerController pattern
-  (the declared `Hunger` view + `get(…, into:)` + `set` — no
-  `Component.ref` line), a cross-script `hunger__feed` command-event
-  with THREE subscribers off one bus (the controller, the pure-ruby
-  top-level `scripts/feed_watcher.rb`, and the native game-root Zig
-  hook `hooks/feed_watcher.zig` — scripts for iteration speed, `hooks/`
-  as the native escape, no glue), an `engine__tick` builtin
-  subscription, `FrameArray` in the hot loop, and plain top-level
-  hooks. Pins: the scripting plugin `local:../..` (THIS checkout —
-  every CI run exercises the current tree, declare tool included),
+  (`feed_watcher.rb`), the Hunger and Worker components DECLARED IN
+  RUBY (`components/hunger.rb` with defaults, `components/worker.rb`
+  the zero-field tag), and the `hunger__feed` bus event DECLARED IN
+  RUBY too (`events/hunger__feed.rb`, one `Labelle.event` line —
+  assembler ≥ v0.87.0 codegens the real event union entry from its
+  schema). The transcript's 0.875-seeded decay chain proves the
+  declared component defaults traveled through the ECS; the
+  registration order is components → events → scripts, so the declared
+  `HungerFeed` constant is VM-global before any script loads —
+  `scripts/feed_watcher.rb` subscribes with the CONSTANT while the
+  spawner emits by plain string, both spellings on one bus. On top: the
+  `#742` HungerController pattern (the declared `Hunger` view +
+  `get(…, into:)` + `set` — no `Component.ref` line), THREE
+  `hunger__feed` subscribers off one emit (the controller, the
+  pure-ruby top-level `scripts/feed_watcher.rb`, and the native
+  game-root Zig hook `hooks/feed_watcher.zig` consuming the
+  RUBY-DECLARED event with an `anytype` payload param), an
+  `engine__tick` builtin subscription, `FrameArray` in the hot loop,
+  and plain top-level hooks. `hooks/feed_watcher.zig` is the example's
+  ONLY `.zig` — the OPTIONAL native escape hatch, never load-bearing:
+  CI's purity variant scratch-copies the example, DELETES `hooks/`,
+  regenerates and reruns green (the same transcript minus exactly
+  `ZIG_FEED_SEEN_0.5`), proving a zero-Zig ruby game builds and runs.
+  Pins: the scripting plugin `local:../..` (THIS checkout — every CI
+  run exercises the current tree, declare tool included),
   core/engine/gfx registry releases, a sibling `labelle-null` clone
   (its bind touchpoint is unreleased), and a pinned labelle-assembler
-  release binary (≥ v0.86.0). CI generates (asserting the generated
-  `scripting_components.zig` and components-before-scripts registration
-  order), builds, runs `LABELLE_NULL_FRAMES=5` and diffs the ordered
-  `RUBY_*`/`ZIG_*` transcript — ruby's permanent regression net
-  (labelle-scripting#10). Recipe + assertions:
-  `.github/workflows/ci.yml` → `ruby-example`; timeline:
-  `examples/ruby-game/scripts/20_hunger_controller.rb`.
+  release binary (≥ v0.87.0). CI generates (asserting the generated
+  `scripting_components.zig` + `scripting_events.zig`, the
+  components → events → scripts registration order, and the
+  one-optional-`.zig` purity inventory), builds, runs
+  `LABELLE_NULL_FRAMES=5` and diffs the ordered `RUBY_*`/`ZIG_*`
+  transcript — ruby's permanent regression net (labelle-scripting#10).
+  Recipe + assertions: `.github/workflows/ci.yml` → `ruby-example`;
+  timeline: `examples/ruby-game/scripts/20_hunger_controller.rb`.
 
 - **`examples/rust-game/`** — the NATIVE-COMPILED counterpart
   (labelle-engine#741): the SAME hunger sawtooth, `scripts/`

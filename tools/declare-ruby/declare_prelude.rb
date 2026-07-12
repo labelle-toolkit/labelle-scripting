@@ -50,6 +50,32 @@
 #                                         order
 #   Labelle.__declare_take_events       — the same flat shape for this
 #                                         chunk's event declarations
+#   Labelle.__declare_seed_const(name[, value])
+#                                       — re-bind a top-level constant an
+#                                         EARLIER file defined, so the
+#                                         legal cross-file reference
+#                                         (labelle-engine#772) resolves
+#                                         in this fresh state: with a
+#                                         value, the PRIMITIVE the
+#                                         constant held, re-bound
+#                                         verbatim; without one, the
+#                                         inert sentinel (the
+#                                         non-primitive rest)
+#   Labelle.__declare_take_consts       — after the chunk ran clean: flat
+#                                         [name, value, ...] pairs — the
+#                                         FULL non-baseline snapshot of
+#                                         Object's constants (seeded
+#                                         names included at CURRENT
+#                                         values; the baseline diff is
+#                                         the runtime prelude's METHOD
+#                                         harvest, respelled for
+#                                         constants), each value a
+#                                         primitive traveling verbatim or
+#                                         SENTINEL_TAG for the rest. The
+#                                         driver REPLACES its ledger with
+#                                         this, so reassignments and
+#                                         remove_const behave like the
+#                                         runtime's one shared VM
 # The Zig side accumulates fragments across chunks and emits
 # {"components":[...]} — plus an "events":[...] array only when any event
 # was declared — BYTE-compatible with the lua runner's __declare_emit
@@ -77,14 +103,17 @@
 # (ruby's spelling of lua's error(msg, 3) level trick).
 
 module Labelle
-  # What every no-op returns. NOT nil: `Labelle.component("Path", {},
-  # Labelle.array([]))` with a nil-returning no-op would silently declare
-  # Path WITHOUT its intended options (nil opts == no opts), and a nil
-  # field default would misreport as "unsupported default of type
-  # NilClass" instead of naming the real mistake. Recognition is by
-  # IDENTITY (equal?); the sentinel is deliberately inert — no
-  # method_missing — so deeper chunk-scope use of a no-op result fails
-  # loudly, mirroring the lua sentinel table's nil-on-index behavior.
+  # What every no-op returns — and what the driver re-binds earlier
+  # files' harvested NON-PRIMITIVE constants to (the constant-ledger
+  # seams below; primitives re-bind verbatim). NOT
+  # nil: `Labelle.component("Path", {}, Labelle.array([]))` with a
+  # nil-returning no-op would silently declare Path WITHOUT its intended
+  # options (nil opts == no opts), and a nil field default would
+  # misreport as "unsupported default of type NilClass" instead of
+  # naming the real mistake. Recognition is by IDENTITY (equal?); the
+  # sentinel is deliberately inert — no method_missing — so deeper
+  # chunk-scope use of a no-op result fails loudly, mirroring the lua
+  # sentinel table's nil-on-index behavior.
   NOOP_RESULT = Object.new.freeze
 
   # The id FIELD marker (labelle-engine#772): `entity: Labelle.id` in an
@@ -161,6 +190,95 @@ module Labelle
       i += 1
     end
     flat
+  end
+
+  # ── the constant ledger (cross-file constants, labelle-engine#772) ───
+  # The runtime prelude's METHOD harvest (src/ruby/prelude.rb
+  # __record_baseline/__new_object_methods), respelled for CONSTANTS: at
+  # runtime ONE shared VM registers components → events → scripts, so a
+  # later file legally references an earlier file's top-level constants
+  # at chunk scope (`Labelle.on(HungerFeed)` with HungerFeed bound by
+  # events/hunger__feed.rb). This runner's fresh-state-per-chunk
+  # isolation would NameError that reference, so the driver re-creates
+  # exactly the runtime's visibility, no more: after each clean chunk it
+  # takes the constants the chunk defined (__declare_take_consts — a
+  # baseline diff of Object's constants, everything the interpreter and
+  # this prelude booted with excluded) WITH their values, degraded to a
+  # tag — a PRIMITIVE (String, Integer, Float, true, false, nil) travels
+  # verbatim, everything else (classes incl. the component view stubs,
+  # arrays, hashes, procs) becomes the sentinel — and re-binds them into
+  # every LATER chunk's state (__declare_seed_const). Primitives
+  # re-binding verbatim is what mirrors the runtime: a cross-file EVENT
+  # constant arrives at the on/emit shims as the real name string
+  # (Labelle.event returns it), where a cross-file COMPONENT constant
+  # arrives as the sentinel and fails the name check — and a shared
+  # primitive default (`level: SHARED_DEFAULT`) classifies exactly as
+  # the runtime VM would resolve it. A constant NO earlier file defined
+  # stays unresolved and NameErrors at extract with the chunk's
+  # file:line — a typo'd constant fails at generate, never extracts
+  # silently — and a reference to a LATER file's constant fails exactly
+  # like the runtime, where file-scope code runs before later files
+  # load. Seeded sentinels answer no methods (chunk isolation is intact)
+  # and are rejected in spec positions (__reject_noop).
+
+  # The value channel's non-primitive tag. A Symbol on purpose: Symbol
+  # is not in the primitive travel set, so a real constant value never
+  # crosses the seam as one — the driver recognizes the tag by TYPE
+  # (tt == symbol, no name matching), and nothing a chunk binds can
+  # collide with it.
+  SENTINEL_TAG = :__labelle_declare_nonprimitive__
+
+  def self.__record_const_baseline
+    @baseline_consts = {}
+    cs = Object.constants
+    i = 0
+    while i < cs.size
+      @baseline_consts[cs[i]] = true
+      i += 1
+    end
+    nil
+  end
+
+  # With `value`: an earlier file's PRIMITIVE constant, re-bound
+  # verbatim (the runtime's shared VM makes it genuinely visible there).
+  # Without: the non-primitive rest, re-bound as the inert sentinel —
+  # resolvable in call positions, rejected in spec positions, answering
+  # no methods.
+  def self.__declare_seed_const(name, value = NOOP_RESULT)
+    Object.const_set(name, value)
+    nil
+  end
+
+  # One harvested constant's ledger value: primitives verbatim,
+  # SENTINEL_TAG for everything else.
+  def self.__const_ledger_value(v)
+    if v.nil? || true.equal?(v) || false.equal?(v) ||
+       v.is_a?(Integer) || v.is_a?(Float) || v.is_a?(String)
+      v
+    else
+      SENTINEL_TAG
+    end
+  end
+
+  # The FULL non-baseline snapshot — seeded names included, at their
+  # CURRENT values. The driver replaces its ledger wholesale with this,
+  # so a chunk reassigning a cross-file constant (X = 2 over a seeded 1)
+  # or removing one (remove_const) is reflected for every later chunk —
+  # exactly what the runtime's single shared VM would show. Excluding
+  # seeded names here would freeze the ledger at first definition.
+  def self.__declare_take_consts
+    added = []
+    cs = Object.constants
+    i = 0
+    while i < cs.size
+      sym = cs[i]
+      unless @baseline_consts[sym]
+        added << sym.to_s
+        added << __const_ledger_value(Object.const_get(sym))
+      end
+      i += 1
+    end
+    added
   end
 
   # ── validation + JSON formatting helpers ─────────────────────────────
@@ -279,13 +397,19 @@ module Labelle
                          " (v1 supports number, boolean, string, { x:, y: } vec2 hashes, and Labelle.id)"
   end
 
-  # The pointed rejection for a helper result where a literal belongs.
-  # `kind` ("component", the default, or "event") names the calling DSL
-  # in the message.
+  # The pointed rejection for a sentinel where a literal belongs. The
+  # sentinel has two sources — Labelle.* helper results and NON-PRIMITIVE
+  # cross-file constants (view classes, collections, procs an earlier
+  # file bound, re-bound as the sentinel by the driver through
+  # __declare_seed_const; PRIMITIVE cross-file constants re-bind verbatim
+  # and classify like the literals they hold) — and the message names
+  # both. `kind` ("component", the default, or "event") names the
+  # calling DSL in the message.
   def self.__reject_noop(v, ctx, kind = "component")
     if v.equal?(NOOP_RESULT)
-      raise ArgumentError, "Labelle." + kind + ": " + ctx + ": Labelle.* helpers cannot be used " \
-                           "in " + kind + " specs — declare-mode fields are literals"
+      raise ArgumentError, "Labelle." + kind + ": " + ctx + ": Labelle.* helpers and non-primitive " \
+                           "cross-file constants cannot be used in " + kind + " specs — " \
+                           "declare-mode fields are literals"
     end
     nil
   end
@@ -474,10 +598,52 @@ module Labelle
     ID_SENTINEL
   end
 
-  # Every OTHER Labelle.* module call — on/log/emit/array/u64str/spawn/
-  # each/... — resolves here: neither runs nor errors ("only declarations
-  # matter at build time"), and the sentinel it returns is rejected in
-  # spec positions.
+  # ── declare-mode Labelle.on / Labelle.emit: name-checked no-ops ──────
+  # Explicit defs (method_missing never sees them) that still subscribe
+  # and emit NOTHING — extra arguments are swallowed, blocks are ignored
+  # and never called, and both return the spec-position-rejected sentinel
+  # like every other no-op — but the event NAME is validated the way the
+  # RUNTIME bindings validate it: raw_event_subscribe/raw_event_emit read
+  # the name as an mruby String (src/ruby/bindings.zig, mrb_get_args
+  # "s"), so a non-String there raises and EVICTS the script at runtime.
+  # Without this check a real constant of the WRONG KIND — a component
+  # where an event was meant, `Labelle.on(Worker)` — extracted clean and
+  # only died in the running game. Event constants pass by construction:
+  # Labelle.event returns the name STRING and the driver's ledger seeds
+  # primitive constants verbatim, so a cross-file `Labelle.on(HungerFeed)`
+  # arrives here as the real name.
+  def self.__require_event_name(callee, name)
+    return if name.is_a?(String)
+    # (component_name must BE a string: the NoopCalls-stubbed classes
+    # answer respond_to? for everything and would hand back the
+    # sentinel.)
+    got = if name.equal?(NOOP_RESULT)
+            "a Labelle.* helper result or non-primitive cross-file constant"
+          elsif name.is_a?(Class) && name.respond_to?(:component_name) &&
+                name.component_name.is_a?(String)
+            "the component '" + name.component_name + "'"
+          else
+            name.class.to_s
+          end
+    raise ArgumentError, "Labelle." + callee + ": expected an event-name String — got " + got +
+                         " (events subscribe and emit by name; a component constant is not " \
+                         "an event name)"
+  end
+
+  def self.on(name, *_rest, **_kw, &_blk)
+    __require_event_name("on", name)
+    NOOP_RESULT
+  end
+
+  def self.emit(name, *_rest, **_kw, &_blk)
+    __require_event_name("emit", name)
+    NOOP_RESULT
+  end
+
+  # Every OTHER Labelle.* module call — log/array/u64str/spawn/each/...
+  # — resolves here: neither runs nor errors ("only declarations matter
+  # at build time"), and the sentinel it returns is rejected in spec
+  # positions.
   def self.method_missing(_m, *_args, &_blk)
     NOOP_RESULT
   end
@@ -489,11 +655,22 @@ module Labelle
   # ── the runtime API's classes, stubbed ───────────────────────────────
   # These are the names real game scripts touch at CHUNK SCOPE (the code
   # declare mode executes): `Labelle::Component.ref(...)` constant
-  # bindings, `class Foo < Labelle::Controller` definitions. Class-level
-  # calls no-op to the sentinel (`new` must be overridden explicitly — it
-  # exists on every Class, so method_missing alone would never see it);
-  # anything DEEPER fails loudly, like every other name outside the stub
-  # surface (unknown constants included: no const_missing on purpose).
+  # bindings, `class Foo < Labelle::Controller` definitions, and — since
+  # labelle-engine#772 — constants OTHER declaration files bind
+  # (`Labelle.on(HungerFeed)` at file scope, `HungerFeed` declared in
+  # events/hunger__feed.rb: at runtime ONE VM registers components →
+  # events → scripts and top-level constants are VM-global, but this
+  # runner evaluates every chunk in a FRESH state, so a cross-file
+  # constant cannot resolve by itself). Class-level calls no-op to the
+  # sentinel (`new` must be overridden explicitly — it exists on every
+  # Class, so method_missing alone would never see it); cross-file
+  # constants resolve because the driver re-binds every EARLIER file's
+  # harvested constants into this chunk's state (the constant-ledger
+  # seams above) — primitives verbatim (event-name strings included),
+  # everything else as the inert sentinel, tolerated in call positions
+  # and rejected in spec positions. A constant NO earlier file defined
+  # stays a plain NameError at extract (typos fail at generate), and
+  # anything DEEPER than a call position fails loudly.
 
   module NoopCalls
     def method_missing(_m, *_args, &_blk)
@@ -558,3 +735,17 @@ module Labelle
     k
   end
 end
+
+# Baseline snapshot AFTER the whole stub is defined: every constant on
+# Object right now (the interpreter's boot set plus `Labelle` itself) is
+# prelude-owned; whatever a chunk body adds beyond it is the chunk's own
+# — the harvest set the driver replays into later chunks (the
+# constant-ledger seams above). NO global Module#const_missing on
+# purpose: an interim revision resolved EVERY unresolved constant to the
+# sentinel, which made a TYPO'd constant (`Labelle.on(HngerFeed)`)
+# extract silently and only fail at RUNTIME as a script eviction. With
+# the ledger, only constants an earlier file really defined resolve
+# (primitives to their real values, the rest to the inert sentinel);
+# a genuinely unknown constant NameErrors at extract with the chunk's
+# file:line, exactly like the runtime VM.
+Labelle.__record_const_baseline

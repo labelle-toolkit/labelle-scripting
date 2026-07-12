@@ -98,8 +98,9 @@ module Labelle
   #   HungerFeed = Labelle.event "hunger__feed", entity: Labelle.id, amount: 0.5
   # is a SCHEMA DECLARATION at build time — `labelle generate` runs the
   # declare runner over the game's events/*.rb files (and scripts) and
-  # the assembler materializes a real events/<name>.zig from the
-  # extracted schema. At RUNTIME — here — the same call validates the
+  # the assembler (v0.87.0+) codegens the extracted schema into one
+  # generated scripting_events.zig at the target root, backing a real
+  # event-union row. At RUNTIME — here — the same call validates the
   # name and returns it as a FROZEN String, so the one constant drives
   # both legs of the bus: Labelle.emit(HungerFeed, entity: id) and
   # Labelle.on(HungerFeed) (both take event-name strings; a frozen one is

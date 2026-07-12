@@ -1,11 +1,15 @@
 // Ruby example game (labelle-scripting#10) — the ruby counterpart of the
-// assembler's `examples/scripting-smoke`: scripts/*.rb drive the REAL
-// engine through the Script Runtime Contract (labelle-engine#749) from
-// the assembler's generated main, headless over the null backend. The
-// scripts live in `scripts/` — the same structure Zig scripts use
-// (labelle-engine#237, assembler v0.86.0), ordering prefixes included —
-// and the Hunger component is DECLARED IN RUBY (`components/hunger.rb`,
-// beside the Zig `components/worker.zig`).
+// assembler's `examples/scripting-smoke`, and the toolkit's first
+// PROVABLY-PURE game (labelle-engine#772: every shipped language must be
+// able to go 100% selected-language): scripts, components AND the custom
+// event are all .rb — scripts/*.rb drive the REAL engine through the
+// Script Runtime Contract (labelle-engine#749) from the assembler's
+// generated main, headless over the null backend; components/hunger.rb +
+// components/worker.rb declare the registry components and
+// events/hunger__feed.rb declares the bus event (assembler v0.87.0).
+// The ONLY .zig in the tree is hooks/feed_watcher.zig — the OPTIONAL
+// native escape hatch, kept deliberately as the interop demo: CI deletes
+// hooks/ in a scratch copy, regenerates, and the game still runs green.
 //
 // THE point of living in this repo: the scripting plugin is pinned
 // `local:../..` — THIS checkout — so every CI run exercises the CURRENT
@@ -37,12 +41,15 @@
     // The scripting plugin resolved from the repo root two levels up —
     // the working tree under test — with the one-language-per-project
     // param (labelle-assembler#584/#589) selecting ruby. Ruby DECLARES
-    // components (assembler v0.86.0 DECLARE_RUNNERS + this repo's
-    // tools/declare-ruby, v0.9.0): the declare phase extracts
-    // components/hunger.rb's schema and codegens the real registry
-    // component (CI greps the generated scripting_components.zig); the
-    // same file, embedded and registered before scripts/, defines the
-    // `Hunger` view constant the controller uses at runtime.
+    // components AND events (assembler v0.86.0 DECLARE_RUNNERS +
+    // v0.87.0 events collection + this repo's tools/declare-ruby,
+    // v0.10.0): the declare phase extracts components/*.rb's and
+    // events/*.rb's schemas and codegens the real registry component
+    // and event union entry (CI greps the generated
+    // scripting_components.zig and scripting_events.zig); the same
+    // files, embedded and registered components → events → scripts,
+    // define the `Hunger`/`Worker`/`HungerFeed` constants the scripts
+    // use at runtime.
     .plugins = .{
         .{
             .name = "scripting",
