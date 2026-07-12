@@ -30,7 +30,7 @@ test "cross-runner golden: the rust half — byte-identical to the lua/ruby runn
     // — one logical declaration set, one schema, whatever the language. The
     // probe prints one line + a trailing newline (the labelle-declare main.zig
     // contract), so trim it before the byte compare.
-    const trimmed = std.mem.trimRight(u8, probe_out, "\r\n");
+    const trimmed = std.mem.trimEnd(u8, probe_out, "\r\n");
     try testing.expectEqualStrings(cross.expected_json, trimmed);
 }
 
