@@ -279,6 +279,42 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── labelle-declare-rs: the rust declare-mode schema extractor ──────
+    // The lua/ruby runners' native-family sibling (labelle-engine#774,
+    // RFC-LANGUAGE-PLUGINS rev 17 §7). Rust has no interpreter, so this exe
+    // is a COMPILE-AND-RUN PROBE: given `--cache-dir <dir>` + declaration
+    // files, it stages a cargo crate under <dir> carrying the SHIPPED
+    // labelle module's macros around those files, builds + runs it, and
+    // prints the schema JSON. Same SHAPE as the lua/ruby steps below —
+    // host-targeted, Debug-pinned, reached only through its named step (or
+    // the rust test wiring, which drives THIS exe for the byte-parity pin).
+    // It carries no vendored C runtime (the compile machinery is cargo,
+    // shelled at runtime), only two build-time artifacts embedded as
+    // anonymous imports its extract.zig @embedFile's: the SHIPPED
+    // native/src/labelle.rs (the exact macro/emitter surface it was built
+    // against) and the probe Cargo.toml template. Created ONCE here so the
+    // named step and the test wiring share the artifact.
+    const declare_rs_mod = b.createModule(.{
+        .root_source_file = b.path("tools/declare-rs/main.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    declare_rs_mod.addAnonymousImport("labelle_rs_src", .{
+        .root_source_file = b.path("native/src/labelle.rs"),
+    });
+    declare_rs_mod.addAnonymousImport("probe_cargo_toml", .{
+        .root_source_file = b.path("tools/declare-rs/Cargo.toml"),
+    });
+    const declare_rs_exe = b.addExecutable(.{
+        .name = "labelle-declare-rs",
+        .root_module = declare_rs_mod,
+    });
+    const declare_rs_step = b.step(
+        "labelle-declare-rs",
+        "Build the rust declare-mode schema extractor (zig-out/bin/labelle-declare-rs)",
+    );
+    declare_rs_step.dependOn(&b.addInstallArtifact(declare_rs_exe, .{}).step);
+
     // Tests: the contract symbols are `extern` in src/contract.zig and the
     // test root provides them (tests/mock_world.zig `export`s a toy world),
     // mirroring production exactly — there the assembled game binary is the
@@ -417,43 +453,38 @@ pub fn build(b: *std.Build) void {
                     tests_root_mod.linkSystemLibrary("gcc_s", .{});
                 }
 
-                // The declare probe (labelle-engine#774): the rust member of
-                // the cross-runner byte-parity contract. Rust has no
+                // The declare tool (labelle-engine#774, rev 17): the rust
+                // member of the cross-runner byte-parity contract. Rust has no
                 // interpreter, so — unlike lua/ruby, RUN in-process through the
-                // declare_core externs — the runner is a probe cargo-BUILDS and
-                // RUNS: tools/declare-rs recomposes the SHIPPED
-                // labelle::component!/event! macros (#[path]) around the
-                // cross-runner golden fixture (src/decls.rs) under the `declare`
-                // feature, and its main prints the schema JSON. Its captured
-                // stdout is `@embedFile`d by tests/declare_rust_tool.zig and
-                // pinned byte-identical to the lua/ruby runners' schema. Own
-                // persistent --target-dir (cargo-incremental on edits);
-                // --locked pins the committed lockfile (inventory is the sole,
-                // declare-only dep). Host-targeted: the probe runs at build
+                // declare_core externs — the runner is the labelle-declare-rs
+                // exe (built above), which cargo-BUILDS a probe INTERNALLY. The
+                // test drives the SHIPPED tool exactly as the assembler will:
+                // `labelle-declare-rs --cache-dir <persistent> <components.rs>
+                // <events.rs>` over the GAME-SHAPED fixtures (bare macros, NO
+                // `use` lines — a green run proves the tool's injected prelude).
+                // Its captured stdout is `@embedFile`d by
+                // tests/declare_rust_tool.zig and pinned byte-identical to the
+                // lua/ruby runners' schema. The --cache-dir is a persistent dir
+                // under the zig cache the tool uses as the cargo --target-dir,
+                // so a re-extract is warm. Host-targeted: the tool runs at build
                 // time on the dev/CI machine, whatever the game targets.
-                const declare_rs_target = b.cache_root.join(
+                const declare_rs_cache = b.cache_root.join(
                     b.allocator,
                     &.{"rust-declare-target"},
                 ) catch @panic("OOM");
-                const cargo_declare = b.addSystemCommand(&.{
-                    "cargo",     "build",
-                    "--release", "--quiet",
-                    "--locked",  "--manifest-path",
-                });
-                cargo_declare.addFileArg(b.path("tools/declare-rs/Cargo.toml"));
-                cargo_declare.addArgs(&.{ "--target-dir", declare_rs_target });
-                const probe_exe = b.fmt("{s}/release/labelle-declare-rs{s}", .{
-                    declare_rs_target,
-                    if (b.graph.host.result.os.tag == .windows) ".exe" else "",
-                });
-                const run_probe = b.addSystemCommand(&.{probe_exe});
-                run_probe.step.dependOn(&cargo_declare.step);
-                const probe_out = run_probe.captureStdOut(.{});
+                const run_tool = b.addRunArtifact(declare_rs_exe);
+                run_tool.addArgs(&.{ "--cache-dir", declare_rs_cache });
+                run_tool.addFileArg(b.path("tools/declare-rs/testdata/components.rs"));
+                run_tool.addFileArg(b.path("tools/declare-rs/testdata/events.rs"));
+                const tool_out = run_tool.captureStdOut(.{});
                 tests_root_mod.addAnonymousImport("rust_declare_schema_out", .{
-                    .root_source_file = probe_out,
+                    .root_source_file = tool_out,
                 });
-                tests_root_mod.addAnonymousImport("declare_rs_decls_src", .{
-                    .root_source_file = b.path("tools/declare-rs/src/decls.rs"),
+                tests_root_mod.addAnonymousImport("declare_rs_components_src", .{
+                    .root_source_file = b.path("tools/declare-rs/testdata/components.rs"),
+                });
+                tests_root_mod.addAnonymousImport("declare_rs_events_src", .{
+                    .root_source_file = b.path("tools/declare-rs/testdata/events.rs"),
                 });
             }
 

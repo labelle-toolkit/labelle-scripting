@@ -1,29 +1,33 @@
-# labelle-declare-rs — the rust declare-mode schema extractor
-# (labelle-engine#774, the "compile-and-run probe" route).
+# The probe-crate manifest TEMPLATE for labelle-declare-rs (the rust declare
+# tool; labelle-engine#774, RFC-LANGUAGE-PLUGINS rev 17 §7).
 #
-# The lua/ruby declare tools are zig exes that RUN scripts against a stub;
-# rust has no interpreter, so its declare "tool" is a probe the assembler
-# CARGO-BUILDS at generate: the shipped `labelle` module's component!/event!
-# macros (native/src/labelle.rs, #[path]-recomposed here — the tests/rust
-# pattern) register schemas under the `declare` feature, and this binary's
-# main prints the accumulated schema JSON.
+# Rust has no interpreter, so — unlike the lua/ruby declare tools, which RUN a
+# script string in-process against a stub — the rust tool is a probe it
+# CARGO-BUILDS at generate: labelle-declare-rs STAGES a crate under the
+# assembler-supplied cache dir (this manifest, the SHIPPED `labelle` module,
+# a generated `main.rs`, and one `decl_NNNN.rs` per declaration file), builds
+# it with `--features declare`, and RUNS it — the shipped
+# `labelle::component!`/`event!` macros register schemas under the `declare`
+# feature and the generated main prints the accumulated JSON on stdout.
 #
-# In a consumer game the assembler generates the module list from the game's
-# components/*.rs + events/*.rs; in THIS repo the probe includes the
-# cross-runner golden fixture so `zig build test` can pin byte-parity with the
-# lua/ruby runners (tests/declare_cross_golden.zig).
+# This file is EMBEDDED into the tool exe (build.zig anonymous import) and
+# written verbatim into the staged crate, so the tool always builds the game's
+# declarations against the exact manifest it was compiled with. No default
+# feature: the tool passes `--features declare` explicitly (the probe's
+# emit_schema needs `inventory`, which the macros submit into under that
+# feature). No committed lockfile — the crate is staged fresh each run and its
+# sole dep (inventory) rides the host's cargo registry cache.
 [package]
-name = "labelle_declare_rs"
+name = "labelle_declare_probe"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 
 [[bin]]
-name = "labelle-declare-rs"
+name = "labelle-declare-probe"
 path = "src/main.rs"
 
 [features]
-default = ["declare"]
 declare = ["dep:inventory"]
 
 [dependencies]
