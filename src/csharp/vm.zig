@@ -621,11 +621,14 @@ fn boot() error{CsharpRuntimeInitFailed}!void {
         return bootFail("csharp: hostfxr_get_runtime_delegate(load_assembly...) failed");
     const load: LoadAssemblyAndGetFnPtrFn = @ptrCast(@alignCast(raw_delegate.?));
 
-    entries.setup = @ptrCast(try resolve(load, dll_path, L("Setup")));
-    entries.dispatch = @ptrCast(try resolve(load, dll_path, L("DispatchInbox")));
-    entries.tick = @ptrCast(try resolve(load, dll_path, L("Tick")));
-    entries.deinit = @ptrCast(try resolve(load, dll_path, L("Deinit")));
-    const abi_ptr: AbiVersionFn = @ptrCast(try resolve(load, dll_path, L("AbiVersion")));
+    // @alignCast: resolve() hands back *anyopaque (align 1); function
+    // pointers align 4 on aarch64 (x86_64's align-1 fns compile without
+    // the cast, which is why only aarch64 builds catch a missing one).
+    entries.setup = @ptrCast(@alignCast(try resolve(load, dll_path, L("Setup"))));
+    entries.dispatch = @ptrCast(@alignCast(try resolve(load, dll_path, L("DispatchInbox"))));
+    entries.tick = @ptrCast(@alignCast(try resolve(load, dll_path, L("Tick"))));
+    entries.deinit = @ptrCast(@alignCast(try resolve(load, dll_path, L("Deinit"))));
+    const abi_ptr: AbiVersionFn = @ptrCast(@alignCast(try resolve(load, dll_path, L("AbiVersion"))));
     boot_abi_version = abi_ptr();
 }
 

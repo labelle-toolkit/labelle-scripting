@@ -279,13 +279,16 @@ module Labelle
                          " (v1 supports number, boolean, string, { x:, y: } vec2 hashes, and Labelle.id)"
   end
 
-  # The pointed rejection for a helper result where a literal belongs.
-  # `kind` ("component", the default, or "event") names the calling DSL
-  # in the message.
+  # The pointed rejection for a sentinel where a literal belongs. The
+  # sentinel has two sources — Labelle.* helper results and unresolved
+  # constants (Module#const_missing, bottom of this file) — and the
+  # message names both. `kind` ("component", the default, or "event")
+  # names the calling DSL in the message.
   def self.__reject_noop(v, ctx, kind = "component")
     if v.equal?(NOOP_RESULT)
-      raise ArgumentError, "Labelle." + kind + ": " + ctx + ": Labelle.* helpers cannot be used " \
-                           "in " + kind + " specs — declare-mode fields are literals"
+      raise ArgumentError, "Labelle." + kind + ": " + ctx + ": Labelle.* helpers and unresolved " \
+                           "constants cannot be used in " + kind + " specs — declare-mode fields " \
+                           "are literals"
     end
     nil
   end
@@ -489,11 +492,19 @@ module Labelle
   # ── the runtime API's classes, stubbed ───────────────────────────────
   # These are the names real game scripts touch at CHUNK SCOPE (the code
   # declare mode executes): `Labelle::Component.ref(...)` constant
-  # bindings, `class Foo < Labelle::Controller` definitions. Class-level
-  # calls no-op to the sentinel (`new` must be overridden explicitly — it
-  # exists on every Class, so method_missing alone would never see it);
-  # anything DEEPER fails loudly, like every other name outside the stub
-  # surface (unknown constants included: no const_missing on purpose).
+  # bindings, `class Foo < Labelle::Controller` definitions, and — since
+  # labelle-engine#772 — constants OTHER declaration files bind
+  # (`Labelle.on(HungerFeed)` at file scope, `HungerFeed` declared in
+  # events/hunger__feed.rb: at runtime ONE VM registers components →
+  # events → scripts and top-level constants are VM-global, but this
+  # runner evaluates every chunk in a FRESH state, so a cross-file
+  # constant cannot resolve here). Class-level calls no-op to the
+  # sentinel (`new` must be overridden explicitly — it exists on every
+  # Class, so method_missing alone would never see it); unresolved
+  # constants yield the same sentinel via Module#const_missing (bottom
+  # of this file) — the ruby spelling of the lua stub _ENV's
+  # unknown-global posture — tolerated in call positions, rejected in
+  # spec positions; anything DEEPER fails loudly.
 
   module NoopCalls
     def method_missing(_m, *_args, &_blk)
@@ -556,5 +567,26 @@ module Labelle
     k.instance_variable_set(:@__labelle_component_name, name)
     k.instance_variable_set(:@__labelle_component_fields, fields.freeze)
     k
+  end
+end
+
+# Unresolved constants yield the inert sentinel instead of NameError —
+# the ruby spelling of the lua stub _ENV's `__index = noop` (one posture,
+# two runners). The case that NEEDS it is labelle-engine#772's cross-file
+# constant: `Labelle.on(HungerFeed)` at FILE SCOPE in a script, with
+# `HungerFeed = Labelle.event ...` bound by events/hunger__feed.rb — at
+# runtime one shared VM registers components → events → scripts, so the
+# constant is defined before any script chunk loads; this runner gives
+# every chunk a fresh state (isolation is the point), so the reference
+# can only be satisfied fictitiously. The sentinel keeps the two modes
+# aligned: call positions no-op through Labelle.method_missing, spec
+# positions reject it pointedly (__reject_noop — a typo'd constant used
+# as a field default still fails the build naming the field), and any
+# DEEPER use fails loudly because the sentinel itself has no
+# method_missing. Runtime semantics are untouched — a genuinely undefined
+# constant still NameErrors at registration, in the real VM.
+class Module
+  def const_missing(_name)
+    Labelle::NOOP_RESULT
   end
 end

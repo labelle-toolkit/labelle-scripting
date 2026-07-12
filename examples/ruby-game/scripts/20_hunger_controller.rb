@@ -11,10 +11,10 @@
 #   - the controller caches ONE instance in setup (`@h = Hunger.new`),
 #   - tick refills it per entity via `e.get(Hunger, into: @h)`, mutates
 #     fields, writes back with `e.set(@h)`,
-#   - command-as-event feeding (`hunger__feed`, events/hunger__feed.zig)
-#     subscribed in setup — emitted by scripts/10_spawner.rb on tick 2,
-#     so the cross-script round-trip over the engine bus is part of the
-#     pinned transcript,
+#   - command-as-event feeding (`hunger__feed` — DECLARED IN RUBY,
+#     events/hunger__feed.rb) subscribed in setup — emitted by
+#     scripts/10_spawner.rb on tick 2, so the cross-script round-trip
+#     over the engine bus is part of the pinned transcript,
 #   - `Labelle::FrameArray` is the per-frame HOT scratch (collect ids,
 #     then process — mruby's Array#clear would FREE the backing every
 #     tick), asserted flat via growth_count at tick 5,

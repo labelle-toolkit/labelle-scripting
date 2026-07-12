@@ -77,8 +77,12 @@ def update(dt)
 
   # Command-as-event, CROSS-SCRIPT: this plain-hooks script commands the
   # controller (which subscribed in its setup) to feed the worker. The
-  # id and the exact f32 0.5 amount round-trip events/hunger__feed.zig
-  # on the real engine bus; the handler sees them on tick 3's inbox.
+  # id and the exact f32 0.5 amount round-trip the RUBY-DECLARED event
+  # (events/hunger__feed.rb) on the real engine bus; the handler sees
+  # them on tick 3's inbox. Emitting by plain STRING deliberately:
+  # scripts/feed_watcher.rb subscribes via the declared `HungerFeed`
+  # constant instead — the constant IS this frozen string, and the
+  # example shows both spellings meeting on one bus.
   if @tick == 2
     if Labelle.emit("hunger__feed", entity: @worker.id, amount: 0.5)
       Labelle.log("RUBY_FEED_SENT")
