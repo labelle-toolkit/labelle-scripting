@@ -374,6 +374,189 @@ test "cross-runner golden: the ruby half — byte-identical to the lua runner's 
     );
 }
 
+test "golden: events emit in their own array — no persist key, declaration order, sorted fields" {
+    // labelle-engine#772, the lua golden's ruby twin: the events array
+    // trails components, carries NO persist (events are never saved), and
+    // follows the same determinism rules — declaration order across
+    // files, fields sorted by name. Labelle.id classifies u64 with
+    // default 0; the trailing-keywords sugar reads bare like component's.
+    // (Every OTHER golden in this file has no events key at all — the
+    // emitters may add it only when an event was declared, or those pins
+    // break; that absence is the old-assembler compat rule.)
+    try expectSchema(&.{
+        .{
+            .path = "events/hunger__feed.rb",
+            .source =
+            \\HungerFeed = Labelle.event "hunger__feed", entity: Labelle.id, amount: 0.5
+            ,
+        },
+        .{ .path = "events/wave__spawned.rb", .source = "Labelle.event(\"wave__spawned\", {})" },
+    },
+        \\{"components":[],"events":[{"name":"hunger__feed","fields":[{"name":"amount","type":"f32","default":0.5},{"name":"entity","type":"u64","default":0}]},{"name":"wave__spawned","fields":[]}]}
+    );
+}
+
+test "events and components are separate namespaces: one name, both kinds, both emit" {
+    // The SAME name declared as a component and as an event is legal —
+    // duplicate detection is per kind — and Labelle.id is a legal
+    // COMPONENT field too (components gain u64 through the same marker).
+    try expectSchema(&.{
+        .{
+            .path = "scripts/hunger.rb",
+            .source =
+            \\Labelle.component "Hunger", level: 1.0, owner: Labelle.id
+            \\Labelle.event "Hunger", entity: Labelle.id
+            ,
+        },
+    },
+        \\{"components":[{"name":"Hunger","persist":"persistent","fields":[{"name":"level","type":"f32","default":1.0},{"name":"owner","type":"u64","default":0}]}],"events":[{"name":"Hunger","fields":[{"name":"entity","type":"u64","default":0}]}]}
+    );
+}
+
+test "duplicate event declarations fail naming BOTH files" {
+    try expectFailure(&.{
+        .{ .path = "events/first.rb", .source = "Labelle.event \"hunger__feed\", {}" },
+        .{ .path = "events/second.rb", .source = "\nLabelle.event \"hunger__feed\", {}" },
+    }, &.{
+        "events/second.rb:2", // the redeclaration site (backtrace frame)
+        "duplicate event 'hunger__feed'",
+        "first declared in events/first.rb",
+    });
+}
+
+test "malformed event declarations fail with file- and event-bearing errors" {
+    // Empty name.
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"\", {})" }},
+        &.{ "events/bad.rb:1", "non-empty event name" },
+    );
+    // Non-identifier name (double underscores ARE legal — hunger__feed
+    // passes the goldens above; a space does not).
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"hunger feed\", {})" }},
+        &.{ "events/bad.rb:1", "'hunger feed'", "not a valid identifier" },
+    );
+    // Missing spec hash — payloadless events spell it {} explicitly.
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"tick\")" }},
+        &.{ "events/bad.rb:1", "'tick'", "spec Hash" },
+    );
+    // A third argument is not a persist knob: events take no options —
+    // whether it is a literal hash or a no-op sentinel.
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"tick\", {}, { persist: \"transient\" })" }},
+        &.{ "events/bad.rb:1", "'tick'", "takes no options (events are not persisted)" },
+    );
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"tick\", {}, Labelle.array([]))" }},
+        &.{ "events/bad.rb:1", "'tick'", "takes no options (events are not persisted)" },
+    );
+    // Unsupported field value type.
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"bad\", cb: ->() {})" }},
+        &.{ "events/bad.rb:1", "event 'bad' field 'cb'", "unsupported default of type Proc" },
+    );
+    // The no-op sentinel is rejected in spec and field positions, with
+    // the message naming the EVENT DSL.
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"bad\", Labelle.array([]))" }},
+        &.{ "events/bad.rb:1", "event 'bad' spec", "cannot be used in event specs — declare-mode fields are literals" },
+    );
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"bad\", w: Labelle.array([]))" }},
+        &.{ "events/bad.rb:1", "event 'bad' field 'w'", "cannot be used in event specs" },
+    );
+}
+
+test "Labelle.id is no-arg only, and no spec" {
+    // v1 has no id(value) constructor — `Labelle.id(42)` must name the
+    // mistake, not classify garbage (ids always default 0).
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.component(\"Bad\", owner: Labelle.id(42))" }},
+        &.{ "events/bad.rb:1", "Labelle.id", "takes no arguments" },
+    );
+    // In spec position the marker is a bare frozen Object, so the
+    // existing shape guard names the real problem.
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"bad\", Labelle.id)" }},
+        &.{ "events/bad.rb:1", "'bad'", "spec Hash" },
+    );
+    // Nested inside a vec2-shaped hash: v1 ids are scalar-only.
+    try expectFailure(
+        &.{.{ .path = "events/bad.rb", .source = "Labelle.event(\"bad\", at: { x: Labelle.id, y: 0 })" }},
+        &.{ "events/bad.rb:1", "event 'bad' field 'at'", "unsupported Hash default" },
+    );
+}
+
+test "the declare-mode event return mimics the runtime value: the frozen name string" {
+    // One DSL, two consumers: chunk-scope code holding the result must
+    // see the SAME value in both modes (src/ruby/prelude.rb's
+    // Labelle.event returns the frozen name). `raise` at chunk scope
+    // fails the build, so the fixture is its own assertion.
+    try expectSchema(&.{
+        .{
+            .path = "events/view.rb",
+            .source =
+            \\HungerFeed = Labelle.event "hunger__feed", entity: Labelle.id
+            \\raise "not the name" unless HungerFeed == "hunger__feed"
+            \\raise "not frozen" unless HungerFeed.frozen?
+            \\raise "id not stable" unless Labelle.id.equal?(Labelle.id)
+            \\raise "id not frozen" unless Labelle.id.frozen?
+            ,
+        },
+    },
+        \\{"components":[],"events":[{"name":"hunger__feed","fields":[{"name":"entity","type":"u64","default":0}]}]}
+    );
+}
+
+test "the event field cap fails on the declaration line: 33 rejected, 32 passes" {
+    // Event payloads share the view fast path's 32-field ceiling
+    // (MAX_VIEW_FIELDS — the drift pin below covers the event twin in the
+    // lua runner too): one schema, whatever the language, and the failure
+    // names the declaration.
+    try expectFailure(&.{.{
+        .path = "events/wide.rb",
+        .source =
+        \\spec = {}
+        \\33.times { |i| spec["f%02d" % i] = 0 }
+        \\Labelle.event("wide", spec)
+        ,
+    }}, &.{
+        "events/wide.rb:3", // the declaration site
+        "event 'wide' has 33 fields",
+        "at most 32 fields; split the event",
+    });
+
+    // Exactly 32 is the edge — still a legal declaration. Expected JSON
+    // is generated to match: fields f00..f31, where zero-padding makes
+    // numeric order lexicographic (= sorted).
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(testing.allocator);
+    try expected.appendSlice(
+        testing.allocator,
+        "{\"components\":[],\"events\":[{\"name\":\"wide32\",\"fields\":[",
+    );
+    for (0..32) |i| {
+        if (i > 0) try expected.append(testing.allocator, ',');
+        const field = try std.fmt.allocPrint(
+            testing.allocator,
+            "{{\"name\":\"f{d:0>2}\",\"type\":\"i32\",\"default\":0}}",
+            .{i},
+        );
+        defer testing.allocator.free(field);
+        try expected.appendSlice(testing.allocator, field);
+    }
+    try expected.appendSlice(testing.allocator, "]}]}");
+    try expectSchema(&.{.{
+        .path = "events/wide32.rb",
+        .source =
+        \\spec = {}
+        \\32.times { |i| spec["f%02d" % i] = 0 }
+        \\Labelle.event("wide32", spec)
+        ,
+    }}, expected.items);
+}
+
 test "the view fast path's field cap fails on the declaration line: 33 rejected, 32 passes" {
     // 33 fields: the declaration itself must fail — past declare, the
     // SAME line's runtime half would construct a view whose every
@@ -448,7 +631,12 @@ test "field-cap drift pin: bindings' MAX_REF_FIELDS equals both preludes' MAX_VI
     // prelude rejects the declaration at build time. If any literal
     // drifts, either declares start passing what runtime rejects (the
     // codex split-brain) or views start rejecting what the raw path
-    // accepts — both are this pin.
+    // accepts — both are this pin. The event DSL rides the same cap
+    // (Labelle.event reuses MAX_VIEW_FIELDS; the LUA declare prelude —
+    // which never had a component cap to reuse — spells the event
+    // ceiling as its own MAX_EVENT_FIELDS literal), so the lua runner's
+    // fourth spelling is pinned here too: a drift would let one runner
+    // declare an event the other rejects.
     const zig_cap = try scanCapLiteral(
         @embedFile("ruby_bindings_src"),
         "const MAX_REF_FIELDS = ",
@@ -461,6 +649,11 @@ test "field-cap drift pin: bindings' MAX_REF_FIELDS equals both preludes' MAX_VI
         @embedFile("declare_ruby_prelude_src"),
         "MAX_VIEW_FIELDS = ",
     );
+    const lua_event_cap = try scanCapLiteral(
+        @embedFile("declare_lua_prelude_src"),
+        "MAX_EVENT_FIELDS = ",
+    );
     try testing.expectEqual(zig_cap, runtime_cap);
     try testing.expectEqual(zig_cap, declare_cap);
+    try testing.expectEqual(zig_cap, lua_event_cap);
 }

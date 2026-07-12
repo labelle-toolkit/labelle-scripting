@@ -293,6 +293,60 @@ TODO: move the in-repo vendor snapshot to a lazy prebuilt tarball once a
 labelle-hosted one exists — mruby has no amalgamation and its upstream
 build needs host ruby+rake, which consumers never see).
 
+## Declaring events in lua and ruby
+
+Custom bus events follow the component pattern — one line, two
+consumers (labelle-engine#772). Declaration files live where their kind
+lives: `events/*.rb|lua` beside `events/*.zig` (the events dir is
+extension-keyed and mixed-language, like `components/`; assembler
+support for collecting them lands with assembler v0.87.0):
+
+```ruby
+# events/hunger__feed.rb — next to events/other_event.zig
+HungerFeed = Labelle.event "hunger__feed", entity: Labelle.id, amount: 0.5
+```
+
+```lua
+-- events/hunger__feed.lua
+local HungerFeed = labelle.event("hunger__feed", { entity = labelle.id, amount = 0.5 })
+```
+
+At BUILD time the line is a SCHEMA DECLARATION: `labelle generate` runs
+the language's declare runner over it and the assembler materializes a
+real `events/hunger__feed.zig` in the staged tree — so the generated
+game's event union, sidecars, and any native Zig hook consuming the
+event are byte-identical to the Zig-authored case (a Zig hook needs
+zero changes when an event migrates from `.zig` to `.rb`). Field types
+infer from the defaults exactly like components (Float→f32,
+Integer→i32, bool, String→str, `{ x:, y: }`→vec2) with one addition:
+**`Labelle.id`** (lua: `labelle.id`) marks an entity-id field —
+`{"type":"u64","default":0}` in the schema, since no plain script value
+can spell u64. The marker is legal in component specs too (components
+gain u64 fields the same way), takes no arguments (v1 has no id(value)
+constructor — id fields always default 0), and returns plain `0` at
+runtime so the same spec line evaluates clean in both modes. Events
+have NO options argument — they are never persisted, so where a
+component takes `persist:` a third argument to `Labelle.event` is a
+build error. A payloadless event is an explicit empty spec
+(`Labelle.event "wave__spawned", {}`); payloads cap at 32 fields (the
+view fast path's ceiling); duplicate event names across files fail the
+build naming the first file; and events are their OWN namespace — an
+event may share a component's name.
+
+At RUNTIME the same call validates the name and returns it — the frozen
+name string (a plain immutable string in lua) — so the one constant
+drives both legs of the bus:
+
+```ruby
+Labelle.on(HungerFeed) { |ev| feed(ev[:entity], ev[:amount]) }
+Labelle.emit(HungerFeed, entity: Labelle.u64str(e.id), amount: 0.5)
+```
+
+One file may declare several events (stem == name is style, not
+enforced), and a chunk-scope declaration inside a regular script stays
+legal — both feed the extractor. TypeScript games keep Zig events for
+now (no TS declare runner exists yet).
+
 ## Using the typescript sub-module
 
 Build with `-Dlanguage=typescript` (embeds [quickjs-ng](https://github.com/quickjs-ng/quickjs)
