@@ -20,6 +20,7 @@
 //! language.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// `crystal env CRYSTAL_LIBRARY_PATH` splitting (colon-separated) —
 /// shared with the test suite as the `crystal_lib_paths` named module.
@@ -792,6 +793,20 @@ fn configureLanguage(
     opts.addOption(Language, "language", language);
     mod.addOptions("scripting_options", opts);
 
+    // Android cross-compilation: Zig ships no libc headers for the
+    // Android target, so any vendored C runtime compiled into `mod`
+    // below (mruby, Lua, quickjs) fails to find <math.h>/<stdlib.h>/etc.
+    // Plumb the NDK sysroot include paths in BEFORE the addCSourceFiles
+    // calls in the switch — mirrors labelle-box2d and the bgfx-Android
+    // backend. No-op for the pure-Zig / natively-compiled languages
+    // (rust/crystal/csharp add no C here). Gated on the Android ABI so
+    // other targets are untouched.
+    if (mod.resolved_target) |t| {
+        if (t.result.abi == .android or t.result.abi == .androideabi) {
+            applyAndroidNdkSysroot(b, mod, t);
+        }
+    }
+
     switch (language) {
         .lua => if (lua_dep_opt) |lua_dep| {
             // Vendored Lua 5.4, compiled straight into the module: every
@@ -945,4 +960,75 @@ fn crystalTriple(b: *std.Build, t: std.Target) ?[]const u8 {
         .linux => b.fmt("{s}-linux-gnu", .{arch}),
         else => null,
     };
+}
+
+/// Add the Android NDK sysroot include/library paths + API-level define
+/// to a C-compiling module so its vendored runtime C sources (mruby,
+/// Lua, quickjs) and @cImport translation find Bionic's
+/// <math.h>/<stdlib.h>/etc. Mirrors labelle-box2d / labelle-bgfx.
+/// Panics with an actionable message if the NDK can't be located (only
+/// called on the Android path).
+fn applyAndroidNdkSysroot(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    const sysroot = androidNdkSysroot(b) orelse
+        @panic("Could not find Android NDK. Set ANDROID_NDK_HOME or ANDROID_HOME.");
+    const triple: []const u8 = switch (target.result.cpu.arch) {
+        .aarch64 => "aarch64-linux-android",
+        .x86_64 => "x86_64-linux-android",
+        .arm, .thumb => "arm-linux-androideabi",
+        .x86 => "i686-linux-android",
+        else => @panic("unsupported Android arch for scripting"),
+    };
+    // Match the toolkit's default Android min_sdk (28).
+    const api = "28";
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include", triple }) });
+    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/lib", triple, api }) });
+    mod.addCMacro("__ANDROID_API__", api);
+    // Android .so consumers need PIC in every archived .o.
+    mod.pic = true;
+}
+
+/// Locate the Android NDK sysroot, mirroring labelle-bgfx's resolver:
+/// `ANDROID_NDK_HOME` first, then `ANDROID_HOME/ndk/<latest>`. Uses the
+/// Zig 0.16 `std.Io.Dir` APIs (getEnvVarOwned / std.fs.cwd() removed).
+/// Returns null if neither resolves to an existing sysroot.
+fn androidNdkSysroot(b: *std.Build) ?[]const u8 {
+    const io = b.graph.io;
+    const host_tag = switch (builtin.os.tag) {
+        .linux => "linux-x86_64",
+        .macos => "darwin-x86_64",
+        .windows => "windows-x86_64",
+        else => "linux-x86_64",
+    };
+    // 1. ANDROID_NDK_HOME
+    if (b.graph.environ_map.get("ANDROID_NDK_HOME")) |ndk_home| {
+        const sysroot = b.pathJoin(&.{ ndk_home, "toolchains", "llvm", "prebuilt", host_tag, "sysroot" });
+        if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| return sysroot else |_| {}
+    }
+    // 2. ANDROID_HOME/ndk/<latest>
+    if (b.graph.environ_map.get("ANDROID_HOME")) |home| {
+        const ndk_dir = b.pathJoin(&.{ home, "ndk" });
+        var dir = std.Io.Dir.cwd().openDir(io, ndk_dir, .{ .iterate = true }) catch return null;
+        defer dir.close(io);
+        var latest: ?[]const u8 = null;
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            if (entry.kind == .directory) {
+                if (latest) |prev| {
+                    if (std.mem.order(u8, entry.name, prev) == .gt) {
+                        b.allocator.free(prev);
+                        latest = b.allocator.dupe(u8, entry.name) catch null;
+                    }
+                } else {
+                    latest = b.allocator.dupe(u8, entry.name) catch null;
+                }
+            }
+        }
+        if (latest) |version| {
+            defer b.allocator.free(version);
+            const sysroot = b.pathJoin(&.{ ndk_dir, version, "toolchains", "llvm", "prebuilt", host_tag, "sysroot" });
+            if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| return sysroot else |_| {}
+        }
+    }
+    return null;
 }
