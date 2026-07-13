@@ -182,9 +182,15 @@ pub const c = struct {
     pub extern fn mrb_str_new(mrb: ?*State, p: ?[*]const u8, len: Int) Value;
     pub extern fn mrb_ary_new_capa(mrb: ?*State, capa: Int) Value;
     pub extern fn mrb_ary_push(mrb: ?*State, ary: Value, elem: Value) void;
+    /// Set `ary[n] = val`, growing the array (filling gaps with nil) as
+    /// needed — how the batched read refills a reused scratch Array in place.
+    pub extern fn mrb_ary_set(mrb: ?*State, ary: Value, n: Int, val: Value) void;
     /// The symbol behind the mrb_ary_ref(mrb, ...) header macro — note it
     /// takes no mrb_state.
     pub extern fn mrb_ary_entry(ary: Value, offset: Int) Value;
+    /// Coerce a value to Float (raises TypeError on a non-numeric) — the
+    /// batched write reads each Array element back to f64 through this.
+    pub extern fn mrb_ensure_float_type(mrb: ?*State, val: Value) Value;
     pub extern fn mrb_hash_new_capa(mrb: ?*State, capa: Int) Value;
     pub extern fn mrb_hash_set(mrb: ?*State, hash: Value, key: Value, val: Value) void;
     pub extern fn mrb_hash_get(mrb: ?*State, hash: Value, key: Value) Value;

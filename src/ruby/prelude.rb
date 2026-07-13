@@ -207,6 +207,24 @@ module Labelle
     nil
   end
 
+  # ── batched query (the whole-query fast path) ────────────────────────
+  # `batch_get(names, arr)` fills `arr` with every matching entity's scalar
+  # component data as a flat f32 array — [c0_f0, c0_f1, ..., c1_f0, ...] per
+  # entity, components in `names` order, fields in declaration order — and
+  # returns the entity COUNT. ONE FFI crossing for the whole query instead
+  # of a get per entity. Reuse the SAME `arr` across ticks (it grows once).
+  # `batch_set(names, arr, n)` writes the mutated `arr` back in ONE crossing
+  # (the host re-queries the same entities, same order). The caller owns the
+  # positional layout: the stride (fields-per-entity) must match how the
+  # host walks the named components.
+  def self.batch_get(names, arr)
+    raw_batch_get(json_encode(names), arr)
+  end
+
+  def self.batch_set(names, arr, n)
+    raw_batch_set(json_encode(names), arr, n)
+  end
+
   # ── per-script method harvest (called by vm.zig) ─────────────────────
 
   # Baseline of Object's OWN (public + private) instance methods, taken

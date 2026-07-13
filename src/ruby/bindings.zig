@@ -131,6 +131,8 @@ const shims = [_]Shim{
     .{ .name = "raw_component_has", .func = rawComponentHas, .aspec = argsReq(2) },
     .{ .name = "raw_component_remove", .func = rawComponentRemove, .aspec = argsReq(2) },
     .{ .name = "raw_query", .func = rawQuery, .aspec = argsReq(1) },
+    .{ .name = "raw_batch_get", .func = rawBatchGet, .aspec = argsReq(2) },
+    .{ .name = "raw_batch_set", .func = rawBatchSet, .aspec = argsReq(3) },
     .{ .name = "raw_event_emit", .func = rawEventEmit, .aspec = argsReq(2) },
     .{ .name = "raw_event_subscribe", .func = rawEventSubscribe, .aspec = argsReq(1) },
     .{ .name = "raw_event_poll", .func = rawEventPoll, .aspec = argsReq(0) },
@@ -318,10 +320,10 @@ fn getIntoArgs(mrb: ?*c.State) IntoArgs {
 fn rawComponentGetInto(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
     _ = self;
     const a = getIntoArgs(mrb);
-    const json = getComponentJson(mrb, a.id, a.name) orelse return c.Value.boolean(false);
 
     // Pre-intern the field symbols once per call (interning an existing
     // symbol is a lookup, not an allocation — these settle at warm-up).
+    // Shared by BOTH the packed fast path and the JSON fallback.
     var field_syms: [MAX_REF_FIELDS]c.Sym = undefined;
     const nfields: usize = @intCast(c.labelle_mrb_ary_len(a.fields));
     for (0..nfields) |fi| {
@@ -330,6 +332,30 @@ fn rawComponentGetInto(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
             raiseError(mrb, "TypeError", "labelle: component fields must be symbols");
         field_syms[fi] = fv.value.sym;
     }
+
+    // ── PACKED fast path ──────────────────────────────────────────────
+    // Try the host's binary codec first: it writes the component's scalar
+    // fields as a self-describing little-endian record we decode straight
+    // into the instance with NO JSON parse. Sizing mirrors the JSON get
+    // (one call; grow-retry-once on required > cap). Only the first-byte
+    // sentinel (0xFF) or an absent component (0) drops us to JSON.
+    {
+        var buf = io_scratch.ensure(mrb, SCRATCH_INITIAL_CAP);
+        var n = contract.labelle_component_get_packed(a.id, a.name.ptr, a.name.len, buf, io_scratch.cap);
+        if (n > io_scratch.cap) {
+            buf = io_scratch.ensure(mrb, n);
+            n = contract.labelle_component_get_packed(a.id, a.name.ptr, a.name.len, buf, io_scratch.cap);
+        }
+        if (n >= 1 and n <= io_scratch.cap and buf[0] != 0xFF) {
+            decodePackedInto(mrb, buf[0..n], a.inst, field_syms[0..nfields]);
+            return c.Value.boolean(true);
+        }
+        // n == 0 (absent) → JSON get also returns absent (false).
+        // buf[0] == 0xFF (non-scalar component) → JSON path decodes it.
+    }
+
+    // ── JSON fallback (unchanged) ─────────────────────────────────────
+    const json = getComponentJson(mrb, a.id, a.name) orelse return c.Value.boolean(false);
 
     var p = Parser{ .mrb = mrb, .text = json };
     p.skipWs();
@@ -365,6 +391,65 @@ fn rawComponentGetInto(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
     return c.Value.boolean(true);
 }
 
+/// Decode a packed component record (the host's `_get_packed` binary
+/// format) straight into the Struct instance: for each field record whose
+/// name matches a declared view field, `instance[idx] = <mrb value>`. Tags
+/// map to immediates (f32→Float, i64/u64→Integer, bool→true/false) so a
+/// scalar refill allocates nothing. A malformed record stops early (the
+/// fields decoded so far stay applied) — the host builds it, so this is
+/// belt-and-suspenders. `field_syms` are the pre-interned view fields.
+fn decodePackedInto(mrb: ?*c.State, rec: []const u8, inst: c.Value, field_syms: []const c.Sym) void {
+    if (rec.len < 1) return;
+    const field_count = rec[0];
+    var pos: usize = 1;
+    var i: usize = 0;
+    while (i < field_count) : (i += 1) {
+        if (pos >= rec.len) return;
+        const name_len = rec[pos];
+        pos += 1;
+        if (pos + name_len > rec.len) return;
+        const fname = rec[pos..][0..name_len];
+        pos += name_len;
+        if (pos >= rec.len) return;
+        const tag = rec[pos];
+        pos += 1;
+        var v: c.Value = undefined;
+        switch (tag) {
+            0 => { // f32
+                if (pos + 4 > rec.len) return;
+                const bits = std.mem.readInt(u32, rec[pos..][0..4], .little);
+                pos += 4;
+                v = c.Value.float(@as(f32, @bitCast(bits)));
+            },
+            1 => { // i64
+                if (pos + 8 > rec.len) return;
+                v = c.Value.int(std.mem.readInt(i64, rec[pos..][0..8], .little));
+                pos += 8;
+            },
+            2 => { // bool
+                if (pos + 1 > rec.len) return;
+                v = c.Value.boolean(rec[pos] != 0);
+                pos += 1;
+            },
+            3 => { // u64 (bitcast to the signed id representation ruby uses)
+                if (pos + 8 > rec.len) return;
+                v = c.Value.int(@bitCast(std.mem.readInt(u64, rec[pos..][0..8], .little)));
+                pos += 8;
+            },
+            else => return,
+        }
+        // Match the field name to a declared view field, assign in place.
+        const key_sym = c.mrb_intern(mrb, fname.ptr, fname.len);
+        for (field_syms, 0..) |fs, idx| {
+            if (fs == key_sym) {
+                var args = [_]c.Value{ c.Value.int(@intCast(idx)), v };
+                _ = c.mrb_funcall_argv(mrb, inst, syms.aset, 2, &args);
+                break;
+            }
+        }
+    }
+}
+
 /// `raw_component_set_from(id, name, instance, fields)` — encode the
 /// Struct instance's fields as a sorted-key JSON object (field values
 /// read via `instance[idx]`, no intermediate Hash) and hand it to the
@@ -374,6 +459,78 @@ fn rawComponentSetFrom(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
     const a = getIntoArgs(mrb);
     const nfields: usize = @intCast(c.labelle_mrb_ary_len(a.fields));
 
+    // ── PACKED fast path ──────────────────────────────────────────────
+    // Build the binary record from the view's fields — tag each by its
+    // RUBY value type (Float→f32, Integer→i64, true/false→bool). The host
+    // coerces each into the target struct field's real type. A field whose
+    // ruby value isn't a scalar (nil/String/Array/…), an over-long name, or
+    // a record that would overflow the local buffer aborts the fast path
+    // (`break :packed`) and we fall through to the JSON encoder below. A
+    // host rc != 0 (component not packable there) does the same.
+    pk: {
+        // Generous stack record: real components sit far under this; a
+        // pathological wide view just takes the JSON path.
+        var rec: [2048]u8 = undefined;
+        var w: usize = 0;
+        rec[w] = @intCast(nfields);
+        w += 1;
+        for (0..nfields) |fi| {
+            const fv = c.mrb_ary_entry(a.fields, @intCast(fi));
+            if (fv.tt != .symbol)
+                raiseError(mrb, "TypeError", "labelle: component fields must be symbols");
+            // Name — mrb_sym_name_len's pointer is valid only until the
+            // NEXT mrb call, so copy it in immediately.
+            var nl: c.Int = 0;
+            const np = c.mrb_sym_name_len(mrb, fv.value.sym, &nl) orelse
+                raiseError(mrb, "TypeError", "labelle: unnameable symbol");
+            const nlen: usize = @intCast(nl);
+            if (nlen > 255 or w + 1 + nlen + 9 > rec.len) break :pk;
+            rec[w] = @intCast(nlen);
+            w += 1;
+            @memcpy(rec[w..][0..nlen], np[0..nlen]);
+            w += nlen;
+            // Value via instance[idx].
+            var idx = [_]c.Value{c.Value.int(@intCast(fi))};
+            const v = c.mrb_funcall_argv(mrb, a.inst, syms.aref, 1, &idx);
+            switch (v.tt) {
+                .float => {
+                    rec[w] = 0;
+                    w += 1;
+                    const f: f32 = @floatCast(v.value.f);
+                    std.mem.writeInt(u32, rec[w..][0..4], @bitCast(f), .little);
+                    w += 4;
+                },
+                .integer => {
+                    rec[w] = 1;
+                    w += 1;
+                    std.mem.writeInt(i64, rec[w..][0..8], v.value.i, .little);
+                    w += 8;
+                },
+                .true => {
+                    rec[w] = 2;
+                    w += 1;
+                    rec[w] = 1;
+                    w += 1;
+                },
+                .false => {
+                    // nil (tt .false, i == 0) is not a bool — let JSON
+                    // encode it as null.
+                    if (v.isNil()) break :pk;
+                    rec[w] = 2;
+                    w += 1;
+                    rec[w] = 0;
+                    w += 1;
+                },
+                else => break :pk, // String/Array/Hash/… → JSON path
+            }
+        }
+        const rc = contract.labelle_component_set_packed(a.id, a.name.ptr, a.name.len, &rec, w);
+        if (rc == 0) return c.Value.int(0);
+        // rc != 0: host refused the packed set (non-scalar target /
+        // unknown) — fall through to the JSON encoder.
+    }
+
+    // ── JSON fallback (unchanged) ─────────────────────────────────────
     // Field names + declared order index, then insertion-sort by name so
     // the encoding is deterministic (the codec's promise; lua sorts too).
     // Names are COPIED out: mruby packs short symbol names inline and
@@ -450,6 +607,74 @@ fn rawQuery(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
         }
     }
     return ary;
+}
+
+// ── batched query codec (the whole-query fast path) ──────────────────────
+
+/// `raw_batch_get(names_json, out_array)` — ONE contract call fills
+/// `out_array` with every matching entity's scalar component data as a flat
+/// f32 stream, returning the entity COUNT (Integer). The host writes
+/// `[u32 count][f32 stream]` into the io scratch (grow-and-retry on the
+/// required-size return, like rawQuery); we read the count header, then
+/// decode the (n-4)/4 floats straight into the reused Array via mrb_ary_set
+/// (elements 0..M-1, growing it once then reusing across ticks). Floats
+/// cross as immediates — the only per-tick allocation is the Array's own
+/// backing growth, amortized to zero once warm.
+fn rawBatchGet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
+    _ = self;
+    var np: [*]const u8 = undefined;
+    var nl: c.Int = undefined;
+    var arr: c.Value = undefined;
+    _ = c.mrb_get_args(mrb, "sA", &np, &nl, &arr);
+    const names = np[0..@intCast(nl)];
+
+    var buf = io_scratch.ensure(mrb, SCRATCH_INITIAL_CAP);
+    var n = contract.labelle_component_batch_get(names.ptr, names.len, buf, io_scratch.cap);
+    if (n == 0) return c.Value.int(0); // not bound / malformed
+    if (n > io_scratch.cap) {
+        buf = io_scratch.ensure(mrb, n);
+        n = contract.labelle_component_batch_get(names.ptr, names.len, buf, io_scratch.cap);
+        if (n == 0 or n > io_scratch.cap) return c.Value.int(0); // belt
+    }
+    if (n < 4) return c.Value.int(0);
+    const count = std.mem.readInt(u32, buf[0..4], .little);
+    const nfloats = (n - 4) / 4;
+    var i: usize = 0;
+    while (i < nfloats) : (i += 1) {
+        const bits = std.mem.readInt(u32, buf[4 + i * 4 ..][0..4], .little);
+        c.mrb_ary_set(mrb, arr, @intCast(i), c.Value.float(@as(f32, @bitCast(bits))));
+    }
+    return c.Value.int(@intCast(count));
+}
+
+/// `raw_batch_set(names_json, array, count)` — ONE contract call writes the
+/// whole swarm back. Packs every element of `array` (`count*stride` floats —
+/// the array is exactly what batch_get filled) into the io scratch as raw
+/// f32, then hands the pure stream (no header) to the host, which re-queries
+/// the same entities and applies them positionally. Returns the contract rc
+/// (0 = ok). `count` is the caller's entity count; the array length is the
+/// authoritative float count and is what we pack.
+fn rawBatchSet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
+    _ = self;
+    var np: [*]const u8 = undefined;
+    var nl: c.Int = undefined;
+    var arr: c.Value = undefined;
+    var count: c.Int = undefined;
+    // `count` (entity count) is accepted for API symmetry; the array length
+    // is the authoritative float count and is what we pack below.
+    _ = c.mrb_get_args(mrb, "sAi", &np, &nl, &arr, &count);
+    const names = np[0..@intCast(nl)];
+    const nfloats: usize = @intCast(c.labelle_mrb_ary_len(arr));
+    const bytes = nfloats * 4;
+    const buf = io_scratch.ensure(mrb, @max(bytes, 1));
+    var i: usize = 0;
+    while (i < nfloats) : (i += 1) {
+        const v = c.mrb_ary_entry(arr, @intCast(i));
+        const f: f32 = @floatCast(c.mrb_ensure_float_type(mrb, v).value.f);
+        std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f), .little);
+    }
+    const rc = contract.labelle_component_batch_set(names.ptr, names.len, buf, bytes);
+    return c.Value.int(rc);
 }
 
 // ── events ───────────────────────────────────────────────────────────────

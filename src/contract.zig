@@ -81,6 +81,66 @@ pub extern fn labelle_component_get(
     out_cap: usize,
 ) usize;
 
+/// PACKED (binary) fast-path twin of `labelle_component_get` (additive,
+/// probe-by-symbol). Serializes the component into `out` as a
+/// self-describing little-endian record instead of JSON text, so a
+/// scalar-only component refills a view with NO JSON parse. Same sizing
+/// contract as the JSON get (required-size return, all-or-nothing write,
+/// NULL/cap-0 probe, 0 = absent). A first byte of 0xFF is the "not
+/// packable" sentinel (the component carries a non-scalar field) — the
+/// caller then falls back to `labelle_component_get`.
+pub extern fn labelle_component_get_packed(
+    id: u64,
+    name: [*]const u8,
+    name_len: usize,
+    out: ?[*]u8,
+    out_cap: usize,
+) usize;
+
+/// PACKED (binary) fast-path twin of `labelle_component_set`. Applies a
+/// packed record (the `_get_packed` format) to the named component,
+/// coercing each field into its real scalar type. REPLACE semantics.
+/// 0 = ok; -1 = unknown/dead/refused (non-scalar target — fall back to
+/// `labelle_component_set`) / malformed / not bound.
+pub extern fn labelle_component_set_packed(
+    id: u64,
+    name: [*]const u8,
+    name_len: usize,
+    buf: ?[*]const u8,
+    buf_len: usize,
+) i32;
+
+/// BATCHED (binary) component read — the whole-query fast path (spike:
+/// collapse the per-entity FFI crossings into ONE call per tick). Resolves
+/// the SAME entity set as `labelle_query` (entities carrying ALL named
+/// components), then writes, for each entity IN QUERY ORDER, each named
+/// component's scalar fields (IN THE GIVEN NAME ORDER, each component's
+/// fields in struct-declaration order) as raw little-endian f32 into `out`.
+/// Wire layout: `[u32 entity_count][f32 stream]` (count header first, then
+/// count*stride floats). Non-scalar fields are skipped; int/bool fields
+/// coerce to f32. Same snprintf-style sizing as `labelle_query`: the return
+/// is the bytes the COMPLETE buffer requires (grow + retry on required >
+/// cap); 0 = malformed names / not bound. A NULL/cap-0 `out` sizes only.
+pub extern fn labelle_component_batch_get(
+    names_json: [*]const u8,
+    names_json_len: usize,
+    out: ?[*]u8,
+    out_cap: usize,
+) usize;
+
+/// BATCHED (binary) component write — twin of `labelle_component_batch_get`.
+/// RE-QUERIES the same entity set in the same order and reads the f32 stream
+/// positionally (`buf` is the pure f32 stream — NO count header; the host's
+/// re-query drives entity count), coercing each f32 back into its field's
+/// real scalar type (REPLACE semantics). 0 = ok; -1 = malformed / too-short
+/// buffer / not bound.
+pub extern fn labelle_component_batch_set(
+    names_json: [*]const u8,
+    names_json_len: usize,
+    buf: ?[*]const u8,
+    buf_len: usize,
+) i32;
+
 /// 1 when the entity carries the component, else 0.
 pub extern fn labelle_component_has(id: u64, name: [*]const u8, name_len: usize) i32;
 
