@@ -8,23 +8,22 @@
 // plugin package's native-csharp/src/game/) into labelle_csharp_scripts.dll
 // BESIDE the binary, and src/csharp/vm.zig loads it at runtime through hostfxr.
 //
-// The ONLY non-C# pieces are this config, scenes/main.jsonc, and the component
-// SCHEMAS (components/*.zig). C# cannot author a component schema: the Script
-// Runtime Contract has no component-registration call and there is no
-// declare-csharp extractor yet (only lua's tools/declare and tools/declare-ruby
-// exist) — so the components stay Zig and a `declare-csharp` tool is the
-// follow-up that would let them (and custom events) be authored in C# like
-// ruby-game's components/hunger.rb. C# still reads/writes them by name at
-// runtime over the contract.
+// The components (components/Hunger.cs + Worker.cs) and the custom event
+// (events/hunger__feed.cs) are DECLARED in C# too (labelle-scripting#27,
+// labelle-declare-csharp): the assembler extracts their schema at generate and
+// codegens the game's component registry / event union exactly like a
+// components/*.zig would. The ONLY non-C# pieces are this config and
+// scenes/main.jsonc — the game is 100% C#, ZERO authored .zig (its second event
+// subscriber is a C# watcher SCRIPT, not the native Zig hook rust/crystal keep).
 //
-// STATUS: documentation-first. The assembler's native-language splice does not
-// yet recognize `csharp` (no released assembler row — labelle-engine#743 tracks
-// the assembler follow-up), so unlike ruby/rust/crystal there is no CI job
-// generating + building + running it YET. The plugin side (src/csharp/,
-// native-csharp/) IS verified end to end by `zig build test` (the csharp suite
-// drives the managed assembly through hostfxr against the mock host). Wire a
-// `csharp-example` CI job once the assembler lands the csharp splice + a
-// declare-csharp runner.
+// STATUS: CI-proven. The `csharp-example` job (.github/workflows/ci.yml) runs
+// this game through the real assembler on every push — generate → stage →
+// labelle-declare-csharp → dotnet publish → build → 5 headless frames with an
+// ordered transcript pinned — the end-to-end proof #743 deferred, now live. The
+// assembler recognizes `csharp` and reads the `.native` `.languages` row
+// generically (labelle-assembler#619); its dev-`.csproj` emitter
+// (labelle-assembler#617) also makes this a first-class Visual Studio / Rider /
+// VS Code project.
 .{
     .name = "csharp_game",
     .title = "LaBelle — C# Example Game (null backend)",
@@ -38,9 +37,10 @@
     .initial_prefab = "main",
     .states = .{"playing"},
     // The scripting plugin resolved from the repo root two levels up — the
-    // working tree under test — selecting csharp. C# has no declare mode yet
-    // (no declare-csharp extractor), so `Hunger`/`Worker` are real
-    // components/*.zig files the C# scripts address by name over the contract.
+    // working tree under test — selecting csharp. `Hunger`/`Worker` and the
+    // `hunger__feed` event are DECLARED in C# (components/*.cs + events/*.cs,
+    // labelle-declare-csharp); the C# scripts also address them by name over
+    // the contract at runtime.
     .plugins = .{
         .{
             .name = "scripting",

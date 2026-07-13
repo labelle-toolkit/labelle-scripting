@@ -7,14 +7,15 @@
 //     byte[] buffers held in fields, refilled per tick by QueryInto /
 //     GetComponentInto (grown at most once via the contract's required-size
 //     legs) — the managed GC's high-water-mark steady state,
-//   - command-as-event feeding (`hunger__feed`, events/hunger__feed.zig)
-//     subscribed in Init — emitted by scripts/Spawner.cs on tick 2, so the
-//     cross-script round-trip over the engine bus is part of the transcript,
-//   - a NATIVE game-root Zig hook (hooks/feed_watcher.zig) consumes the SAME
-//     hunger__feed from the same bus — the two-layer interop.
+//   - command-as-event feeding (`hunger__feed`, events/hunger__feed.cs — a
+//     C#-declared event) subscribed in Init — emitted by scripts/Spawner.cs on
+//     tick 2, so the cross-script round-trip over the engine bus is part of the
+//     transcript,
+//   - a second subscriber, scripts/FeedWatcher.cs (a pure-C# watcher SCRIPT),
+//     consumes the SAME hunger__feed from the same bus.
 //
-// `Hunger` is a real engine component (components/hunger.zig) — C# has no
-// declare mode, so every call addresses it by name over the contract at
+// `Hunger` is an engine component DECLARED in C# (components/Hunger.cs,
+// labelle-declare-csharp); every call addresses it by name over the contract at
 // runtime. Timeline: scripts/Game.cs's header.
 
 using System.Globalization;

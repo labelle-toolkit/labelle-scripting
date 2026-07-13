@@ -22,7 +22,7 @@ Every language binds the engine's **Script Runtime Contract** (`labelle-engine/c
 | `rust` (staticlib) | ✅ done (labelle-engine#741) — first native-compiled sub-module: game `scripts/` sources (module root `scripts/mod.rs`) cargo-built into the shipped crate (`native/`), `Script` trait + safe wrappers, panics caught at every FFI entry, tested against the same mock host AND end-to-end (`examples/rust-game` through the assembler's native-language splice, labelle-assembler ≥ v0.84.0; the `scripts/` dir since v0.86.0) |
 | `crystal` (localized object) | ✅ done (labelle-engine#741) — second native-compiled sub-module on rust's skeleton: game `scripts/` sources (module root `scripts/game.cr`) built by `crystal build --cross-compile` + a main-localization pass into a linkable object, `Labelle::Script` class + safe wrappers, every raise rescued at every FFI entry, GC collections enabled (host-thread runtime boot), tested against the same mock host AND end-to-end (`examples/crystal-game` through the assembler's native-language splice, labelle-assembler ≥ v0.85.0; the `scripts/` dir since v0.86.0) |
 | `go` (c-archive) | planned |
-| `csharp` (CoreCLR) | ✅ done (labelle-engine#743) — the epic's final sub-module: game `scripts/*.cs` compiled by `dotnet publish` into a managed assembly (`native-csharp/`), loaded at runtime through the .NET hosting API (hostfxr) with `[UnmanagedCallersOnly]` entries, contract bound via `[LibraryImport]` against the host process; both deployment modes (framework-dependent / self-contained) documented below; desktop-first (mobile AOT out of v1). Tested against the same mock host end to end (`examples/csharp-game`; the assembler csharp splice is a follow-up) |
+| `csharp` (CoreCLR) | ✅ done (labelle-engine#743) — the epic's final sub-module: game `scripts/*.cs` compiled by `dotnet publish` into a managed assembly (`native-csharp/`), loaded at runtime through the .NET hosting API (hostfxr) with `[UnmanagedCallersOnly]` entries, contract bound via `[LibraryImport]` against the host process; both deployment modes (framework-dependent / self-contained) documented below; desktop-first (mobile AOT out of v1). Components + events declared in C# (labelle-declare-csharp, #27); CI-proven end to end through the real assembler (`examples/csharp-game`: generate → declare → `dotnet publish` → run) |
 
 ## Using the lua sub-module
 
@@ -737,6 +737,46 @@ entry (a throw out of an `[UnmanagedCallersOnly]` method into foreign
 frames is UB): Init throw → logged + evicted; Update/OnEvent throw →
 logged every time, script stays; `Register` throw → all-or-nothing
 rollback — the same isolation story as rust's panics / crystal's raises.
+
+**Declaring components and events in C#** (labelle-scripting#27). Author a
+component or event as a `record` carrying `[LabelleComponent]` or
+`[LabelleEvent]` (global namespace — no `using`), whose public instance fields
+are the schema and whose field initializers are the declared defaults:
+
+```csharp
+[LabelleComponent]
+record Hunger
+{
+    public double level = 1.0;   // double|float → f32; formats at f64 precision
+    public bool starving = false;
+}
+
+[LabelleComponent(Persist.Transient)]
+record Dead;
+
+[LabelleEvent]
+record hunger__feed
+{
+    public ulong entity = 0;     // ulong → u64 (the entity-id type)
+    public double amount = 0.5;
+}
+```
+
+Type map: `double`|`float`→f32, `int`→i32, `bool`, `string`→str, `Vec2`→vec2,
+`ulong`→u64. At `labelle generate` the assembler runs `labelle-declare-csharp`
+(a `dotnet` compile-and-run probe) over the game's `components/*.cs` +
+`events/*.cs`, extracts the schema, and codegens the game's component registry /
+event union — exactly as a `components/*.zig` would, and byte-identical to
+lua/ruby/rust/crystal/ts. Drop `components/*.zig`: a C# game reaches the same
+zero-authored-`.zig` purity (see `examples/csharp-game`, CI-proven).
+
+**A first-class Visual Studio project** (labelle-assembler#617). `labelle
+generate` also emits a dev `.csproj` at the game root so you can open the game
+in Visual Studio / Rider / VS Code with full IntelliSense and build-in-place:
+it globs your `scripts/` + `components/` + `events/` and references the shipped
+`Labelle` surface, so `Labelle.*`, `Script`, `[LabelleComponent]`, `Vec2`, …
+all resolve as you edit the files you ship. It is a dev aid, regenerated each
+generate — the real build stays the `.language_builds` `dotnet publish` above.
 
 **Deployment modes** (both documented, both ride the same hosting call —
 they differ only in where hostfxr and the shared framework live):
