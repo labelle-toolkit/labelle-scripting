@@ -9,22 +9,21 @@
 // embedded CoreCLR runtime, and scripts are compiled types.
 //
 // The game mirrors examples/rust-game and examples/crystal-game's hunger
-// sawtooth so the cross-language story is visible token-for-token — but this
-// example is FULLY C#: everything except the config (project.labelle), the
-// scene (scenes/main.jsonc) and the component schemas (components/*.zig — see
-// below) lives in scripts/*.cs. Where rust/crystal use a native Zig hook
-// (hooks/feed_watcher.zig) as the second event subscriber, this game uses a
-// pure-C# watcher SCRIPT (scripts/FeedWatcher.cs) — the C# mirror of
-// ruby-game's scripts/feed_watcher.rb.
+// sawtooth so the cross-language story is visible token-for-token — and this
+// example is FULLY C#: everything except the config (project.labelle) and the
+// scene (scenes/main.jsonc) lives in C#. Where rust/crystal use a native Zig
+// hook (hooks/feed_watcher.zig) as the second event subscriber, this game uses
+// a pure-C# watcher SCRIPT (scripts/FeedWatcher.cs) — the C# mirror of
+// ruby-game's scripts/feed_watcher.rb — so the authored tree is ZERO .zig.
 //
-// Components stay Zig (components/hunger.zig + worker.zig): the Script Runtime
-// Contract has no component-registration call and there is no declare-csharp
-// extractor yet (only lua's tools/declare and tools/declare-ruby exist), so
-// C# cannot author a component SCHEMA — that is the single remaining non-C#
-// piece and a declare-csharp follow-up. C# still reads/writes those components
-// by name over the contract at runtime. (Same story for the custom event: its
-// only Zig artifact was the typed struct the removed Zig hook consumed;
-// the C# scripts use "hunger__feed" purely by name + JSON.)
+// The components (components/Hunger.cs + Worker.cs) and the custom event
+// (events/hunger__feed.cs) are DECLARED in C# (labelle-scripting#27,
+// labelle-declare-csharp): the `[LabelleComponent]` / `[LabelleEvent]` records'
+// public fields are the schema the assembler extracts at generate and codegens
+// into the game's component registry / event union — the C# twin of
+// ruby-game's components/hunger.rb and crystal's components/hunger.cr. The C#
+// scripts also read/write those components (and emit the event) by name over
+// the contract at runtime.
 //
 // Registration order is hook order: the spawner registers FIRST (its Init
 // seeds the world before the system's, its Update runs first each tick),

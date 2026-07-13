@@ -1243,6 +1243,256 @@ jobs:
           fi
           echo "PASS: the 100% crystal game (zero .zig) generated, built and ran green — hooks/ is proven OPTIONAL (14 tokens, ZIG_FEED_SEEN_0.5 alone gone)"
 
+  # C# example game (labelle-engine#743) — the CoreCLR-hosted counterpart of
+  # rust-example / crystal-example, living in THIS repo so every push runs a
+  # real C# game through the real assembler against the real engine:
+  # examples/csharp-game pins its scripting plugin `local:../..` (the CURRENT
+  # checkout), so native-csharp/ (Labelle.cs, Glue.cs, Declare.cs), the glue and
+  # src/csharp/vm.zig under review are exactly what dotnet compiles and the
+  # generated game loads through hostfxr. C#'s permanent regression net — and
+  # the end-to-end proof that generate → stage → declare (labelle-declare-csharp)
+  # → dotnet publish → run works, the thing #743 deferred. This is a FULLY-C#
+  # game: components + event declared in C# (#27), scripts in C#, the second
+  # event subscriber a pure-C# watcher SCRIPT (not a native Zig hook) — so the
+  # authored tree is ZERO .zig, no optional escape hatch to delete (a stronger
+  # purity story than rust/crystal, which keep hooks/feed_watcher.zig).
+  csharp-example:
+    runs-on: ubuntu-latest
+    # Cold toolkit fetch + engine compile + one dotnet publish normally lands
+    # well under 15; bound a wedged runner far below GitHub's 6h default.
+    timeout-minutes: 30
+    env:
+      # The pinned labelle-assembler release the example generates with — a
+      # BINARY release (tag → release.yml assets). v0.90.0 is the floor: it
+      # carries the csharp dev-`.csproj` emitter (labelle-assembler#617) this
+      # job asserts. The csharp `.native` `.languages` row consume itself is
+      # generic and predates it (v0.88.0's spliceFromRow + the link-less
+      # `.language_builds` step), but pinning the release that also emits the
+      # dev project keeps the example demonstrating the full VS-project
+      # workflow. Bump deliberately, never float.
+      ASSEMBLER_VERSION: v0.90.0
+    steps:
+      # Checkout into a subdir so the example's sibling pins resolve:
+      # examples/csharp-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
+      - uses: actions/checkout@v4
+        with:
+          path: labelle-scripting
+          persist-credentials: false
+
+      # Sibling checkout for the null backend — same reason and pattern as the
+      # rust/crystal jobs (the `script_contract.bind` touchpoint is on
+      # labelle-null main, unreleased).
+      - name: Checkout labelle-null (bind touchpoint is unreleased)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The .NET SDK must exist before GENERATE, not just the build: the
+      # declare phase runs labelle-declare-csharp (a `dotnet build` probe) at
+      # generate, and the `.language_builds` step is a `dotnet publish`. >= 7
+      # for the [LibraryImport] source generator (Glue.cs). It also provides the
+      # runtime hostfxr loads at run time (framework-dependent publish).
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "7.0.x"
+
+      - name: Download the pinned labelle-assembler release binary
+        run: |
+          curl -fL -o labelle-assembler \
+            "https://github.com/labelle-toolkit/labelle-assembler/releases/download/${ASSEMBLER_VERSION}/labelle-assembler-linux-x86_64"
+          chmod +x labelle-assembler
+
+      # Mirrors rust/crystal-example's flow: generate → declare + codegen greps
+      # → build (fingerprint dance; `zig build` runs the plugin's dotnet-publish
+      # step) → bounded headless run → ordered-transcript diff. The CoreCLR
+      # deltas are the point. Frame-by-frame timeline: scripts/Game.cs's header.
+      - name: Generate + build + run the C# example game
+        run: |
+          set -o pipefail
+
+          # Fresh HOME: the assembler's package cache lives under ~/.labelle —
+          # never leak a runner's real one. .NET's NuGet/global caches land
+          # harmlessly inside it; DOTNET_ROOT (set by setup-dotnet) drives
+          # hostfxr's runtime resolution, not HOME.
+          export HOME="$RUNNER_TEMP/labelle-home"
+          mkdir -p "$HOME"
+
+          cd labelle-scripting/examples/csharp-game
+          ASM=$GITHUB_WORKSPACE/labelle-assembler
+
+          $ASM install --project-root .
+          $ASM generate --project-root . 2>&1 | tee generate.log
+          if grep -q 'generate failed' generate.log; then
+            echo "E: generate reported failure"
+            exit 1
+          fi
+          # C# DECLARES now (#27 / labelle-declare-csharp): NO declare-phase
+          # skip note may appear — its presence means the plugin.labelle csharp
+          # `.languages` row or the in-package tool probe regressed.
+          if grep -q 'script-declared components' generate.log; then
+            echo "E: declare-phase skip note printed — C# declares since #27"
+            exit 1
+          fi
+          # THE declare assertions: components/Hunger.cs's schema landed as a
+          # real generated registry component — the declared default renders `1`
+          # (`{d}` of f32 1.0), DELIBERATELY not the 0.875 the spawner WRITES, so
+          # the transcript's decay chain proves the C# write traveled, not the
+          # default — components/Worker.cs's zero-field tag beside it, and
+          # events/hunger__feed.cs's schema as the generated event struct (fields
+          # sorted by name, u64 id default 0). Extracted by labelle-declare-csharp
+          # at generate: NOTHING embeds (registerScript-absent below), only the
+          # SCHEMA travels.
+          grep -qF 'pub const Hunger' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'level: f32 = 1,' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'starving: bool = false,' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const Worker' .labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const HungerFeed' .labelle/null_desktop/scripting_events.zig
+          grep -qF 'amount: f32 = 0.5,' .labelle/null_desktop/scripting_events.zig
+          grep -qF 'entity: u64 = 0,' .labelle/null_desktop/scripting_events.zig
+          grep -qF '.Hunger = @import("scripting_components.zig").Hunger,' .labelle/null_desktop/main.zig
+          grep -qF '.Worker = @import("scripting_components.zig").Worker,' .labelle/null_desktop/main.zig
+          grep -qF 'hunger__feed: @import("scripting_events.zig").HungerFeed,' .labelle/null_desktop/main.zig
+          # Purity inventory (labelle-engine#772's mandate): this example is
+          # FULLY C# — its second event subscriber is a C# watcher SCRIPT, not a
+          # native Zig hook, so the authored tree has ZERO .zig files (stronger
+          # than rust/crystal's one optional escape hatch). If any .zig sneaks in
+          # as load-bearing, this fails and the purity story is void.
+          ZIGS=$(git ls-files -- '*.zig')
+          if [ -n "$ZIGS" ]; then
+            echo "E: examples/csharp-game is meant to be 100% C# (zero .zig) — found:"
+            printf '%s\n' "$ZIGS"
+            exit 1
+          fi
+          # Migrated to scripts/ — the legacy-dir grace note must not appear.
+          if grep -q 'keeps working for one release of grace' generate.log; then
+            echo "E: legacy script-dir deprecation note printed for a migrated example"
+            exit 1
+          fi
+
+          M=.labelle/null_desktop/main.zig
+          B=.labelle/null_desktop/build.zig
+          # THE native-family assertion: C# arrives as a compiled managed
+          # assembly — nothing embeds, nothing registers script SOURCE. A
+          # registerScript line means the splice fell back to the embed family.
+          if grep -q 'registerScript' $M; then
+            echo "E: registerScript emitted for a native-compiled language"
+            exit 1
+          fi
+          # Splice (family-shared): the flag, the bind touchpoint (proves the
+          # sibling labelle-null checkout was staged), the Controller tick, the
+          # event tap.
+          grep -qF 'const scripting_enabled = true;' $M
+          grep -qF 'engine.script_contract.bind(&g);' $M
+          grep -qF 'scripting.Controller.tick(&g, scaled_dt);' $M
+          grep -qF 'engine.script_contract.drainEvents(&g);' $M
+          # Build wiring: the plugin's -Dlanguage option selects the csharp
+          # dispatcher (src/csharp/vm.zig — hostfxr host, no VM compiled in).
+          grep -qF '.language = .csharp' $B
+          # Build wiring (.language_builds → #586 steps): the emitted
+          # dotnet-publish command. Unlike rust/crystal there is NO addObjectFile
+          # — a CoreCLR host LOADS the managed assembly at runtime; the step is
+          # link-less (`.link = .none`), so it only runs and the game build
+          # depends on it.
+          grep -qF 'b.addSystemCommand(&.{ "dotnet", "publish"' $B
+          if grep -q 'addObjectFile(plugin_scripting_build_artifact' $B; then
+            echo "E: a link artifact was wired for a CoreCLR-hosted (runtime-loaded) language"
+            exit 1
+          fi
+          # The dev `.csproj` for IDE support (labelle-assembler#617): emitted at
+          # the game root, globbing the in-place convention dirs + the Labelle
+          # surface. A first-class VS/Rider/VS Code project (not the build path).
+          test -f csharp_game.csproj
+          grep -qF '<Compile Include="scripts/**/*.cs" />' csharp_game.csproj
+          grep -qF '<Compile Include="components/**/*.cs" />' csharp_game.csproj
+          grep -qF '<Compile Include="events/**/*.cs" />' csharp_game.csproj
+          grep -qF 'Labelle/Declare.cs' csharp_game.csproj
+          # Staging is a LIVE LINK, not a copy (deps shared across targets): the
+          # game's scripts/ IS the staged package's game module (module root
+          # scripts/Game.cs), so edits flow into the next build without a
+          # re-generate.
+          STAGED=.labelle/deps/labelle-scripting/native-csharp/src/game
+          test -L "$STAGED"
+          cmp scripts/Game.cs "$STAGED/Game.cs"
+
+          cd .labelle/null_desktop
+
+          # labelle-cli-equivalent fixFingerprint dance. `zig build` also runs
+          # the plugin's dotnet-publish step (the managed assembly beside the
+          # binary) as a build dependency.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # Point the CoreCLR host at the managed assembly. The plugin's
+          # `.language_builds` `dotnet publish` step emits
+          # labelle_csharp_scripts.dll (+ runtimeconfig.json) into its
+          # plugin-build cache ({cache}), not beside the game binary — so, like
+          # the csharp suite (which sets LABELLE_CS_ASSEMBLY_DIR), locate the
+          # published DLL and point src/csharp/vm.zig's documented override at
+          # its dir. (A shipped game keeps the DLL beside its binary or ships
+          # self-contained — the README's deployment section; that packaging
+          # copy is out of this run's scope, which proves the RUNTIME.)
+          DLL=$(find "$PWD" -name labelle_csharp_scripts.dll -print -quit)
+          if [ -z "$DLL" ]; then
+            echo "E: dotnet publish produced no labelle_csharp_scripts.dll"
+            find "$PWD" -name '*.dll' | head
+            exit 1
+          fi
+          export LABELLE_CS_ASSEMBLY_DIR="$(dirname "$DLL")"
+          echo "csharp assembly dir: $LABELLE_CS_ASSEMBLY_DIR"
+
+          # Headless bounded run: no window, no GL — the binary runs to
+          # completion (rc=0) or crashes. hostfxr loads the assembly and
+          # resolves the labelle_* contract against the game binary's exports.
+          LABELLE_NULL_FRAMES=5 ./zig-out/bin/csharp_game > run.log 2>&1
+
+          # Pin the exact ordered milestone sequence — token-for-token the rust /
+          # crystal transcript's shape (CS_ for CSharp), so the cross-language
+          # story is diffable by eye. Every CS_LEVEL_* value is the level the
+          # script wrote through the real ECS that tick; CS_FED_LEVEL_0.875 is
+          # re-READ after the feed handler's write (the emitted id + f32 0.5
+          # amount round-tripped the engine bus bit-exact); CS_WATCHER_SAW_0.5 is
+          # the pure-C# watcher SCRIPT consuming the same emit on the NEXT tick's
+          # inbox (a drain-boundary later than a native hook would — the
+          # cross-layer latency is part of the pin). Timeline: scripts/Game.cs.
+          grep -oE 'CS_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          CS_INIT
+          CS_CTRL_READY
+          CS_LEVEL_0.625
+          CS_FEED_SENT
+          CS_LEVEL_0.375
+          CS_ENGINE_TICK_SEEN
+          CS_FED_LEVEL_0.875
+          CS_WATCHER_SAW_0.5
+          CS_LEVEL_0.625
+          CS_LEVEL_0.375
+          CS_LEVEL_0.125
+          CS_STARVING
+          CS_CTRL_DONE
+          CS_DEINIT
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: csharp-example milestone sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: C# drove the real engine — components + event DECLARED in C# (labelle-declare-csharp), scripts compiled by the plugin's dotnet-publish step and loaded through hostfxr, cross-script hunger__feed (two C# subscribers off one bus) + engine__tick over 5 headless frames, ZERO authored .zig, against this repo's HEAD"
+
   # TypeScript example game (labelle-engine#745) — the TYPED counterpart of
   # ruby-example, living in THIS repo so every push runs a real typescript
   # game through the real assembler against the real engine:
