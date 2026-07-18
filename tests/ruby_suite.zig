@@ -1229,3 +1229,32 @@ test "bulk v1.3: batch_set raises when the entity set changed since batch_get" {
     try expect(mock.logsContain("stale refused:"));
     try expect(mock.logsContain("entity set changed"));
 }
+
+test "bulk v1.3: an unrepresentable packed value falls back to JSON end-to-end" {
+    fresh();
+    // seed is a u64 in the mock's Stats schema; a Ruby -1 cannot
+    // represent itself there, so the host REFUSES the packed set (-1,
+    // engine round-1 parity: refuse, never clamp) and the binding falls
+    // back to the JSON path — which stores the value faithfully.
+    scripting.registerScript("packed_range",
+        \\Stats = Labelle::Component.ref("Stats", :power, :score, :alive, :seed)
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  s = Stats.new
+        \\  s.power = 1.5
+        \\  s.score = 5
+        \\  s.alive = true
+        \\  s.seed = -1
+        \\  raise "set failed" unless e.set(s)
+        \\  Labelle.log("range done")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("range done"));
+    // SORTED keys = the JSON encoder wrote it (the packed set stores
+    // schema order: power,score,alive,seed) — proof the refusal engaged
+    // the fallback, and the out-of-range value survived untouched.
+    try expectComponent(1, "Stats", "{\"alive\":true,\"power\":1.5,\"score\":5,\"seed\":-1}");
+}

@@ -411,6 +411,32 @@ fn defaultScalar(kind: PackedKind) ScalarVal {
     };
 }
 
+/// The engine host's packed-SET refusal semantics, mirrored (round-1
+/// panic-safety hardening): a tagged value the target field cannot
+/// represent — negative into u64, u64 past maxInt(i64) into i64, a
+/// non-finite or out-of-range float into either int kind — makes the
+/// whole set REFUSE (-1) so the binding falls back to JSON, which
+/// surfaces the value faithfully. Never clamp/zero on the SET path;
+/// the clamping scalarTo* helpers above serve only the GET/stream side
+/// (host-owned data).
+fn coerceForKind(kind: PackedKind, v: ScalarVal) ?ScalarVal {
+    switch (kind) {
+        .f32, .boolean => return v, // total: float accepts all, bool compares
+        .i64 => switch (v) {
+            .u => |x| return if (x > std.math.maxInt(i64)) null else v,
+            .f => |x| return if (!std.math.isFinite(x) or
+                x < -9223372036854775808.0 or x >= 9223372036854775808.0) null else v,
+            else => return v,
+        },
+        .u64 => switch (v) {
+            .i => |x| return if (x < 0) null else v,
+            .f => |x| return if (!std.math.isFinite(x) or
+                x < 0 or x >= 18446744073709551616.0) null else v,
+            else => return v,
+        },
+    }
+}
+
 export fn labelle_component_get_packed(
     id: u64,
     name: [*]const u8,
@@ -525,7 +551,11 @@ export fn labelle_component_set_packed(
             else => return -1,
         }
         for (t.fields, 0..) |f, fi| {
-            if (std.mem.eql(u8, f.name, fname)) vals[fi] = v;
+            if (std.mem.eql(u8, f.name, fname)) {
+                // Engine parity: an unrepresentable value refuses the
+                // WHOLE set — the binding then falls back to JSON.
+                vals[fi] = coerceForKind(f.kind, v) orelse return -1;
+            }
         }
     }
     // Serialize in schema order and store through the shared path.
