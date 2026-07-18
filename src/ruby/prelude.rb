@@ -211,12 +211,22 @@ module Labelle
   # `batch_get(names, arr)` fills `arr` with every matching entity's scalar
   # component data as a flat f32 array — [c0_f0, c0_f1, ..., c1_f0, ...] per
   # entity, components in `names` order, fields in declaration order — and
-  # returns the entity COUNT. ONE FFI crossing for the whole query instead
-  # of a get per entity. Reuse the SAME `arr` across ticks (it grows once).
+  # returns the entity COUNT (`arr` is trimmed to exactly count*stride).
+  # ONE FFI crossing for the whole query instead of a get per entity. Reuse
+  # the SAME `arr` across ticks (it grows once, keeps its capacity).
   # `batch_set(names, arr, n)` writes the mutated `arr` back in ONE crossing
   # (the host re-queries the same entities, same order). The caller owns the
   # positional layout: the stride (fields-per-entity) must match how the
   # host walks the named components.
+  #
+  # Refusals are LOUD (contract v1.3):
+  #   - a named component with an INT-typed field raises ArgumentError —
+  #     i64/u64 cannot ride the f32 stream without silent corruption; keep
+  #     such components on per-entity get/set (their packed codec is
+  #     lossless).
+  #   - do NOT spawn or destroy entities between a paired batch_get and
+  #     batch_set: batch_set raises RuntimeError when the entity set no
+  #     longer matches the buffer (re-run batch_get and recompute).
   def self.batch_get(names, arr)
     raw_batch_get(json_encode(names), arr)
   end

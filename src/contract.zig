@@ -28,6 +28,8 @@
 //!   - main-thread only, valid during the plugin's tick;
 //!   - before the host binds its game every call is a safe no-op.
 
+const std = @import("std");
+
 /// The contract revision this plugin was written against. `Controller.setup`
 /// compares it with `labelle_contract_version()` and refuses to start the VM
 /// on mismatch — a version skew must fail loudly at boot, not as corrupted
@@ -81,8 +83,20 @@ pub extern fn labelle_component_get(
     out_cap: usize,
 ) usize;
 
-/// PACKED (binary) fast-path twin of `labelle_component_get` (additive,
-/// probe-by-symbol). Serializes the component into `out` as a
+// ── Bulk component access (contract v1.3, labelle-scripting#41) ──────────
+//
+// Additive per the contract's minor-revision convention: the four
+// exports below are marked "since v1.3" in labelle_script.h and exist
+// only on engine hosts ≥ 2.6.0. Compatibility is the SAME model as the
+// rest of this file: the plugin links into the host binary, so an older
+// engine fails the game link (undefined symbol) at BUILD time — pair
+// this plugin version with engine ≥ 2.6.0. There is no runtime probe in
+// this linking model; the JSON paths remain the semantic fallback the
+// bindings use when the HOST refuses (0xFF sentinel / -1), not when the
+// symbol is missing.
+
+/// PACKED (binary) fast-path twin of `labelle_component_get` (since
+/// v1.3). Serializes the component into `out` as a
 /// self-describing little-endian record instead of JSON text, so a
 /// scalar-only component refills a view with NO JSON parse. Same sizing
 /// contract as the JSON get (required-size return, all-or-nothing write,
@@ -97,11 +111,11 @@ pub extern fn labelle_component_get_packed(
     out_cap: usize,
 ) usize;
 
-/// PACKED (binary) fast-path twin of `labelle_component_set`. Applies a
-/// packed record (the `_get_packed` format) to the named component,
-/// coercing each field into its real scalar type. REPLACE semantics.
-/// 0 = ok; -1 = unknown/dead/refused (non-scalar target — fall back to
-/// `labelle_component_set`) / malformed / not bound.
+/// PACKED (binary) fast-path twin of `labelle_component_set` (since
+/// v1.3). Applies a packed record (the `_get_packed` format) to the named
+/// component, coercing each field into its real scalar type. REPLACE
+/// semantics. 0 = ok; -1 = unknown/dead/refused (non-scalar target — fall
+/// back to `labelle_component_set`) / malformed / not bound.
 pub extern fn labelle_component_set_packed(
     id: u64,
     name: [*]const u8,
@@ -110,17 +124,29 @@ pub extern fn labelle_component_set_packed(
     buf_len: usize,
 ) i32;
 
-/// BATCHED (binary) component read — the whole-query fast path (spike:
-/// collapse the per-entity FFI crossings into ONE call per tick). Resolves
-/// the SAME entity set as `labelle_query` (entities carrying ALL named
-/// components), then writes, for each entity IN QUERY ORDER, each named
-/// component's scalar fields (IN THE GIVEN NAME ORDER, each component's
-/// fields in struct-declaration order) as raw little-endian f32 into `out`.
-/// Wire layout: `[u32 entity_count][f32 stream]` (count header first, then
-/// count*stride floats). Non-scalar fields are skipped; int/bool fields
-/// coerce to f32. Same snprintf-style sizing as `labelle_query`: the return
-/// is the bytes the COMPLETE buffer requires (grow + retry on required >
-/// cap); 0 = malformed names / not bound. A NULL/cap-0 `out` sizes only.
+/// `labelle_component_batch_get`'s int-field refusal sentinel — the rc
+/// convention's -2 carried in its usize return (the header's
+/// LABELLE_BATCH_INT_REFUSED, C's `(size_t)-2`). Distinct from 0 =
+/// malformed/not-bound and from any required-size return. Check it
+/// BEFORE treating the return as a required size.
+pub const BATCH_INT_REFUSED: usize = std.math.maxInt(usize) - 1;
+
+/// BATCHED (binary) component read — the whole-query fast path (since
+/// v1.3: collapse the per-entity FFI crossings into ONE call per tick).
+/// Resolves the SAME entity set as `labelle_query` (entities carrying ALL
+/// named components), then writes, for each entity IN QUERY ORDER, each
+/// named component's scalar fields (IN THE GIVEN NAME ORDER, each
+/// component's fields in struct-declaration order) as raw little-endian
+/// f32 into `out`. Wire layout: `[u32 entity_count][f32 stream]` (count
+/// header first, then count*stride floats). Non-scalar fields are skipped
+/// identically on both directions; f64 narrows, bool rides as 0/1.
+/// INT-TYPED fields are REFUSED outright — `BATCH_INT_REFUSED` when any
+/// named component carries one (i64/u64 would silently corrupt through
+/// f32's 24-bit mantissa; keep such components on the per-entity paths —
+/// the packed codec carries ints losslessly). Same snprintf-style sizing
+/// as `labelle_query`: the return is the bytes the COMPLETE buffer
+/// requires (grow + retry on required > cap); 0 = malformed names / not
+/// bound. A NULL/cap-0 `out` sizes only.
 pub extern fn labelle_component_batch_get(
     names_json: [*]const u8,
     names_json_len: usize,
@@ -128,12 +154,22 @@ pub extern fn labelle_component_batch_get(
     out_cap: usize,
 ) usize;
 
-/// BATCHED (binary) component write — twin of `labelle_component_batch_get`.
-/// RE-QUERIES the same entity set in the same order and reads the f32 stream
-/// positionally (`buf` is the pure f32 stream — NO count header; the host's
-/// re-query drives entity count), coercing each f32 back into its field's
-/// real scalar type (REPLACE semantics). 0 = ok; -1 = malformed / too-short
-/// buffer / not bound.
+/// BATCHED (binary) component write — twin of `labelle_component_batch_get`
+/// (since v1.3). RE-QUERIES the same entity set in the same order and reads
+/// the f32 stream positionally (`buf` is the pure f32 stream — NO count
+/// header; the host's re-query drives entity count), converting each f32
+/// back into its field's real scalar type (REPLACE semantics).
+///
+/// POSITIONAL-COUPLING GUARD: `buf_len` must EXACTLY match the re-queried
+/// set's stream size (count × stride × 4); a mismatch means the entity set
+/// changed since the paired `_batch_get` (spawn/destroy between the two
+/// calls — forbidden) and the write is refused with -1. Entities walked
+/// before the mismatch was detected keep their writes: treat -1 as
+/// "re-get and recompute".
+///
+/// 0 = ok; -1 = malformed names / entity-count mismatch / not bound;
+/// -2 = int-typed field in a named component (BATCH_INT_REFUSED's i32
+/// twin).
 pub extern fn labelle_component_batch_set(
     names_json: [*]const u8,
     names_json_len: usize,

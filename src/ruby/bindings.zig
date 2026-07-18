@@ -611,15 +611,53 @@ fn rawQuery(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
 
 // ── batched query codec (the whole-query fast path) ──────────────────────
 
+/// Raise with a runtime-formatted message — `raiseError`'s formatted twin
+/// (that one is comptime-message only). An over-long formatted message
+/// degrades to a generic refusal rather than failing to raise.
+fn raiseFmt(
+    mrb: ?*c.State,
+    comptime class: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) noreturn {
+    var buf: [512]u8 = undefined;
+    const msg: [:0]const u8 = std.fmt.bufPrintZ(&buf, fmt, args) catch
+        "labelle: batch refused (message too long to format)";
+    const cls_sym = c.mrb_intern(mrb, class.ptr, class.len);
+    c.mrb_raise(mrb, c.mrb_exc_get_id(mrb, cls_sym), msg.ptr);
+}
+
+/// The batch f32 stream cannot carry int-typed fields — i64/u64 silently
+/// corrupt past f32's 24-bit mantissa, so the host refuses the whole
+/// batch (contract v1.3: `(size_t)-2` from batch_get, -2 from batch_set)
+/// and the binding surfaces it LOUDLY. Never a silent JSON fallback:
+/// coerced-int corruption is exactly what the refusal exists to prevent.
+fn raiseBatchIntRefused(mrb: ?*c.State, names_json: []const u8) noreturn {
+    raiseFmt(
+        mrb,
+        "ArgumentError",
+        "labelle: batch refused for {s}: a named component has an int-typed " ++
+            "field (i64/u64 cannot ride the f32 batch stream) — keep that " ++
+            "component on per-entity get/set (the packed codec carries ints " ++
+            "losslessly)",
+        .{names_json},
+    );
+}
+
 /// `raw_batch_get(names_json, out_array)` — ONE contract call fills
 /// `out_array` with every matching entity's scalar component data as a flat
 /// f32 stream, returning the entity COUNT (Integer). The host writes
 /// `[u32 count][f32 stream]` into the io scratch (grow-and-retry on the
 /// required-size return, like rawQuery); we read the count header, then
 /// decode the (n-4)/4 floats straight into the reused Array via mrb_ary_set
-/// (elements 0..M-1, growing it once then reusing across ticks). Floats
-/// cross as immediates — the only per-tick allocation is the Array's own
-/// backing growth, amortized to zero once warm.
+/// (elements 0..M-1, growing it once then reusing across ticks), and TRIM
+/// the Array to exactly that float count (mrb_ary_resize keeps capacity, so
+/// reuse still costs nothing) — the trailing floats of a bigger past tick
+/// would otherwise ride into `raw_batch_set` and trip the host's exact-size
+/// coupling guard. Floats cross as immediates — the only per-tick
+/// allocation is the Array's own backing growth, amortized to zero once
+/// warm. An int-carrying named component RAISES ArgumentError (host
+/// refusal `(size_t)-2` — see raiseBatchIntRefused).
 fn rawBatchGet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
     _ = self;
     var np: [*]const u8 = undefined;
@@ -630,6 +668,9 @@ fn rawBatchGet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
 
     var buf = io_scratch.ensure(mrb, SCRATCH_INITIAL_CAP);
     var n = contract.labelle_component_batch_get(names.ptr, names.len, buf, io_scratch.cap);
+    // The refusal sentinel must be checked BEFORE the grow-retry: it is
+    // (size_t)-2, which would otherwise read as a required size.
+    if (n == contract.BATCH_INT_REFUSED) raiseBatchIntRefused(mrb, names);
     if (n == 0) return c.Value.int(0); // not bound / malformed
     if (n > io_scratch.cap) {
         buf = io_scratch.ensure(mrb, n);
@@ -644,16 +685,24 @@ fn rawBatchGet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
         const bits = std.mem.readInt(u32, buf[4 + i * 4 ..][0..4], .little);
         c.mrb_ary_set(mrb, arr, @intCast(i), c.Value.float(@as(f32, @bitCast(bits))));
     }
+    _ = c.mrb_ary_resize(mrb, arr, @intCast(nfloats));
     return c.Value.int(@intCast(count));
 }
 
 /// `raw_batch_set(names_json, array, count)` — ONE contract call writes the
 /// whole swarm back. Packs every element of `array` (`count*stride` floats —
-/// the array is exactly what batch_get filled) into the io scratch as raw
-/// f32, then hands the pure stream (no header) to the host, which re-queries
-/// the same entities and applies them positionally. Returns the contract rc
-/// (0 = ok). `count` is the caller's entity count; the array length is the
-/// authoritative float count and is what we pack.
+/// the array is exactly what batch_get filled and trimmed) into the io
+/// scratch as raw f32, then hands the pure stream (no header) to the host,
+/// which re-queries the same entities and applies them positionally.
+/// Returns 0 on success. `count` is the caller's entity count (API
+/// symmetry); the array length is the authoritative float count and is what
+/// we pack. Host refusals RAISE — both mean the write would corrupt data,
+/// and both must be loud:
+///   -2  int-typed field in a named component → ArgumentError;
+///   -1  the entity set changed between batch_get and batch_set (the
+///       exact-size positional-coupling guard; also malformed names / host
+///       not bound) → RuntimeError. The floats were computed against a
+///       STALE entity set — re-run batch_get and recompute.
 fn rawBatchSet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
     _ = self;
     var np: [*]const u8 = undefined;
@@ -674,7 +723,17 @@ fn rawBatchSet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
         std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f), .little);
     }
     const rc = contract.labelle_component_batch_set(names.ptr, names.len, buf, bytes);
-    return c.Value.int(rc);
+    if (rc == -2) raiseBatchIntRefused(mrb, names);
+    if (rc != 0) raiseFmt(
+        mrb,
+        "RuntimeError",
+        "labelle: batch_set refused for {s}: the entity set changed between " ++
+            "batch_get and batch_set (spawn/destroy between the paired calls " ++
+            "— the buffer was computed against a stale set; re-run batch_get " ++
+            "and recompute), or the names were malformed / the host not bound",
+        .{names},
+    );
+    return c.Value.int(0);
 }
 
 // ── events ───────────────────────────────────────────────────────────────

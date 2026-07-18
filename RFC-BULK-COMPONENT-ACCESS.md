@@ -199,3 +199,42 @@ Prototyped end-to-end and measured in local worktrees:
 4. Port the binding changes to Lua / TypeScript (the contract is shared; only the per-language decode differs).
 5. Add mock-world exports + a contract-version bump with `@hasDecl` gates.
 6. Ship one batched example per language as a permanent perf regression net.
+
+## Decisions (stage 1)
+
+Recorded as landed in the stage-1 PRs (engine `feat/bulk-component-access` +
+this repo's `feat/bulk-component-access`, contract **v1.3**):
+
+- **f32-only batch stream + int-field refusal.** The batch stream stays raw
+  f32 (option (b) of the type-generality question), but instead of
+  documenting the coercion the host now **refuses** any named component
+  carrying an int-typed field — `LABELLE_BATCH_INT_REFUSED` (`(size_t)-2`)
+  from `batch_get`, `-2` from `batch_set` — because i64/u64 silently corrupt
+  past f32's 24-bit mantissa. f32/f64 and bool (0/1) fields ride the stream;
+  non-scalar fields are skipped identically in both directions. The Ruby
+  binding surfaces the refusal as a **raised ArgumentError naming the
+  component list** — loud, never a silent JSON fallback. Int-carrying
+  components keep the per-entity paths (the packed codec carries ints
+  losslessly).
+- **Positional coupling gets a cheap count guard.** `batch_set` re-resolves
+  the query and refuses `-1` unless `buf_len` EXACTLY matches the
+  re-queried set's stream size, catching any spawn/destroy between the
+  paired calls that changes the entity count (a same-count membership/order
+  change remains undetectable — the "no spawn/destroy between get and set"
+  rule stands). The Ruby binding raises RuntimeError on `-1` ("re-run
+  batch_get and recompute") and trims the reused Array to exactly
+  count×stride after each `batch_get` so a shrinking set never ships stale
+  trailing floats.
+- **Id column deferred pending measurement.** The safer embed-entity-ids
+  variant stays out until the cost of the id column is measured against the
+  305 ns/entity baseline.
+- **Block iterator (`Labelle.batch { |e| }`) deferred to stage 2**, per
+  language, along with the interpreted-block-tax measurement.
+- **Versioning:** additive minor revision per the contract's convention —
+  major stays 1, the four exports are marked "since v1.3" in
+  `labelle_script.h`. In this repo's link-into-the-host model there is no
+  runtime symbol probe: the Ruby binding references the new externs
+  unconditionally, so **ruby games require labelle-engine ≥ 2.6.0** (an
+  older host fails the game link at build time, loudly). The JSON paths
+  remain the semantic fallback for host refusals (0xFF / -1), not for
+  missing symbols.

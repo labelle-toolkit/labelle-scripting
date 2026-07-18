@@ -185,6 +185,11 @@ pub const c = struct {
     /// Set `ary[n] = val`, growing the array (filling gaps with nil) as
     /// needed — how the batched read refills a reused scratch Array in place.
     pub extern fn mrb_ary_set(mrb: ?*State, ary: Value, n: Int, val: Value) void;
+    /// Truncate/grow the array to exactly `len` elements (capacity is KEPT
+    /// on shrink) — how the batched read trims a reused Array whose previous
+    /// tick was bigger, so `raw_batch_set` never ships stale trailing floats
+    /// into the host's exact-size coupling guard.
+    pub extern fn mrb_ary_resize(mrb: ?*State, ary: Value, len: Int) Value;
     /// The symbol behind the mrb_ary_ref(mrb, ...) header macro — note it
     /// takes no mrb_state.
     pub extern fn mrb_ary_entry(ary: Value, offset: Int) Value;

@@ -1061,3 +1061,171 @@ test "console eval: mruby inspect hex-escapes invalid bytes (already JSON-safe)"
     try expect(r.ok);
     try expectEqualStrings("\"\\xff\"", r.text);
 }
+
+// ── bulk component access (contract v1.3, labelle-scripting#41) ─────
+
+test "bulk v1.3: packed codec rides the ref into:/set fast path, JSON stays the fallback" {
+    fresh();
+    // "Stats" is in the mock's packed schema table (one field per scalar
+    // kind); "Plain" is NOT — its set/get must degrade to the JSON path
+    // (set_packed -1 / get_packed 0xFF), invisibly to the script.
+    scripting.registerScript("packed_rt",
+        \\Stats = Labelle::Component.ref("Stats", :power, :score, :alive, :seed)
+        \\Plain = Labelle::Component.ref("Plain", :a)
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  s = Stats.new
+        \\  s.power = 1.5
+        \\  s.score = -42
+        \\  s.alive = true
+        \\  s.seed = 123
+        \\  raise "packed set refused" unless e.set(s)
+        \\  s2 = Stats.new
+        \\  raise "packed get_into failed" if e.get_into(Stats, s2).nil?
+        \\  Labelle.log("packed:#{s2.power}:#{s2.score}:#{s2.alive}:#{s2.seed}")
+        \\  p = Plain.new
+        \\  p.a = 2.5
+        \\  raise "plain set refused" unless e.set(p)
+        \\  p2 = Plain.new
+        \\  raise "plain get_into failed" if e.get_into(Plain, p2).nil?
+        \\  Labelle.log("plain:#{p2.a}")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Every field kind survived the binary round-trip (f32/i64/bool/u64).
+    try expect(mock.logsContain("packed:1.5:-42:true:123"));
+    // The stored JSON is in the mock's SCHEMA order (power,score,alive,
+    // seed) — the packed set wrote it. The JSON encoder would have
+    // sorted the keys (alive,power,score,seed), so key order proves the
+    // path taken.
+    try expectComponent(1, "Stats", "{\"power\":1.5,\"score\":-42,\"alive\":true,\"seed\":123}");
+    // The schema-less component still round-trips — through JSON.
+    try expect(mock.logsContain("plain:2.5"));
+    try expectComponent(1, "Plain", "{\"a\":2.5}");
+}
+
+test "bulk v1.3: batch_get/batch_set round-trip the whole query as one f32 stream" {
+    fresh();
+    scripting.registerScript("batch_rt",
+        \\NAMES = ["BatchPos", "BatchVel"].freeze
+        \\def init
+        \\  3.times do |i|
+        \\    e = Labelle::Entity.create
+        \\    e.set("BatchPos", x: i + 1, y: 0)
+        \\    e.set("BatchVel", vx: 10, vy: -10)
+        \\  end
+        \\  lone = Labelle::Entity.create
+        \\  lone.set("BatchPos", x: 7, y: 8)
+        \\  @buf = []
+        \\end
+        \\def update(_dt)
+        \\  count = Labelle.batch_get(NAMES, @buf)
+        \\  Labelle.log("batch count:#{count} floats:#{@buf.length}")
+        \\  i = 0
+        \\  while i < count
+        \\    b = i * 4
+        \\    @buf[b] += @buf[b + 2]     # x += vx
+        \\    @buf[b + 1] += @buf[b + 3] # y += vy
+        \\    i += 1
+        \\  end
+        \\  Labelle.batch_set(NAMES, @buf, count)
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+    // 3 matching entities (the lone BatchPos-only one is filtered out),
+    // stride 4 → the reused Array holds exactly 12 floats.
+    try expect(mock.logsContain("batch count:3 floats:12"));
+    try expectComponent(1, "BatchPos", "{\"x\":11,\"y\":-10}");
+    try expectComponent(2, "BatchPos", "{\"x\":12,\"y\":-10}");
+    try expectComponent(3, "BatchPos", "{\"x\":13,\"y\":-10}");
+    // A second tick reuses the same Array and advances again — the
+    // steady-state shape.
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "BatchPos", "{\"x\":21,\"y\":-20}");
+    try expectComponent(3, "BatchPos", "{\"x\":23,\"y\":-20}");
+    // The filtered-out entity was never rewritten (still the script's
+    // own sorted-key JSON set).
+    try expectComponent(4, "BatchPos", "{\"x\":7,\"y\":8}");
+}
+
+test "bulk v1.3: batch refuses int-carrying components loudly (never a silent coercion)" {
+    fresh();
+    // "Stats" carries i64/u64 fields → the host refuses the whole batch
+    // ((size_t)-2 from batch_get, -2 from batch_set) and the binding
+    // raises ArgumentError — int corruption through f32 must be loud,
+    // not a silent fallback.
+    scripting.registerScript("batch_refuse",
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  e.set("Stats", power: 1, score: 5, alive: true, seed: 9)
+        \\  e.set("BatchPos", x: 1, y: 2)
+        \\  begin
+        \\    Labelle.batch_get(["BatchPos", "Stats"], [])
+        \\    Labelle.log("get refusal missed")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("get refused: #{ex.message}")
+        \\  end
+        \\  begin
+        \\    Labelle.batch_set(["Stats"], [1.0, 2.0, 3.0, 4.0], 1)
+        \\    Labelle.log("set refusal missed")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("set refused: #{ex.message}")
+        \\  end
+        \\  Labelle.log("still alive")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("get refusal missed"));
+    try expect(!mock.logsContain("set refusal missed"));
+    // The raise names the refused component list and the reason.
+    try expect(mock.logsContain("get refused: labelle: batch refused for [\"BatchPos\",\"Stats\"]"));
+    try expect(mock.logsContain("int-typed"));
+    try expect(mock.logsContain("set refused: labelle: batch refused for [\"Stats\"]"));
+    // The raise is catchable — the script kept running.
+    try expect(mock.logsContain("still alive"));
+    // And nothing was written through the refused paths.
+    try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
+}
+
+test "bulk v1.3: batch_set raises when the entity set changed since batch_get" {
+    fresh();
+    scripting.registerScript("batch_stale",
+        \\NAMES = ["BatchPos", "BatchVel"].freeze
+        \\def init
+        \\  @es = []
+        \\  2.times do |i|
+        \\    e = Labelle::Entity.create
+        \\    e.set("BatchPos", x: i, y: 0)
+        \\    e.set("BatchVel", vx: 1, vy: 1)
+        \\    @es << e
+        \\  end
+        \\  @buf = []
+        \\end
+        \\def update(_dt)
+        \\  count = Labelle.batch_get(NAMES, @buf)
+        \\  @es[1].destroy # the forbidden move: destroy between get and set
+        \\  begin
+        \\    Labelle.batch_set(NAMES, @buf, count)
+        \\    Labelle.log("stale write accepted")
+        \\  rescue RuntimeError => ex
+        \\    Labelle.log("stale refused: #{ex.message}")
+        \\  end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+    // The exact-size positional-coupling guard fired and surfaced as a
+    // catchable RuntimeError telling the script to re-get.
+    try expect(!mock.logsContain("stale write accepted"));
+    try expect(mock.logsContain("stale refused:"));
+    try expect(mock.logsContain("entity set changed"));
+}
