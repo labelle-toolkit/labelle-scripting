@@ -227,6 +227,10 @@ module Labelle
   #   - do NOT spawn or destroy entities between a paired batch_get and
   #     batch_set: batch_set raises RuntimeError when the entity set no
   #     longer matches the buffer (re-run batch_get and recompute).
+  #   - on a game built against a pre-v1.3 engine (labelle-engine < 2.6.0)
+  #     BOTH calls raise RuntimeError ("host engine lacks batch support")
+  #     — there is no batch fallback; use per-entity get/set there. The
+  #     per-entity into:/set fast paths degrade to JSON silently instead.
   def self.batch_get(names, arr)
     raw_batch_get(json_encode(names), arr)
   end

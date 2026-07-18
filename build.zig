@@ -244,6 +244,19 @@ pub fn build(b: *std.Build) void {
     });
     configureLanguage(b, scripting_mod, language, lua_dep_opt, quickjs_dep_opt);
 
+    // The engine STUB behind src/contract.zig's `host_has_bulk_access`
+    // comptime probe (contract v1.3, #41). Generated games get the REAL
+    // labelle-engine module from the assembler's plugin wiring; this
+    // repo's own builds are engine-free, so a one-decl stand-in carrying
+    // the v1.3 marker answers the probe — TRUE, matching the mock world,
+    // which exports the four bulk-access symbols. See the stub's doc.
+    const engine_stub_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scripting_mod.addImport("labelle-engine", engine_stub_mod);
+
     // The extractor CORE as a named module for the tests below: tests/ is
     // its own module root, so tools/declare/extract.zig can't be reached by
     // path import from there (cross-root path imports don't resolve) — the
@@ -440,6 +453,8 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
             });
             configureLanguage(b, lang_mod, lang, lua_dep_opt, quickjs_dep_opt);
+            // The v1.3 probe's engine stand-in — see engine_stub_mod above.
+            lang_mod.addImport("labelle-engine", engine_stub_mod);
             const tests_root_mod = b.createModule(.{
                 .root_source_file = b.path("tests/root.zig"),
                 .target = target,

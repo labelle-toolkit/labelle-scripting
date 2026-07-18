@@ -87,13 +87,38 @@ pub extern fn labelle_component_get(
 //
 // Additive per the contract's minor-revision convention: the four
 // exports below are marked "since v1.3" in labelle_script.h and exist
-// only on engine hosts ≥ 2.6.0. Compatibility is the SAME model as the
-// rest of this file: the plugin links into the host binary, so an older
-// engine fails the game link (undefined symbol) at BUILD time — pair
-// this plugin version with engine ≥ 2.6.0. There is no runtime probe in
-// this linking model; the JSON paths remain the semantic fallback the
-// bindings use when the HOST refuses (0xFF sentinel / -1), not when the
-// symbol is missing.
+// only on engine hosts ≥ 2.6.0. Detection is `host_has_bulk_access`
+// below — a COMPTIME probe of the engine module — and every fast-path
+// reference in the bindings is gated on it, so a game built against an
+// older engine never references these symbols at all (no link error,
+// no runtime surprise): the per-component paths degrade to JSON, the
+// batch calls raise a clear "needs engine ≥ 2.6.0" script error. The
+// JSON paths additionally remain the semantic fallback the bindings
+// use when a v1.3 HOST refuses (0xFF sentinel / -1).
+
+/// COMPTIME capability probe for the v1.3 bulk-access exports — the
+/// `@hasDecl`-on-the-engine-module convention this plugin's bundled
+/// scripting_console pack already uses for the v1.2 response channel
+/// (`@hasDecl(engine, "plugin_command")`). The assembler hands the
+/// plugin module `labelle-engine` as a dep in every generated game
+/// (this repo's own test binaries stand in a one-decl stub, see
+/// build.zig), and `script_contract.batch_int_refused` is a decl the
+/// engine gained in the SAME release (2.6.0) that exports the four
+/// symbols — so this comptime answer is exactly the link-time truth,
+/// on every platform.
+///
+/// Why not a weak-extern runtime probe (`@extern(..., .linkage = .weak)`
+/// resolving null on an old host): verified on Zig 0.16 that an ABSENT
+/// weak symbol only links on COFF and on ELF under the LLVM backend —
+/// the Mach-O linker refuses undefined weak externals outright (both
+/// backends), and the self-hosted ELF linker (the x86_64-linux Debug
+/// default) refuses them too. That rules weak linkage out for the
+/// primary platforms; the comptime gate degrades everywhere instead.
+pub const host_has_bulk_access = blk: {
+    const engine = @import("labelle-engine");
+    break :blk @hasDecl(engine, "script_contract") and
+        @hasDecl(engine.script_contract, "batch_int_refused");
+};
 
 /// PACKED (binary) fast-path twin of `labelle_component_get` (since
 /// v1.3). Serializes the component into `out` as a

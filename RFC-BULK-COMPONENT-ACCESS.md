@@ -230,11 +230,29 @@ this repo's `feat/bulk-component-access`, contract **v1.3**):
   305 ns/entity baseline.
 - **Block iterator (`Labelle.batch { |e| }`) deferred to stage 2**, per
   language, along with the interpreted-block-tax measurement.
-- **Versioning:** additive minor revision per the contract's convention —
-  major stays 1, the four exports are marked "since v1.3" in
-  `labelle_script.h`. In this repo's link-into-the-host model there is no
-  runtime symbol probe: the Ruby binding references the new externs
-  unconditionally, so **ruby games require labelle-engine ≥ 2.6.0** (an
-  older host fails the game link at build time, loudly). The JSON paths
-  remain the semantic fallback for host refusals (0xFF / -1), not for
-  missing symbols.
+- **Versioning + capability detection (supersedes the earlier "paired
+  engine version, link fails on old host" statement):** additive minor
+  revision per the contract's convention — major stays 1, the four exports
+  are marked "since v1.3" in `labelle_script.h`. Detection is the
+  **comptime engine-module probe** `contract.host_has_bulk_access`
+  (`@hasDecl(engine.script_contract, "batch_int_refused")` — the marker
+  decl the engine gained in the same 2.6.0 release as the exports; the
+  assembler hands every generated game's scripting module `labelle-engine`
+  as a dep, and this repo's own builds stand in `src/engine_stub.zig`).
+  Every fast-path extern reference is gated on it, so **a game built
+  against an older engine never references the symbols** (no link
+  failure): `get_into`/`set` degrade to the JSON paths silently, while
+  `batch_get`/`batch_set` **raise** a clear "host engine lacks batch
+  support (needs labelle-engine ≥ 2.6.0)" script error — there is no batch
+  fallback, and silently degrading a whole-query read would be data loss.
+  Verified end to end: `examples/ruby-game` builds AND produces its full
+  16-token transcript against the pinned released engine (2.5.0).
+  A **weak-extern runtime probe** (`@extern(..., .linkage = .weak)` →
+  null on old hosts) was prototyped and rejected on measurement: on Zig
+  0.16 an ABSENT weak symbol links only on COFF and on ELF under the LLVM
+  backend — the Mach-O linker refuses undefined weak externals (both
+  backends), as does the self-hosted ELF linker (the x86_64-linux Debug
+  default) — so it cannot cover the primary platforms. The comptime probe
+  matches link-time truth exactly on every platform. The JSON paths
+  additionally remain the semantic fallback for v1.3 host refusals
+  (0xFF / -1), independent of the capability gate.

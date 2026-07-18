@@ -333,13 +333,15 @@ fn rawComponentGetInto(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
         field_syms[fi] = fv.value.sym;
     }
 
-    // ── PACKED fast path ──────────────────────────────────────────────
+    // ── PACKED fast path (v1.3 hosts only — comptime-gated) ───────────
     // Try the host's binary codec first: it writes the component's scalar
     // fields as a self-describing little-endian record we decode straight
     // into the instance with NO JSON parse. Sizing mirrors the JSON get
     // (one call; grow-retry-once on required > cap). Only the first-byte
-    // sentinel (0xFF) or an absent component (0) drops us to JSON.
-    {
+    // sentinel (0xFF) or an absent component (0) drops us to JSON. On a
+    // pre-v1.3 engine the gate folds this block away entirely (the extern
+    // is never referenced → no link error) and every get rides JSON.
+    if (comptime contract.host_has_bulk_access) {
         var buf = io_scratch.ensure(mrb, SCRATCH_INITIAL_CAP);
         var n = contract.labelle_component_get_packed(a.id, a.name.ptr, a.name.len, buf, io_scratch.cap);
         if (n > io_scratch.cap) {
@@ -459,15 +461,21 @@ fn rawComponentSetFrom(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
     const a = getIntoArgs(mrb);
     const nfields: usize = @intCast(c.labelle_mrb_ary_len(a.fields));
 
-    // ── PACKED fast path ──────────────────────────────────────────────
+    // ── PACKED fast path (v1.3 hosts only — comptime-gated) ───────────
     // Build the binary record from the view's fields — tag each by its
     // RUBY value type (Float→f32, Integer→i64, true/false→bool). The host
     // coerces each into the target struct field's real type. A field whose
     // ruby value isn't a scalar (nil/String/Array/…), an over-long name, or
     // a record that would overflow the local buffer aborts the fast path
-    // (`break :packed`) and we fall through to the JSON encoder below. A
-    // host rc != 0 (component not packable there) does the same.
-    pk: {
+    // (`break :pk`) and we fall through to the JSON encoder below. A host
+    // rc != 0 (component not packable there, or a value its target field
+    // cannot represent — out-of-range int, NaN into an int) does the same:
+    // the JSON path surfaces the value faithfully. On a pre-v1.3 engine
+    // the gate folds the whole block away (extern never referenced).
+    // NOTE the gate wraps the WHOLE labeled block: a runtime `break :pk`
+    // on a comptime-false condition would still ANALYZE the body — and
+    // with it the extern reference the gate exists to avoid.
+    if (comptime contract.host_has_bulk_access) pk: {
         // Generous stack record: real components sit far under this; a
         // pathological wide view just takes the JSON path.
         var rec: [2048]u8 = undefined;
@@ -660,33 +668,44 @@ fn raiseBatchIntRefused(mrb: ?*c.State, names_json: []const u8) noreturn {
 /// refusal `(size_t)-2` — see raiseBatchIntRefused).
 fn rawBatchGet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
     _ = self;
-    var np: [*]const u8 = undefined;
-    var nl: c.Int = undefined;
-    var arr: c.Value = undefined;
-    _ = c.mrb_get_args(mrb, "sA", &np, &nl, &arr);
-    const names = np[0..@intCast(nl)];
+    // Comptime if/ELSE — not an early raise: only the taken branch is
+    // analyzed, so on a pre-v1.3 engine the extern below is never
+    // referenced (no link error) and the call raises instead. There is
+    // no batch fallback — degrading a whole-query read to nothing would
+    // be silent data loss, so the absence must be loud.
+    if (comptime !contract.host_has_bulk_access) {
+        raiseError(mrb, "RuntimeError", "labelle: batch_get — the host engine lacks " ++
+            "batch support (script contract v1.3 needs labelle-engine >= 2.6.0); " ++
+            "use per-entity get/set on this engine");
+    } else {
+        var np: [*]const u8 = undefined;
+        var nl: c.Int = undefined;
+        var arr: c.Value = undefined;
+        _ = c.mrb_get_args(mrb, "sA", &np, &nl, &arr);
+        const names = np[0..@intCast(nl)];
 
-    var buf = io_scratch.ensure(mrb, SCRATCH_INITIAL_CAP);
-    var n = contract.labelle_component_batch_get(names.ptr, names.len, buf, io_scratch.cap);
-    // The refusal sentinel must be checked BEFORE the grow-retry: it is
-    // (size_t)-2, which would otherwise read as a required size.
-    if (n == contract.BATCH_INT_REFUSED) raiseBatchIntRefused(mrb, names);
-    if (n == 0) return c.Value.int(0); // not bound / malformed
-    if (n > io_scratch.cap) {
-        buf = io_scratch.ensure(mrb, n);
-        n = contract.labelle_component_batch_get(names.ptr, names.len, buf, io_scratch.cap);
-        if (n == 0 or n > io_scratch.cap) return c.Value.int(0); // belt
+        var buf = io_scratch.ensure(mrb, SCRATCH_INITIAL_CAP);
+        var n = contract.labelle_component_batch_get(names.ptr, names.len, buf, io_scratch.cap);
+        // The refusal sentinel must be checked BEFORE the grow-retry: it is
+        // (size_t)-2, which would otherwise read as a required size.
+        if (n == contract.BATCH_INT_REFUSED) raiseBatchIntRefused(mrb, names);
+        if (n == 0) return c.Value.int(0); // not bound / malformed
+        if (n > io_scratch.cap) {
+            buf = io_scratch.ensure(mrb, n);
+            n = contract.labelle_component_batch_get(names.ptr, names.len, buf, io_scratch.cap);
+            if (n == 0 or n > io_scratch.cap) return c.Value.int(0); // belt
+        }
+        if (n < 4) return c.Value.int(0);
+        const count = std.mem.readInt(u32, buf[0..4], .little);
+        const nfloats = (n - 4) / 4;
+        var i: usize = 0;
+        while (i < nfloats) : (i += 1) {
+            const bits = std.mem.readInt(u32, buf[4 + i * 4 ..][0..4], .little);
+            c.mrb_ary_set(mrb, arr, @intCast(i), c.Value.float(@as(f32, @bitCast(bits))));
+        }
+        _ = c.mrb_ary_resize(mrb, arr, @intCast(nfloats));
+        return c.Value.int(@intCast(count));
     }
-    if (n < 4) return c.Value.int(0);
-    const count = std.mem.readInt(u32, buf[0..4], .little);
-    const nfloats = (n - 4) / 4;
-    var i: usize = 0;
-    while (i < nfloats) : (i += 1) {
-        const bits = std.mem.readInt(u32, buf[4 + i * 4 ..][0..4], .little);
-        c.mrb_ary_set(mrb, arr, @intCast(i), c.Value.float(@as(f32, @bitCast(bits))));
-    }
-    _ = c.mrb_ary_resize(mrb, arr, @intCast(nfloats));
-    return c.Value.int(@intCast(count));
 }
 
 /// `raw_batch_set(names_json, array, count)` — ONE contract call writes the
@@ -705,35 +724,42 @@ fn rawBatchGet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
 ///       STALE entity set — re-run batch_get and recompute.
 fn rawBatchSet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
     _ = self;
-    var np: [*]const u8 = undefined;
-    var nl: c.Int = undefined;
-    var arr: c.Value = undefined;
-    var count: c.Int = undefined;
-    // `count` (entity count) is accepted for API symmetry; the array length
-    // is the authoritative float count and is what we pack below.
-    _ = c.mrb_get_args(mrb, "sAi", &np, &nl, &arr, &count);
-    const names = np[0..@intCast(nl)];
-    const nfloats: usize = @intCast(c.labelle_mrb_ary_len(arr));
-    const bytes = nfloats * 4;
-    const buf = io_scratch.ensure(mrb, @max(bytes, 1));
-    var i: usize = 0;
-    while (i < nfloats) : (i += 1) {
-        const v = c.mrb_ary_entry(arr, @intCast(i));
-        const f: f32 = @floatCast(c.mrb_ensure_float_type(mrb, v).value.f);
-        std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f), .little);
+    // Same comptime if/else gate as rawBatchGet — see the note there.
+    if (comptime !contract.host_has_bulk_access) {
+        raiseError(mrb, "RuntimeError", "labelle: batch_set — the host engine lacks " ++
+            "batch support (script contract v1.3 needs labelle-engine >= 2.6.0); " ++
+            "use per-entity get/set on this engine");
+    } else {
+        var np: [*]const u8 = undefined;
+        var nl: c.Int = undefined;
+        var arr: c.Value = undefined;
+        var count: c.Int = undefined;
+        // `count` (entity count) is accepted for API symmetry; the array
+        // length is the authoritative float count and is what we pack below.
+        _ = c.mrb_get_args(mrb, "sAi", &np, &nl, &arr, &count);
+        const names = np[0..@intCast(nl)];
+        const nfloats: usize = @intCast(c.labelle_mrb_ary_len(arr));
+        const bytes = nfloats * 4;
+        const buf = io_scratch.ensure(mrb, @max(bytes, 1));
+        var i: usize = 0;
+        while (i < nfloats) : (i += 1) {
+            const v = c.mrb_ary_entry(arr, @intCast(i));
+            const f: f32 = @floatCast(c.mrb_ensure_float_type(mrb, v).value.f);
+            std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f), .little);
+        }
+        const rc = contract.labelle_component_batch_set(names.ptr, names.len, buf, bytes);
+        if (rc == -2) raiseBatchIntRefused(mrb, names);
+        if (rc != 0) raiseFmt(
+            mrb,
+            "RuntimeError",
+            "labelle: batch_set refused for {s}: the entity set changed between " ++
+                "batch_get and batch_set (spawn/destroy between the paired calls " ++
+                "— the buffer was computed against a stale set; re-run batch_get " ++
+                "and recompute), or the names were malformed / the host not bound",
+            .{names},
+        );
+        return c.Value.int(0);
     }
-    const rc = contract.labelle_component_batch_set(names.ptr, names.len, buf, bytes);
-    if (rc == -2) raiseBatchIntRefused(mrb, names);
-    if (rc != 0) raiseFmt(
-        mrb,
-        "RuntimeError",
-        "labelle: batch_set refused for {s}: the entity set changed between " ++
-            "batch_get and batch_set (spawn/destroy between the paired calls " ++
-            "— the buffer was computed against a stale set; re-run batch_get " ++
-            "and recompute), or the names were malformed / the host not bound",
-        .{names},
-    );
-    return c.Value.int(0);
 }
 
 // ── events ───────────────────────────────────────────────────────────────
