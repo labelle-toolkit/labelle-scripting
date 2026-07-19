@@ -565,6 +565,29 @@ pub const Vm = struct {
         logError(name, "init() failed — script evicted; update/deinit will not run");
     }
 
+    /// Hot reload (labelle-engine#740): re-run a changed script in the
+    /// RUNNING VM. The old incarnation's `labelle.on` handlers are purged
+    /// first (the new module body re-registers its own — without the
+    /// purge every save would stack another copy), then `loadScript`
+    /// compiles + evaluates a FRESH ES-module instance and overwrites the
+    /// script's registry namespace: module-scope state resets (the RFC's
+    /// "ivars are caches" reload semantics), shared globals and prelude
+    /// state survive. The superseded JSModuleDef stays on the context's
+    /// module list until close — a small per-save leak, dev-mode only.
+    /// On failure the new body already self-purged (loadScript's usual
+    /// containment) and the OLD namespace entry is removed too — the
+    /// script goes silent until the next save fixes it, matching the
+    /// lua/ruby reload-failure behavior (running half-old code with its
+    /// handlers purged would be worse than running none).
+    pub fn reloadScript(self: Vm, name: []const u8, source: [:0]const u8) bool {
+        self.purgeScriptHandlers(name);
+        if (!self.loadScript(name, source)) {
+            self.removeScriptEntry(name);
+            return false;
+        }
+        return true;
+    }
+
     /// Drop every event handler `name` registered through `labelle.on` —
     /// the prelude-side half of eviction, via its `__labelle_purge_handlers`
     /// hook. Missing hook (prelude never installed) is a silent no-op; a

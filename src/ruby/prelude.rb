@@ -627,19 +627,51 @@ module Labelle
     while i < cs.size
       klass, owner = cs[i]
       i += 1
-      saved = $__labelle_current_script
-      $__labelle_current_script = owner
-      snap = __handlers_snapshot
-      begin
-        inst = klass.new
-        inst.setup
-        @controllers << [inst, owner]
-      rescue Exception => e
-        __handlers_rollback(snap)
-        raw_log("[ruby] controller #{klass} setup failed — controller evicted: #{e.class}: #{e.message}\n  backtrace: #{(e.backtrace || []).join(' | ')}")
-      end
-      $__labelle_current_script = saved
+      __setup_one_controller(klass, owner)
     end
+    nil
+  end
+
+  # Hot reload (labelle-engine#740): instantiate + set up ONLY `name_sym`'s
+  # registered controller classes, appending to the live list — the
+  # per-script slice of __setup_controllers, called by vm.zig after a
+  # reloaded body re-registered its classes (__evict_script dropped the
+  # previous instances first, so nothing doubles; the reloaded script's
+  # controllers move to the end of tick order). A no-op before the boot
+  # sweep has run — @controllers nil means Controller.setup is still ahead
+  # and will pick the classes up itself.
+  def self.__setup_controllers_for(name_sym)
+    return if @controllers.nil?
+    cs = @controller_classes || []
+    i = 0
+    while i < cs.size
+      klass, owner = cs[i]
+      i += 1
+      __setup_one_controller(klass, owner) if owner == name_sym
+    end
+    nil
+  end
+
+  # One controller's instantiate + setup, rescue-contained (shared by the
+  # boot sweep and the per-script reload slice above). A raising
+  # initialize/setup evicts that CONTROLLER (logged; no tick, no teardown)
+  # — its script and sibling controllers keep running — and rolls back any
+  # `on(...)` handlers the failed setup registered before raising: without
+  # the rollback they would keep firing into the dead instance on every
+  # later dispatch.
+  def self.__setup_one_controller(klass, owner)
+    saved = $__labelle_current_script
+    $__labelle_current_script = owner
+    snap = __handlers_snapshot
+    begin
+      inst = klass.new
+      inst.setup
+      @controllers << [inst, owner]
+    rescue Exception => e
+      __handlers_rollback(snap)
+      raw_log("[ruby] controller #{klass} setup failed — controller evicted: #{e.class}: #{e.message}\n  backtrace: #{(e.backtrace || []).join(' | ')}")
+    end
+    $__labelle_current_script = saved
     nil
   end
 

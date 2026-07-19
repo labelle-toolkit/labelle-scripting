@@ -105,6 +105,17 @@ comptime {
     if (scripting.language == .lua) _ = @import("eval_shared_suite.zig");
 }
 
+// The dev-experience suite (labelle-engine#740): hot reload, the update
+// error throttle, sandbox-by-construction pins. Rides EVERY language
+// binary — the VM family exercises reload/throttle end to end, the
+// native family pins the explicit reload refusal; tests gate themselves
+// on the language inside. (The opted-in lua sandbox PROFILE has its own
+// binary — tests/sandbox_root.zig — because the profile is a comptime
+// module configuration.)
+comptime {
+    _ = @import("devx_suite.zig");
+}
+
 test "dispatch contract (#3): explicit-tick-only, zero-arg deinit" {
     // The assembler's splice (labelle-assembler#596) emits
     // `scripting.Controller.tick(&g, scaled_dt)` EXPLICITLY and selects

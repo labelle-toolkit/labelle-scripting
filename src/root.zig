@@ -49,6 +49,16 @@ pub const contract = @import("contract.zig");
 /// `Controller.evalCommand` / `handleEvalCommand` below for the seams.
 pub const eval = @import("eval.zig");
 
+/// Dev-mode disk watcher (labelle-engine#740) — the VM-free polling
+/// layer behind `hot_reload` below. Re-exported so the test suites
+/// exercise it directly against plain temp dirs.
+pub const watch = @import("watch.zig");
+
+/// Whether the mod sandbox profile is active (labelle-engine#740) —
+/// resolved comptime from the project's plugin params; see
+/// src/sandbox.zig for the per-language mechanism notes.
+pub const sandbox_enabled = @import("sandbox.zig").enabled;
+
 /// The selected language (introspection/tests — the test root switches
 /// its suite on this).
 pub const language = build_options.language;
@@ -85,10 +95,20 @@ const Backend = switch (build_options.language) {
 /// One registered script: a stable name (chunkname for error reporting,
 /// registry key for hook dispatch) plus its source. Slices are borrowed —
 /// callers pass `@embedFile`d or otherwise static strings, which is why
-/// registration needs no allocator.
+/// registration needs no allocator (the hot-reload glue below is the one
+/// caller that swaps in heap sources, and it owns their lifetime).
 const RegisteredScript = struct {
     name: []const u8,
     source: [:0]const u8,
+    /// Load AND init both succeeded in the CURRENT VM — the reload seam's
+    /// "does init still owe a run?" answer (a script broken at boot gets
+    /// its init when a reload finally fixes it; a running script does NOT
+    /// re-init on reload — its init-time entities would duplicate).
+    initialized: bool = false,
+    /// Error-UX throttle state (see `Controller.tick`): how many update()
+    /// calls in a row have raised, and how many upcoming ticks to skip.
+    consecutive_update_failures: u16 = 0,
+    throttle_skip: u16 = 0,
 };
 
 /// Fixed registration capacity. Scripts are registered once at boot by
@@ -114,16 +134,24 @@ var active_vm: ?Backend.vm.Vm = null;
 /// integration is a follow-up ticket — this function is the seam).
 /// Registration after `setup` takes effect on the next setup.
 pub fn registerScript(name: []const u8, source: [:0]const u8) void {
+    _ = findOrRegister(name, source);
+}
+
+/// Shared registration body for `registerScript` and `reloadScript`:
+/// find-by-name (replacing the source) or append. Returns the registry
+/// entry.
+fn findOrRegister(name: []const u8, source: [:0]const u8) *RegisteredScript {
     for (script_registry[0..script_count]) |*s| {
         if (std.mem.eql(u8, s.name, name)) {
             s.source = source;
-            return;
+            return s;
         }
     }
     if (script_count >= MAX_REGISTERED_SCRIPTS)
         @panic("labelle-scripting: script registry full — raise MAX_REGISTERED_SCRIPTS");
     script_registry[script_count] = .{ .name = name, .source = source };
     script_count += 1;
+    return &script_registry[script_count - 1];
 }
 
 /// Number of currently registered scripts (introspection/tests).
@@ -144,6 +172,242 @@ pub fn scratchGrowthCount() usize {
 pub fn clearScripts() void {
     script_count = 0;
 }
+
+// ── Hot reload (labelle-engine#740) ─────────────────────────────────────
+
+/// Whether the ACTIVE backend can re-load a script into a running VM —
+/// the VM family (lua/ruby/typescript) can re-eval; the native family
+/// (rust/crystal/csharp) is compiled into/beside the game binary and is
+/// explicitly OUT of hot-reload scope in v1 (a dev-mode dylib swap is
+/// the RFC's sketched future, not this ticket).
+pub const supports_reload = @hasDecl(Backend.vm.Vm, "reloadScript");
+
+/// Reload one script: replace (or add) its registration and — when a VM
+/// is running — re-load it in place. THE hot-push seam: the disk watcher
+/// below feeds it, and the studio preview's hot-push integration will
+/// call exactly this once the studio side grows the channel (there is no
+/// engine hot-push contract to wire to yet — see the PR notes).
+///
+/// State semantics (per RFC-LANGUAGE-PLUGINS: "authoritative state lives
+/// in components; ivars are caches — hot reload resets the VM"):
+/// component/ECS data survives by construction (it lives in the host);
+/// script-LOCAL state resets — the changed file's body re-runs in the
+/// existing VM under each language's own semantics:
+///   - lua: a FRESH private `_ENV` replaces the script's env (top-level
+///     locals/globals reset); shared globals and the prelude survive;
+///   - ruby: the previous incarnation is evicted first (harvested hooks,
+///     handlers, controllers, the @ivar receiver), then the new body
+///     runs and is re-harvested; controllers the new body registers are
+///     instantiated + set up immediately;
+///   - typescript: a fresh ES-module instance replaces the registry
+///     namespace entry (module-scope state resets).
+/// In every language the script's OLD event handlers are purged before
+/// the new body registers its own — no duplicate-handler pileup.
+///
+/// `init()` policy: a script that was already running does NOT re-run
+/// init (its init-time entities would duplicate); a script that never
+/// completed load+init (broken at boot, now fixed) gets its init now —
+/// the fix-and-save loop fully starts it. Update-throttle state resets
+/// either way.
+///
+/// `name`/`source` lifetimes follow `registerScript` (borrowed, must
+/// outlive the registry); returns false when the re-load or owed init
+/// failed (logged through the host, VM untouched otherwise) or when the
+/// backend has no reload story.
+pub fn reloadScript(name: []const u8, source: [:0]const u8) bool {
+    if (comptime !supports_reload) {
+        // Refused OUTRIGHT (no registration either): the native backends
+        // refuse registered sources wholesale — pretending to accept one
+        // here would just defer the confusion to the next setup.
+        logHost("hot reload is not supported for the native language family (rust/crystal/csharp) — restart the game");
+        return false;
+    } else {
+        const entry = findOrRegister(name, source);
+        entry.consecutive_update_failures = 0;
+        entry.throttle_skip = 0;
+        const vm = active_vm orelse return true; // next setup picks it up
+        if (!vm.reloadScript(entry.name, entry.source)) {
+            // The new body failed to load: the backend evicted whatever
+            // it managed to register, so nothing half-new keeps running.
+            // The registration keeps the new source — the author's next
+            // save retries it.
+            entry.initialized = false;
+            return false;
+        }
+        if (!entry.initialized) {
+            if (vm.callScriptHook(entry.name, "init", null)) {
+                entry.initialized = true;
+            } else {
+                vm.evictScript(entry.name);
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+/// Dev-mode disk watching (labelle-engine#740): poll the game's script
+/// dir off the Controller tick and feed changed files through
+/// `reloadScript`. COMPILED OUT unless the plugin is built with
+/// `-Dhot_reload=true` (the dev-mode gate — the assembler's dev builds
+/// will pass it; release builds never carry the watcher or its tick
+/// branch). VM family only — `watchDir` refuses on native backends.
+pub const hot_reload = struct {
+    /// Poll cadence in Controller ticks (~4 Hz at 60 fps). Tick-counted,
+    /// not wall-clocked, on purpose: Zig 0.16 has no std.time.Timer and
+    /// a dev loop doesn't need one.
+    pub const poll_interval_ticks: u32 = 15;
+
+    /// Cap on one reloaded script file (dev-mode read guard).
+    pub const max_script_bytes: usize = 1 << 20;
+
+    var watcher: ?watch.Watcher = null;
+    var gpa: std.mem.Allocator = undefined;
+    var countdown: u32 = 0;
+
+    /// Reload-owned sources + stable name storage: registry `name`
+    /// slices must outlive the watcher (watcher entry storage reshuffles
+    /// across polls), and re-read sources are heap copies that must be
+    /// freed when the NEXT reload of the same script replaces them.
+    const Owned = struct {
+        name_buf: [watch.filename_cap]u8 = undefined,
+        name_len: usize = 0,
+        source: ?[:0]u8 = null,
+    };
+    var owned: [MAX_REGISTERED_SCRIPTS]Owned = @splat(.{});
+    var owned_count: usize = 0;
+
+    /// Start watching `dir_path` (resolved against the cwd) for the
+    /// selected language's script files. `io`/`allocator` are stored for
+    /// the polls; call from the game's main after Controller.setup (a
+    /// generated dev build's splice, or by hand).
+    pub fn watchDir(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) error{ HotReloadUnsupported, WatchDirOpen }!void {
+        const dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch
+            return error.WatchDirOpen;
+        return watchOpenedDir(io, allocator, dir);
+    }
+
+    /// `watchDir` over an already-open handle (must have `.iterate`
+    /// capability). The watcher borrows it until `stopWatching`.
+    pub fn watchOpenedDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) error{HotReloadUnsupported}!void {
+        const ext = comptime scriptExtension() orelse return error.HotReloadUnsupported;
+        watcher = watch.Watcher.init(io, dir, ext);
+        gpa = allocator;
+        countdown = 0;
+    }
+
+    /// Stop polling. The watched dir handle is the caller's to close;
+    /// already-reloaded sources stay live (the registry points at them).
+    pub fn stopWatching() void {
+        watcher = null;
+    }
+
+    /// Poll now and reload every changed script; returns how many
+    /// reloaded clean. Public so tests (and a future studio push) can
+    /// force a deterministic poll; the tick path calls it on the
+    /// `poll_interval_ticks` cadence.
+    pub fn pump() usize {
+        const w = if (watcher) |*ptr| ptr else return 0;
+        var changes: [16]watch.Change = undefined;
+        var reloaded: usize = 0;
+        const n = w.poll(&changes);
+        for (changes[0..n]) |ch| {
+            const source = w.dir.readFileAllocOptions(
+                w.io,
+                ch.file,
+                gpa,
+                .limited(max_script_bytes),
+                .of(u8),
+                0,
+            ) catch {
+                logHost("hot reload: failed to read a changed script file — skipped");
+                continue;
+            };
+            if (reloadOwned(ch.name, source)) reloaded += 1;
+        }
+        return reloaded;
+    }
+
+    /// Called from Controller.tick (comptime-gated there).
+    fn pumpTick() void {
+        if (watcher == null) return;
+        if (countdown > 0) {
+            countdown -= 1;
+            return;
+        }
+        countdown = poll_interval_ticks - 1;
+        _ = pump();
+    }
+
+    /// Route one freshly read source through `reloadScript`, managing
+    /// ownership: the registry gets slot-stable name storage and the
+    /// slot's previous heap source is freed once replaced.
+    fn reloadOwned(name: []const u8, source: [:0]u8) bool {
+        const slot = ownedSlot(name) orelse {
+            gpa.free(source);
+            logHost("hot reload: too many watched scripts — raise MAX_REGISTERED_SCRIPTS");
+            return false;
+        };
+        const prev = slot.source;
+        slot.source = source;
+        const ok = reloadScript(slot.name_buf[0..slot.name_len], source);
+        if (prev) |p| gpa.free(p); // registry now points at `source`
+        return ok;
+    }
+
+    fn ownedSlot(name: []const u8) ?*Owned {
+        for (owned[0..owned_count]) |*slot| {
+            if (std.mem.eql(u8, slot.name_buf[0..slot.name_len], name)) return slot;
+        }
+        if (owned_count >= owned.len or name.len > watch.filename_cap) return null;
+        const slot = &owned[owned_count];
+        owned_count += 1;
+        @memcpy(slot.name_buf[0..name.len], name);
+        slot.name_len = name.len;
+        slot.source = null;
+        return slot;
+    }
+
+    /// Test/tooling seam: stop watching and free every reload-owned
+    /// source. Callers must have cleared the registry (or torn the VM
+    /// down and re-registered) first — registry entries may point at the
+    /// freed sources.
+    pub fn reset() void {
+        stopWatching();
+        for (owned[0..owned_count]) |*slot| {
+            if (slot.source) |s| gpa.free(s);
+            slot.source = null;
+        }
+        owned_count = 0;
+    }
+
+    fn scriptExtension() ?[]const u8 {
+        return switch (build_options.language) {
+            .lua => ".lua",
+            .ruby => ".rb",
+            // The VM evaluates JS; in a generated dev build the watch
+            // dir is the assembler's transpile OUTPUT (tsc --watch or a
+            // dev-mode transpile step keeps it fresh) — watching raw
+            // .ts would need an in-process transpiler this plugin
+            // deliberately doesn't carry.
+            .typescript => ".js",
+            else => null, // native family — no VM to re-load into
+        };
+    }
+};
+
+// ── Error-UX throttle policy (labelle-engine#740) ───────────────────────
+
+/// After this many CONSECUTIVE update() failures of one script, its
+/// update stops running every tick…
+pub const update_throttle_threshold: u16 = 3;
+
+/// …and is attempted (and its traceback logged) only once every this
+/// many ticks — one line a second at 60 fps instead of sixty — until an
+/// attempt succeeds, which restores full cadence immediately. Init/load
+/// failures don't need this (they evict); event-handler and controller
+/// errors are event-cadence, not 60/s, and stay unthrottled.
+pub const update_throttle_stride: u16 = 60;
 
 // ── Console eval (labelle-scripting#4) ──────────────────────────────────
 //
@@ -225,14 +489,24 @@ pub const Controller = struct {
 
         // Two passes — load everything, then init everything — so an
         // early script's init() can already touch entities/events involving
-        // scripts registered after it.
-        for (script_registry[0..script_count]) |s| {
+        // scripts registered after it. Per-entry `initialized` records
+        // load+init success for the reload seam (a boot-broken script owes
+        // an init when a reload fixes it); throttle state starts clean in
+        // every fresh VM.
+        var loaded: [MAX_REGISTERED_SCRIPTS]bool = undefined;
+        for (script_registry[0..script_count], 0..) |*s, i| {
+            s.initialized = false;
+            s.consecutive_update_failures = 0;
+            s.throttle_skip = 0;
             // Load failures self-evict inside loadScript: a chunk body that
             // errors is pulled back out of the hook registry.
-            _ = vm.loadScript(s.name, s.source);
+            loaded[i] = vm.loadScript(s.name, s.source);
         }
-        for (script_registry[0..script_count]) |s| {
-            if (!vm.callScriptHook(s.name, "init", null)) {
+        for (script_registry[0..script_count], 0..) |*s, i| {
+            if (!loaded[i]) continue;
+            if (vm.callScriptHook(s.name, "init", null)) {
+                s.initialized = true;
+            } else {
                 // init() raised: the script is half-initialized — evict it
                 // so update/deinit never run against broken state (the
                 // init-time counterpart of loadScript's self-eviction).
@@ -256,17 +530,37 @@ pub const Controller = struct {
     ///   4. controller `tick(dt)`s, registration order (backends with a
     ///      controller tier — a no-op for the rest).
     /// Script errors are logged with a full traceback and never abort the
-    /// tick — the remaining scripts still run. No-op before setup.
+    /// tick — the remaining scripts still run, with repeat offenders
+    /// throttled (see `update_throttle_threshold`/`_stride`: after 3
+    /// consecutive update() failures the script is attempted — and its
+    /// traceback logged — only once every 60 ticks until an attempt
+    /// succeeds, which restores full cadence). No-op before setup.
+    ///
+    /// Dev builds (`-Dhot_reload=true`) also pump the disk watcher here,
+    /// at tick START so reloaded code runs the very tick it lands.
     pub fn tick(game: anytype, dt: f32) void {
         _ = game;
         const vm = active_vm orelse return;
+        if (comptime build_options.hot_reload) hot_reload.pumpTick();
         contract.labelle_time_dt_stamp(dt);
         vm.callLabelleFn("dispatch_inbox", null);
-        for (script_registry[0..script_count]) |s| {
+        for (script_registry[0..script_count]) |*s| {
+            if (s.throttle_skip > 0) {
+                s.throttle_skip -= 1;
+                continue;
+            }
             // Update errors are logged per-call and do NOT evict — unlike a
             // failed init, the script's state is intact and the author gets
-            // a traceback every tick until it's fixed.
-            _ = vm.callScriptHook(s.name, "update", dt);
+            // a traceback (at full cadence until the throttle kicks in).
+            if (vm.callScriptHook(s.name, "update", dt)) {
+                s.consecutive_update_failures = 0;
+            } else {
+                s.consecutive_update_failures +|= 1;
+                if (s.consecutive_update_failures == update_throttle_threshold)
+                    logThrottled(s.name);
+                if (s.consecutive_update_failures >= update_throttle_threshold)
+                    s.throttle_skip = update_throttle_stride - 1;
+            }
         }
         vm.callLabelleFn("__tick_controllers", dt);
     }
@@ -312,6 +606,19 @@ pub const Controller = struct {
         active_vm = null;
     }
 };
+
+/// Announce (once per failure episode) that a script's update() hit the
+/// consecutive-failure threshold and is being throttled.
+fn logThrottled(script_name: []const u8) void {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    w.print(
+        "[scripting] {s}: update() failed {d} ticks in a row — throttling to one attempt every {d} ticks until it succeeds",
+        .{ script_name, update_throttle_threshold, update_throttle_stride },
+    ) catch {};
+    const line = w.buffered();
+    contract.labelle_log(line.ptr, line.len);
+}
 
 /// Route a plugin-level (not script-level) message through the host log.
 fn logHost(msg: []const u8) void {

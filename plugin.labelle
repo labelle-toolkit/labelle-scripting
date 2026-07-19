@@ -19,6 +19,17 @@
     // key and keep the fast-path.
     .params_schema = .{
         .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript", "rust", "crystal", "csharp" }, .required = true },
+        // Mod sandbox profile (labelle-engine#740): no filesystem/OS
+        // access for scripts. Default OFF — games keep today's full
+        // stdlib; the profile is the base for the future mods tier. The
+        // resolved value reaches the plugin through the staged
+        // `plugin_params` module (src/sandbox.zig reads it); lua is the
+        // language it actually switches (safe-lib subset instead of
+        // luaL_openlibs), ruby/typescript are sandboxed by construction,
+        // the native family has no sandbox story by design. Needs
+        // assembler ≥ v0.83.0 to SET (older ones hard-fail non-language
+        // params); leaving it unset works everywhere.
+        .{ .name = "sandbox", .type = .bool, .default = false },
     },
     // Per-LANGUAGE capability rows (RFC-LANGUAGE-PLUGINS rev 17 §7,
     // labelle-engine#619/#774). Each row is everything the assembler needs
