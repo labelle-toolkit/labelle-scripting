@@ -19,6 +19,7 @@ mod alloc_probe;
 mod behavior;
 mod big_id;
 mod big_query;
+mod bulk;
 mod counter;
 mod events;
 mod lifecycle;
@@ -85,6 +86,23 @@ pub fn register(scripts: &mut Scripts) {
         }
         "alloc" => {
             scripts.add("alloc_probe", Box::new(alloc_probe::AllocProbe::default()));
+        }
+        // Bulk component access (contract v1.3, #44): packed codec,
+        // raw batch tier, coupling guard, typed closure tier.
+        "bulk_packed" => {
+            scripts.add("bulk_packed", Box::new(bulk::PackedRt::default()));
+        }
+        "bulk_batch" => {
+            scripts.add("bulk_batch", Box::new(bulk::BatchFlat::default()));
+        }
+        "bulk_stale" => {
+            scripts.add("bulk_stale", Box::new(bulk::BatchStale::default()));
+        }
+        "bulk_iter" => {
+            scripts.add("bulk_iter", Box::new(bulk::BatchIter::default()));
+        }
+        "bulk_iter_edge" => {
+            scripts.add("bulk_iter_edge", Box::new(bulk::BatchIterEdge::default()));
         }
         _ => {}
     }
