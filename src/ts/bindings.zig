@@ -646,8 +646,10 @@ fn rawBatchSet(ctx: ?*c.Context, this: c.Value, argc: c_int, argv: ?[*]const c.V
 /// is the authoritative float count. Host refusals THROW — both mean the
 /// write would corrupt data: -2 int-typed field → TypeError; -1 entity-set
 /// drift (the exact-size preflight; nothing was applied — re-run batch_get
-/// and recompute) → Error. Non-number elements are a TypeError (loud, like
-/// ruby's ensure_float — never a silent NaN).
+/// and recompute) → Error. Non-number elements AND non-finite numbers
+/// (NaN/Inf — the json_encode non-finite policy, applied at the binding)
+/// are a TypeError naming the element; in every throw NOTHING was handed
+/// to the host.
 fn batchSetImpl(ctx: ?*c.Context, argv: ?[*]const c.Value, argc: c_int) JsError!c.Value {
     // Same comptime if/else gate as batchGetImpl — see the note there.
     if (comptime !contract.host_has_bulk_access) {
@@ -673,11 +675,35 @@ fn batchSetImpl(ctx: ?*c.Context, argv: ?[*]const c.Value, argc: c_int) JsError!
             if (elem.isException()) return error.JsError;
             defer c.JS_FreeValue(ctx, elem);
             if (!elem.isNumberTag()) {
-                _ = c.JS_ThrowTypeError(ctx, "labelle: batch_set: array elements must be numbers");
+                var msg_buf: [128]u8 = undefined;
+                const msg: [:0]const u8 = std.fmt.bufPrintZ(
+                    &msg_buf,
+                    "labelle: batch_set: array element {d} is not a number — the " ++
+                        "f32 stream carries numbers only (nothing was written)",
+                    .{i},
+                ) catch unreachable;
+                _ = c.JS_ThrowTypeError(ctx, "%s", msg.ptr);
                 return error.JsError;
             }
             var f: f64 = 0;
             if (c.JS_ToFloat64(ctx, &f, elem) < 0) return error.JsError;
+            // Non-finite refusal at the BINDING — the json_encode
+            // "non-finite number" TypeError policy applied to the stream:
+            // NaN/Inf must never ride into component fields. Strict from
+            // day one (this API is new in stage 3); ruby's identical gap
+            // retrofits the same binding-level check via #45.
+            if (std.math.isNan(f) or std.math.isInf(f)) {
+                var msg_buf: [160]u8 = undefined;
+                const msg: [:0]const u8 = std.fmt.bufPrintZ(
+                    &msg_buf,
+                    "labelle: batch_set: non-finite number at element {d} — the " ++
+                        "f32 stream refuses NaN/Inf, the json_encode non-finite " ++
+                        "policy (nothing was written)",
+                    .{i},
+                ) catch unreachable;
+                _ = c.JS_ThrowTypeError(ctx, "%s", msg.ptr);
+                return error.JsError;
+            }
             const f32v: f32 = @floatCast(f);
             std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f32v), .little);
         }

@@ -1001,7 +1001,15 @@ local CLOSER_MT = {
 local function batch_noop_iter() return nil end
 
 function labelle.batch(names)
-  if type(names) ~= "table" then names = { names } end
+  -- Accept the same name-or-ref forms every component-name site does
+  -- (the component_name contract shared with Entity get/set and
+  -- game.query): a single name string, a single labelle.component REF —
+  -- a ref is a table, so it must be detected BEFORE the "table = list"
+  -- branch — or a list mixing both (resolve_names normalizes each
+  -- element through component_name).
+  if type(names) ~= "table" or type(names.__labelle_component) == "string" then
+    names = { names }
+  end
   if #names == 0 then
     error("labelle.batch: expected at least one component name", 2)
   end

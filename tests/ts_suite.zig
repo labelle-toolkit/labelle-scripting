@@ -1339,3 +1339,95 @@ test "bulk v1.3: non-finite floats take the same refusal on the packed and JSON 
     // Nothing was stored by either refusal.
     try expect(mock.componentJson(1, "Stats") == null);
 }
+
+test "bulk stage 3: batch_set refuses non-numbers and non-finite elements before any write" {
+    fresh();
+    // Round-1 review (PR #48): NaN/Infinity would ride straight into
+    // component fields through the f32 stream — they now refuse AT THE
+    // BINDING as the canonical non-finite TypeError, naming the element,
+    // with nothing handed to the host (the json_encode non-finite policy
+    // applied to the stream; ruby's identical gap retrofits via #45).
+    scripting.registerScript("batch_set_strict",
+        \\const NAMES = ["BatchPos", "BatchVel"];
+        \\export function init() {
+        \\  const e = Entity.create();
+        \\  e.set("BatchPos", { x: 1, y: 2 });
+        \\  e.set("BatchVel", { vx: 3, vy: 4 });
+        \\  const buf = [];
+        \\  const count = labelle.batch_get(NAMES, buf);
+        \\  buf[1] = "9"; // strings never coerce into the stream
+        \\  try {
+        \\    labelle.batch_set(NAMES, buf, count);
+        \\    labelle.log("string accepted");
+        \\  } catch (err) {
+        \\    labelle.log(`string refused (${err.constructor.name}): ${err.message}`);
+        \\  }
+        \\  buf[1] = NaN;
+        \\  try {
+        \\    labelle.batch_set(NAMES, buf, count);
+        \\    labelle.log("nan accepted");
+        \\  } catch (err) {
+        \\    labelle.log(`nan refused: ${err.message}`);
+        \\  }
+        \\  buf[1] = Infinity;
+        \\  try {
+        \\    labelle.batch_set(NAMES, buf, count);
+        \\    labelle.log("inf accepted");
+        \\  } catch (err) {
+        \\    labelle.log(`inf refused: ${err.message}`);
+        \\  }
+        \\  // The callback-iterator path hits the same guard at commit
+        \\  // time: the trailing batch_set throws out of labelle.batch.
+        \\  try {
+        \\    labelle.batch(NAMES, (d) => {
+        \\      d.y = NaN;
+        \\    });
+        \\    labelle.log("view nan accepted");
+        \\  } catch (err) {
+        \\    labelle.log(`view nan refused: ${err.message}`);
+        \\  }
+        \\}
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("string accepted"));
+    try expect(mock.logsContain("string refused (TypeError): labelle: batch_set: array element 1 is not a number"));
+    try expect(!mock.logsContain("nan accepted"));
+    try expect(mock.logsContain("nan refused: labelle: batch_set: non-finite number at element 1"));
+    try expect(!mock.logsContain("inf accepted"));
+    try expect(mock.logsContain("inf refused: labelle: batch_set: non-finite number at element 1"));
+    try expect(!mock.logsContain("view nan accepted"));
+    try expect(mock.logsContain("view nan refused: labelle: batch_set: non-finite number at element 1"));
+    // Every refusal fired BEFORE any host write — both components keep
+    // their original values.
+    try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
+    try expectComponent(1, "BatchVel", "{\"vx\":3,\"vy\":4}");
+}
+
+test "bulk stage 3: a single component ref (and refs in lists) drive labelle.batch" {
+    fresh();
+    // The component_name contract shared with Entity get/set and
+    // game.query: labelle.batch takes a single name string, a single
+    // labelle.component REF, or a list mixing both.
+    scripting.registerScript("batch_ref",
+        \\export function init() {
+        \\  const e = Entity.create();
+        \\  e.set("BatchPos", { x: 1, y: 2 });
+        \\  e.set("BatchVel", { vx: 1, vy: 1 });
+        \\  const Ref = labelle.component("BatchPos");
+        \\  const n = labelle.batch(Ref, (v) => {
+        \\    v.x += 1.0;
+        \\  });
+        \\  labelle.log(`ref n:${n}`);
+        \\  const mn = labelle.batch([Ref, "BatchVel"], (v) => {});
+        \\  labelle.log(`mix n:${mn}`);
+        \\}
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("ref n:1"));
+    try expect(mock.logsContain("mix n:1"));
+    try expectComponent(1, "BatchPos", "{\"x\":2,\"y\":2}");
+}

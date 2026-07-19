@@ -1175,6 +1175,21 @@ test "bulk stage 3: single-name coercion, unknown-field raise, and the discovery
         \\    n = n + 1
         \\  end
         \\  labelle.log("single n:" .. n)
+        \\  -- Single component REF (the labelle.component form every
+        \\  -- name-taking site accepts — Entity get/set, game.query): a
+        \\  -- ref is a TABLE, so it must not be mistaken for a names list.
+        \\  local Ref = labelle.component("BatchPos")
+        \\  local rn = 0
+        \\  for v in labelle.batch(Ref) do
+        \\    v.x = v.x + 1.0
+        \\    rn = rn + 1
+        \\  end
+        \\  labelle.log("ref n:" .. rn)
+        \\  -- Refs mix into lists too (the resolve_names leg).
+        \\  e:set("BatchVel", { vx = 1, vy = 1 })
+        \\  local mn = 0
+        \\  for v in labelle.batch({ Ref, "BatchVel" }) do mn = mn + 1 end
+        \\  labelle.log("mix n:" .. mn)
         \\  -- A typo'd field name raises instead of silently reading nil
         \\  -- (no names are reserved — the view's base offset lives in an
         \\  -- upvalue, not on the table).
@@ -1187,7 +1202,6 @@ test "bulk stage 3: single-name coercion, unknown-field raise, and the discovery
         \\  -- clear raise, not a low-level nil error. Stub the re-query leg
         \\  -- to force the race deterministically (an UNCACHED names-set,
         \\  -- so first-use discovery actually runs).
-        \\  e:set("BatchVel", { vx = 1, vy = 1 })
         \\  labelle.raw_query = function(_names_json) return "" end
         \\  local ok2, err2 = pcall(function()
         \\    for v in labelle.batch({ "BatchVel" }) do end
@@ -1199,7 +1213,11 @@ test "bulk stage 3: single-name coercion, unknown-field raise, and the discovery
     defer scripting.Controller.deinit();
 
     try expect(mock.logsContain("single n:1"));
-    try expectComponent(1, "BatchPos", "{\"x\":2,\"y\":2}");
+    // The single-ref form iterated too (+1 more on x), and refs mixed
+    // into a names list resolve through the same component_name leg.
+    try expect(mock.logsContain("ref n:1"));
+    try expect(mock.logsContain("mix n:1"));
+    try expectComponent(1, "BatchPos", "{\"x\":3,\"y\":2}");
     try expect(!mock.logsContain("typo accepted"));
     try expect(mock.logsContain("typo refused:"));
     try expect(mock.logsContain("unknown field 'z'"));
@@ -1298,4 +1316,55 @@ test "bulk v1.3: non-finite floats take the same refusal on the packed and JSON 
     try expect(mock.logsContain("nonfinite done"));
     // Nothing was stored by either refusal.
     try expect(mock.componentJson(1, "Stats") == null);
+}
+
+test "bulk stage 3: batch_set refuses numeric strings and non-finite elements before any write" {
+    fresh();
+    // Round-1 review (PR #48): lua_tonumberx would silently coerce a
+    // numeric STRING into the stream, and NaN/Inf would ride straight
+    // into component fields — both now refuse AT THE BINDING, naming the
+    // element, with nothing handed to the host (the json.encode
+    // non-finite policy applied to the stream; ruby's identical gap
+    // retrofits via #45).
+    scripting.registerScript("batch_set_strict",
+        \\local NAMES = { "BatchPos", "BatchVel" }
+        \\function init()
+        \\  local e = Entity.new()
+        \\  e:set("BatchPos", { x = 1, y = 2 })
+        \\  e:set("BatchVel", { vx = 3, vy = 4 })
+        \\  local buf = {}
+        \\  local count = labelle.batch_get(NAMES, buf)
+        \\  buf[2] = "9" -- numeric string: tonumber would take it; we must not
+        \\  local ok, err = pcall(function() labelle.batch_set(NAMES, buf, count) end)
+        \\  if ok then labelle.log("string accepted") else labelle.log("string refused: " .. err) end
+        \\  buf[2] = 0 / 0
+        \\  local ok2, err2 = pcall(function() labelle.batch_set(NAMES, buf, count) end)
+        \\  if ok2 then labelle.log("nan accepted") else labelle.log("nan refused: " .. err2) end
+        \\  buf[2] = math.huge
+        \\  local ok3, err3 = pcall(function() labelle.batch_set(NAMES, buf, count) end)
+        \\  if ok3 then labelle.log("inf accepted") else labelle.log("inf refused: " .. err3) end
+        \\  -- The block-iterator path hits the same guard at commit time:
+        \\  -- the closer's batch_set raises out of the loop.
+        \\  local ok4, err4 = pcall(function()
+        \\    for d in labelle.batch(NAMES) do d.y = 0 / 0 end
+        \\  end)
+        \\  if ok4 then labelle.log("view nan accepted") else labelle.log("view nan refused: " .. err4) end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("string accepted"));
+    try expect(mock.logsContain("string refused: labelle: batch_set: array element 2 is not a number"));
+    try expect(!mock.logsContain("nan accepted"));
+    try expect(mock.logsContain("nan refused: labelle: batch_set: non-finite number at element 2"));
+    try expect(!mock.logsContain("inf accepted"));
+    try expect(mock.logsContain("inf refused: labelle: batch_set: non-finite number at element 2"));
+    try expect(!mock.logsContain("view nan accepted"));
+    try expect(mock.logsContain("view nan refused:"));
+    try expect(mock.logsContain("non-finite number at element 2"));
+    // Every refusal fired BEFORE any host write — both components keep
+    // their original values.
+    try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
+    try expectComponent(1, "BatchVel", "{\"vx\":3,\"vy\":4}");
 }

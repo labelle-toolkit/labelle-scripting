@@ -565,7 +565,10 @@ fn rawBatchGet(L: ?*c.State) callconv(.c) c_int {
 /// is the authoritative float count. Host refusals RAISE — both mean the
 /// write would corrupt data: -2 int-typed field; -1 entity-set drift (the
 /// exact-size preflight; nothing was applied — re-run batch_get and
-/// recompute). A non-number element raises too (loud, never a silent 0).
+/// recompute). A non-number element (numeric strings included — no silent
+/// coercion) and a non-finite number (the json.encode policy, applied at
+/// the binding) raise too, naming the element; in every raise NOTHING was
+/// handed to the host.
 fn rawBatchSet(L: ?*c.State) callconv(.c) c_int {
     // Same comptime if/else gate as rawBatchGet — see the note there.
     if (comptime !contract.host_has_bulk_access) {
@@ -581,11 +584,30 @@ fn rawBatchSet(L: ?*c.State) callconv(.c) c_int {
         var i: usize = 0;
         while (i < nfloats) : (i += 1) {
             _ = c.lua_rawgeti(L, 2, @intCast(i + 1));
-            var isnum: c_int = 0;
-            const f = c.lua_tonumberx(L, -1, &isnum);
-            if (isnum == 0)
-                argError(L, "labelle: batch_set: array elements must be numbers");
+            // A REAL number only — lua_tonumberx would silently coerce a
+            // numeric string ("42") into the stream, and the contract is
+            // loud refusal for non-number elements. The raise names the
+            // (1-based) element; nothing was handed to the host.
+            if (c.lua_type(L, -1) != c.LUA_TNUMBER) raiseFmt(
+                L,
+                "labelle: batch_set: array element {d} is not a number — " ++
+                    "the f32 stream carries numbers only (nothing was written)",
+                .{i + 1},
+            );
+            const f = c.lua_tonumberx(L, -1, null);
             c.lua_settop(L, -2);
+            // Non-finite refusal at the BINDING — the json.encode
+            // "non-finite number" policy applied to the stream: NaN/Inf
+            // must never ride into component fields. Strict from day one
+            // (this API is new in stage 3); ruby's identical gap
+            // retrofits the same binding-level check via #45.
+            if (!std.math.isFinite(f)) raiseFmt(
+                L,
+                "labelle: batch_set: non-finite number at element {d} — the " ++
+                    "f32 stream refuses NaN/Inf, the json.encode non-finite " ++
+                    "policy (nothing was written)",
+                .{i + 1},
+            );
             const f32v: f32 = @floatCast(f);
             std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f32v), .little);
         }
