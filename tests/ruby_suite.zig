@@ -1230,6 +1230,173 @@ test "bulk v1.3: batch_set raises when the entity set changed since batch_get" {
     try expect(mock.logsContain("entity set changed"));
 }
 
+test "bulk stage 2: Labelle.batch block iterator round-trips through ONE reused view" {
+    fresh();
+    scripting.registerScript("batch_block",
+        \\NAMES = ["BatchPos", "BatchVel"].freeze
+        \\def init
+        \\  3.times do |i|
+        \\    e = Labelle::Entity.create
+        \\    e.set("BatchPos", x: i + 1, y: 0)
+        \\    e.set("BatchVel", vx: 10, vy: -10)
+        \\  end
+        \\end
+        \\def update(_dt)
+        \\  same = 0
+        \\  seen = nil
+        \\  n = Labelle.batch(NAMES) do |e|
+        \\    seen ||= e
+        \\    same += 1 if seen.equal?(e) # view REUSE: one object across yields
+        \\    e.x += e.vx
+        \\    e.y += e.vy
+        \\    e.vx = -e.vx if e.x > 12.0  # bounce entity 3 (x reaches 13)
+        \\  end
+        \\  Labelle.log("block n:#{n} same_view:#{same}")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+    // 3 entities, every yield saw the SAME view object, count returned.
+    try expect(mock.logsContain("block n:3 same_view:3"));
+    // The block's writes landed through the one batch_set: accessors
+    // mapped [x, y, vx, vy] exactly as the stream is laid out.
+    try expectComponent(1, "BatchPos", "{\"x\":11,\"y\":-10}");
+    try expectComponent(2, "BatchPos", "{\"x\":12,\"y\":-10}");
+    try expectComponent(3, "BatchPos", "{\"x\":13,\"y\":-10}");
+    try expectComponent(3, "BatchVel", "{\"vx\":-10,\"vy\":-10}");
+    try expectComponent(1, "BatchVel", "{\"vx\":10,\"vy\":-10}");
+    // Second tick rides the CACHED view class — steady state advances
+    // again (entity 3 now moves backward with its flipped vx).
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.logsContain("block n:3 same_view:3"));
+    try expectComponent(1, "BatchPos", "{\"x\":21,\"y\":-20}");
+    try expectComponent(3, "BatchPos", "{\"x\":3,\"y\":-20}");
+}
+
+test "bulk stage 2: Labelle.batch on an empty result never calls the block" {
+    fresh();
+    scripting.registerScript("batch_block_empty",
+        \\def init
+        \\  begin
+        \\    Labelle.batch(["BatchPos", "BatchVel"])
+        \\    Labelle.log("blockless accepted")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("blockless refused: #{ex.message}")
+        \\  end
+        \\  n = Labelle.batch(["BatchPos", "BatchVel"]) { |e| Labelle.log("block ran") }
+        \\  Labelle.log("empty n:#{n}")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // No block is a caller bug — refused up front, even on an empty set.
+    try expect(!mock.logsContain("blockless accepted"));
+    try expect(mock.logsContain("blockless refused: Labelle.batch requires a block"));
+    // No matching entities: 0 returned, the block never ran.
+    try expect(!mock.logsContain("block ran"));
+    try expect(mock.logsContain("empty n:0"));
+}
+
+test "bulk stage 2: Labelle.batch refuses ambiguous and probe-defeating layouts loudly" {
+    fresh();
+    scripting.registerScript("batch_block_refuse",
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  e.set("BatchPos", x: 1, y: 2)
+        \\  e.set("Plain", a: 2.5)
+        \\  # The same component named twice: every field name collides —
+        \\  # the view could not disambiguate e.x, so it must not exist.
+        \\  begin
+        \\    Labelle.batch(["BatchPos", "BatchPos"]) { |v| }
+        \\    Labelle.log("dup accepted")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("dup refused: #{ex.message}")
+        \\  end
+        \\  # "Plain" has no schema — it contributes ZERO stream floats
+        \\  # (the mock's stand-in for a non-scalar component) while its
+        \\  # JSON shows a number, so the derived layout cannot match the
+        \\  # stream stride. The cross-check must refuse, never mis-map.
+        \\  begin
+        \\    Labelle.batch(["BatchPos", "Plain"]) { |v| }
+        \\    Labelle.log("mismatch accepted")
+        \\  rescue RuntimeError => ex
+        \\    Labelle.log("mismatch refused: #{ex.message}")
+        \\  end
+        \\  Labelle.log("still alive")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("dup accepted"));
+    try expect(mock.logsContain("dup refused:"));
+    try expect(mock.logsContain("appears in more than one named component"));
+    try expect(!mock.logsContain("mismatch accepted"));
+    try expect(mock.logsContain("mismatch refused:"));
+    try expect(mock.logsContain("does not match the host stream"));
+    // Both raises are catchable; nothing was written through either.
+    try expect(mock.logsContain("still alive"));
+    try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
+}
+
+test "bulk stage 2: Labelle.batch surfaces batch_get's raise and a raising block writes NOTHING" {
+    fresh();
+    scripting.registerScript("batch_block_errors",
+        \\NAMES = ["BatchPos", "BatchVel"].freeze
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  e.set("BatchPos", x: 5, y: 6)
+        \\  e.set("BatchVel", vx: 1, vy: 1)
+        \\  # A raising block abandons the WHOLE batch: batch_set never
+        \\  # runs, so the mutation before the raise is not applied.
+        \\  begin
+        \\    Labelle.batch(NAMES) do |v|
+        \\      v.x = 999.0
+        \\      raise "boom"
+        \\    end
+        \\    Labelle.log("raise swallowed")
+        \\  rescue RuntimeError => ex
+        \\    Labelle.log("block raised: #{ex.message}")
+        \\  end
+        \\  # Unsupported-host parity: Labelle.batch's first act IS
+        \\  # batch_get, so a host without batch support surfaces the
+        \\  # exact same raise. Prove the pass-through (and that batch_set
+        \\  # is never reached) by stubbing batch_get to raise the
+        \\  # pre-v1.3 message verbatim.
+        \\  def Labelle.batch_get(_names, _arr)
+        \\    raise RuntimeError, "labelle: batch_get — the host engine lacks batch support " \
+        \\                        "(script contract v1.3 needs labelle-engine >= 2.6.0); " \
+        \\                        "use per-entity get/set on this engine"
+        \\  end
+        \\  def Labelle.batch_set(_names, _arr, _n)
+        \\    Labelle.log("batch_set reached")
+        \\  end
+        \\  begin
+        \\    Labelle.batch(NAMES) { |v| Labelle.log("block ran on old host") }
+        \\    Labelle.log("old host accepted")
+        \\  rescue RuntimeError => ex
+        \\    Labelle.log("old host refused: #{ex.message}")
+        \\  end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // The block's raise propagated and nothing was written.
+    try expect(!mock.logsContain("raise swallowed"));
+    try expect(mock.logsContain("block raised: boom"));
+    try expectComponent(1, "BatchPos", "{\"x\":5,\"y\":6}");
+    // The unsupported-host raise passed through IDENTICALLY; the block
+    // never ran and batch_set was never reached.
+    try expect(!mock.logsContain("old host accepted"));
+    try expect(!mock.logsContain("block ran on old host"));
+    try expect(!mock.logsContain("batch_set reached"));
+    try expect(mock.logsContain("old host refused: labelle: batch_get — the host engine lacks batch support"));
+}
+
 test "bulk v1.3: an unrepresentable packed value falls back to JSON end-to-end" {
     fresh();
     // score is an i64 in the mock's Stats schema; a Ruby Float 1.0e30 is

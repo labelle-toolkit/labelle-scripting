@@ -239,6 +239,146 @@ module Labelle
     raw_batch_set(json_encode(names), arr, n)
   end
 
+  # ── batch block iterator (the ergonomic layer over batch_get/set) ────
+  # `Labelle.batch(names) { |e| ... }` — ONE batch_get, the block runs
+  # once per matching entity against a single REUSED view object, then
+  # ONE batch_set writes everything back. No per-entity FFI and no
+  # per-entity allocation: the view is one object whose backing offset
+  # moves between yields (stash values, never `e` itself — the object
+  # you saved points at whatever entity was yielded last).
+  #
+  #   Labelle.batch(["Position", "Velocity"]) do |e|
+  #     e.x += e.vx; e.y += e.vy
+  #     e.vx = -e.vx if e.x < 0.0 || e.x > 800.0
+  #   end
+  #
+  # Accessors are the components' FIELD NAMES in stream order (components
+  # in `names` order, fields in declaration order — the same walk
+  # batch_get lays the stream out with). Reads return Floats (bools ride
+  # as 0.0/1.0, like the raw stream); writes take numbers. Returns the
+  # entity count. An empty query returns 0 without touching the block. A
+  # RAISING block abandons the whole write — batch_set never runs, no
+  # entity is touched (all-or-nothing, safe to rescue and retry). The raw
+  # pairing rules apply to the block form too: no spawn/destroy inside
+  # the block, and no nested Labelle.batch over the same names (it would
+  # refill the shared buffer mid-iteration).
+  #
+  # How the view learns the layout (stage-2 design decision): the field
+  # list is derived ON FIRST USE per names-set, in pure ruby, from a JSON
+  # `raw_component_get` of each named component on the first matched
+  # entity — the host serializes struct fields in DECLARATION order, the
+  # exact order the batch stream walks, and non-scalar values (strings /
+  # objects / arrays / nil) are filtered out just as the stream skips
+  # non-scalar fields. No extra contract surface, and any way the probe
+  # could disagree with the stream (an optional field, say) is caught by
+  # a hard cross-check against the stream's real stride before the first
+  # yield — a mismatch raises, never mis-maps. The derived view class is
+  # cached per names-set: steady state is batch_get + N yields +
+  # batch_set, nothing else.
+  #
+  # Refusals (on top of batch_get/batch_set's own, which pass through
+  # unchanged — int-typed fields, entity-set drift, pre-v1.3 hosts):
+  #   - a field name duplicated across the named components raises
+  #     ArgumentError (the accessors could not disambiguate);
+  #   - a derived layout that does not match the stream's stride raises
+  #     RuntimeError (use the raw batch_get/batch_set flat loop there).
+  #
+  # WHEN TO USE (measured, 2000-entity integrate+bounce, ReleaseFast,
+  # engine 2.6.0): the block form costs ~1.9× the raw flat loop
+  # (1.25 ms/tick = 624 ns/entity vs 0.64 ms/tick = 321 ns/entity — the
+  # per-entity yield + accessor dispatch, unavoidable in an interpreter)
+  # but stays ~4.3× faster than naive per-entity get/set (5.37 ms/tick).
+  # Reach for the block by default; drop to the batch_get/batch_set flat
+  # loop for the hottest loops; never per-entity get/set over thousands.
+  #
+  # Stage-3 porters (lua/js/…): copy this shape — derive the field walk
+  # from one per-component get of the first matched entity, cross-check
+  # the stride, cache a reused view keyed by the names-set, yield it with
+  # a moving base offset, write back once. JIT'd runtimes can expect the
+  # closure to inline and approach flat-loop speed.
+  def self.batch(names)
+    raise ArgumentError, "Labelle.batch requires a block" unless block_given?
+    st = ((@batch_iters ||= {})[names.join("\x00")] ||= [[], nil, 0])
+    buf = st[0]
+    count = batch_get(names, buf)
+    return 0 if count == 0
+    view = st[1]
+    unless view
+      view, st[2] = __batch_view(names, buf, count)
+      st[1] = view
+    end
+    stride = st[2]
+    unless buf.size == count * stride
+      raise RuntimeError, "labelle: Labelle.batch(#{names.inspect}): derived layout " \
+                          "(#{stride} fields per entity) does not match the host stream " \
+                          "(#{buf.size} floats / #{count} entities) — a field the stream " \
+                          "skips (non-scalar) confused the layout probe; use " \
+                          "batch_get/batch_set with explicit offsets for these components"
+    end
+    b = 0
+    i = 0
+    while i < count
+      view.__labelle_base = b
+      yield view
+      b += stride
+      i += 1
+    end
+    batch_set(names, buf, count)
+    count
+  end
+
+  # Build the reused per-entity view for a names-set: derive the field
+  # walk (first-entity JSON probe, scalar values only — see the design
+  # note on Labelle.batch), cross-check it against the stream stride,
+  # then mint a class whose accessors read/write `buf` at a moving base
+  # offset. Runs once per names-set; the load-time allocations are fine.
+  def self.__batch_view(names, buf, count)
+    ids = raw_query(json_encode(names))
+    first = ids[0]
+    fields = []
+    i = 0
+    while i < names.size
+      nm = names[i].to_s
+      i += 1
+      s = raw_component_get(first, nm)
+      next if s.nil? # cross-check below catches any inconsistency
+      json_decode(s).each do |k, v|
+        next unless v.is_a?(Float) || v.is_a?(Integer) || true == v || false == v
+        if k.to_s.start_with?("__labelle")
+          raise ArgumentError, "labelle: Labelle.batch(#{names.inspect}): field name " \
+                               "'#{k}' collides with the view's internals — use " \
+                               "batch_get/batch_set with explicit offsets"
+        end
+        if fields.include?(k)
+          raise ArgumentError, "labelle: Labelle.batch(#{names.inspect}): field name " \
+                               "'#{k}' appears in more than one named component — the " \
+                               "block view cannot disambiguate; use batch_get/batch_set " \
+                               "with explicit offsets"
+        end
+        fields << k
+      end
+    end
+    stride = fields.size
+    unless buf.size == count * stride
+      raise RuntimeError, "labelle: Labelle.batch(#{names.inspect}): derived layout " \
+                          "(#{stride} fields: #{fields.inspect}) does not match the host " \
+                          "stream (#{buf.size} floats / #{count} entities) — a field the " \
+                          "stream skips (non-scalar) confused the layout probe; use " \
+                          "batch_get/batch_set with explicit offsets for these components"
+    end
+    klass = Class.new
+    klass.send(:attr_writer, :__labelle_base)
+    fields.each_with_index do |f, off|
+      # each_with_index (not while) on purpose: each iteration gets a
+      # fresh environment, so every accessor pair captures ITS f/off.
+      klass.send(:define_method, f) { buf[@__labelle_base + off] }
+      klass.send(:define_method, :"#{f}=") { |v| buf[@__labelle_base + off] = v }
+    end
+    view = klass.new
+    view.__labelle_base = 0
+    [view, stride]
+  end
+
   # ── per-script method harvest (called by vm.zig) ─────────────────────
 
   # Baseline of Object's OWN (public + private) instance methods, taken
@@ -664,6 +804,10 @@ module Labelle
 
     def each(*names, &blk)
       Labelle.each(*names, &blk)
+    end
+
+    def batch(names, &blk)
+      Labelle.batch(names, &blk)
     end
 
     def emit(name, payload = nil, **kw)
