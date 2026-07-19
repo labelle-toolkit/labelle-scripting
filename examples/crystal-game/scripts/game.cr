@@ -64,6 +64,10 @@
 #                                     grew — the grow-once discipline
 #                                     (gc_churn.cr's pin, rehearsed over a
 #                                     real game frame)
+#           CRYSTAL_BATCH_OK_3_13.5   the batched swarm (scripts/swarm.cr):
+#                                     3 boids × 5 ticks of x += 0.5 through
+#                                     ONE batch_get + ONE batch_set per
+#                                     tick (contract v1.3 — engine ≥ 2.6.0)
 #   deinit  CRYSTAL_CTRL_DONE        hunger system (reverse registration)
 #           CRYSTAL_DEINIT           spawner
 #
@@ -74,6 +78,7 @@
 
 require "./hunger"
 require "./spawner"
+require "./swarm"
 
 module Game
   # The game registration entry point (the game's `scripts/game.cr`,
@@ -83,6 +88,10 @@ module Game
   def self.register(scripts : Labelle::Scripts) : Nil
     scripts.add "spawner", Spawner.new
     scripts.add "hunger", HungerSystem.new
+    # The bulk-access swarm (contract v1.3, labelle-scripting#44) —
+    # registers LAST so its per-tick token lands after the hunger
+    # system's; see scripts/swarm.cr for the batch-block story.
+    scripts.add "swarm", Swarm.new
   end
 
   # ── Shared payload parsing ──────────────────────────────────────────

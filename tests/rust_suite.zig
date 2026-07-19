@@ -309,6 +309,129 @@ test "console eval is a documented refusal for native-compiled rust" {
     try expect(std.mem.indexOf(u8, parsed.value.@"error", "native-compiled") != null);
 }
 
+test "bulk v1.3: packed codec round-trips typed views, JSON stays the fallback" {
+    fresh();
+    selectScenario("bulk_packed");
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Every field kind survived the binary round-trip (f32/i64/bool/u64).
+    try expect(mock.logsContain("rust: packed:1.5:-42:true:123"));
+    // The stored JSON is in the mock's SCHEMA order (power,score,alive,
+    // seed) — the packed set wrote it. The JSON fallback sorts keys
+    // (alive,power,score,seed), so key order proves the path taken.
+    try expectComponent(1, "Stats", "{\"power\":1.5,\"score\":-42,\"alive\":true,\"seed\":123}");
+    // The schema-less component round-trips through JSON — with SORTED
+    // keys (single key here; the log proves the value came back).
+    try expect(mock.logsContain("rust: plain:2.5"));
+    // JSON-fallback coercion (round 1): whole-number floats are spelled
+    // as int-class tokens (`{"a":2}` — by the host AND by our own
+    // fallback encoder) and must still land in the f32 view field.
+    try expect(mock.logsContain("rust: plain int:2"));
+    try expect(mock.logsContain("rust: plain whole:3"));
+    try expectComponent(1, "Plain", "{\"a\":3}");
+    // A bit-63 u64 rides tag 3 bit-exact (rust has a real u64); the
+    // host stored the unsigned value via the packed path (schema-order
+    // keys again).
+    try expect(mock.logsContain("rust: u64rt:true"));
+    try expectComponent(2, "Stats", "{\"power\":0,\"score\":0,\"alive\":false,\"seed\":9223372036854775809}");
+    // Non-finite policy: NaN refused up front — nothing stored.
+    try expect(mock.logsContain("rust: nan_refused:true"));
+    try expect(mock.componentJson(3, "Stats") == null);
+    // Absent components answer false through both routes.
+    try expect(mock.logsContain("rust: absent:true"));
+}
+
+test "bulk v1.3: batch_get/batch_set round-trip the whole query as one f32 stream" {
+    fresh();
+    selectScenario("bulk_batch");
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Int-carrying components refused LOUDLY on both directions — as
+    // Err values, the rust spelling of ruby's ArgumentError raise.
+    try expect(mock.logsContain("rust: get int refused:true"));
+    try expect(mock.logsContain("rust: set int refused:true"));
+
+    scripting.Controller.tick(.{}, 0.016);
+    // 3 matching entities (the lone BatchPos-only one filtered out),
+    // stride 4 → exactly 12 floats crossed.
+    try expect(mock.logsContain("rust: batch count:3 floats:12"));
+    try expectComponent(1, "BatchPos", "{\"x\":11,\"y\":-10}");
+    try expectComponent(2, "BatchPos", "{\"x\":12,\"y\":-10}");
+    try expectComponent(3, "BatchPos", "{\"x\":13,\"y\":-10}");
+    // Second tick reuses the same buffers and advances again.
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "BatchPos", "{\"x\":21,\"y\":-20}");
+    try expectComponent(3, "BatchPos", "{\"x\":23,\"y\":-20}");
+    // The filtered-out entity was never rewritten.
+    try expectComponent(4, "BatchPos", "{\"x\":7,\"y\":8}");
+}
+
+test "bulk v1.3: batch_set errors when the entity set changed since batch_get" {
+    fresh();
+    selectScenario("bulk_stale");
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+    // The exact-size positional-coupling guard fired and surfaced as
+    // Err(EntitySetChanged) — safe to catch and re-get.
+    try expect(mock.logsContain("rust: stale refused:true"));
+    // NOTHING was applied: the survivor keeps its batch_get-era value.
+    try expectComponent(1, "BatchPos", "{\"x\":0,\"y\":0}");
+}
+
+test "bulk stage 3: the typed closure tier round-trips through batch2" {
+    fresh();
+    selectScenario("bulk_iter");
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.logsContain("rust: iter n:3"));
+    // The closure's writes landed through the one batch_set — typed
+    // views mapped [x, y | vx, vy] exactly as the stream lays out.
+    try expectComponent(1, "BatchPos", "{\"x\":11,\"y\":-10}");
+    try expectComponent(2, "BatchPos", "{\"x\":12,\"y\":-10}");
+    try expectComponent(3, "BatchPos", "{\"x\":13,\"y\":-10}");
+    try expectComponent(3, "BatchVel", "{\"vx\":-10,\"vy\":-10}");
+    try expectComponent(1, "BatchVel", "{\"vx\":10,\"vy\":-10}");
+    // Second tick is steady state (entity 3 moves backward, bounced).
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "BatchPos", "{\"x\":21,\"y\":-20}");
+    try expectComponent(3, "BatchPos", "{\"x\":3,\"y\":-20}");
+}
+
+test "bulk stage 3: closure-tier exit semantics — early exit commits, panic aborts" {
+    fresh();
+    selectScenario("bulk_iter_edge");
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Empty query: Ok(0), the closure never ran.
+    try expect(mock.logsContain("rust: empty n:0"));
+    try expect(!mock.logsContain("rust: empty ran"));
+    // Early exit (batch2_while → false) after mutating entity 1 only:
+    // its write COMMITTED, not-yet-visited entities round-tripped
+    // unchanged.
+    try expect(mock.logsContain("rust: while n:3"));
+    try expectComponent(1, "BatchPos", "{\"x\":11,\"y\":0}");
+    try expectComponent(2, "BatchPos", "{\"x\":2,\"y\":0}");
+    try expectComponent(3, "BatchPos", "{\"x\":3,\"y\":0}");
+    // The panicking closure aborted the whole write (x stays 11, the
+    // 999 never landed) — and the panic never crossed the FFI boundary.
+    try expect(mock.logsContain("rust: panic aborted:true"));
+    // Duplicate component names refused before any host call (the 555
+    // never landed — x still 11).
+    try expect(mock.logsContain("rust: dup refused:true"));
+    // Layout mismatch (a zero-stream-float component vs a one-field
+    // view) refused before any closure call.
+    try expect(mock.logsContain("rust: mismatch refused:true"));
+    try expect(!mock.logsContain("rust: mismatch ran"));
+    try expectComponent(4, "BatchPos", "{\"x\":50,\"y\":0}");
+}
+
 test "registered sources are refused loudly — rust code arrives compiled, not as text" {
     fresh();
     scripting.registerScript("stray", "fn update() {}");

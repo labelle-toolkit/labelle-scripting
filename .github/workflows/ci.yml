@@ -723,6 +723,7 @@ jobs:
           RUST_LEVEL_0.125
           RUST_STARVING
           RUST_BUFFERS_OK
+          RUST_BATCH_OK_3_13.5
           RUST_CTRL_DONE
           RUST_DEINIT
           END
@@ -744,7 +745,7 @@ jobs:
       # by deletion: scratch-copy the example, rm -rf the copy's hooks/,
       # regenerate + rebuild + rerun. The copy is a ZERO-.zig game
       # (asserted), the generated main folds no FeedWatcher, and the
-      # transcript is the SAME 15-token run minus exactly ZIG_FEED_SEEN_0.5 —
+      # transcript is the SAME 16-token run minus exactly ZIG_FEED_SEEN_0.5 —
       # nothing else moves, so the native Zig layer is demonstrably additive,
       # never load-bearing. Reuses the main step's warm package/zig caches
       # (same redirected HOME + rustup/cargo homes).
@@ -819,6 +820,7 @@ jobs:
           RUST_LEVEL_0.125
           RUST_STARVING
           RUST_BUFFERS_OK
+          RUST_BATCH_OK_3_13.5
           RUST_CTRL_DONE
           RUST_DEINIT
           END
@@ -1137,6 +1139,7 @@ jobs:
           CRYSTAL_LEVEL_0.125
           CRYSTAL_STARVING
           CRYSTAL_BUFFERS_OK
+          CRYSTAL_BATCH_OK_3_13.5
           CRYSTAL_CTRL_DONE
           CRYSTAL_DEINIT
           END
@@ -1158,7 +1161,7 @@ jobs:
       # deletion: scratch-copy the example, rm -rf the copy's hooks/,
       # regenerate + rebuild + rerun. The copy is a ZERO-.zig game (asserted),
       # the generated main folds no FeedWatcher, and the transcript is the SAME
-      # 15-token run minus exactly ZIG_FEED_SEEN_0.5 — nothing else moves, so
+      # 16-token run minus exactly ZIG_FEED_SEEN_0.5 — nothing else moves, so
       # the native Zig layer is demonstrably additive, never load-bearing.
       # Reuses the main step's warm package/zig caches (same redirected HOME).
       - name: Purity variant — delete hooks/, rerun 100% crystal
@@ -1231,6 +1234,7 @@ jobs:
           CRYSTAL_LEVEL_0.125
           CRYSTAL_STARVING
           CRYSTAL_BUFFERS_OK
+          CRYSTAL_BATCH_OK_3_13.5
           CRYSTAL_CTRL_DONE
           CRYSTAL_DEINIT
           END
@@ -1481,6 +1485,7 @@ jobs:
           CS_LEVEL_0.375
           CS_LEVEL_0.125
           CS_STARVING
+          CS_BATCH_OK_3_13.5
           CS_CTRL_DONE
           CS_DEINIT
           END

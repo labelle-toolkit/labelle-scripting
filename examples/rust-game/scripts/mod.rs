@@ -58,6 +58,10 @@
 //!           RUST_BUFFERS_OK       warmed reused buffers never grew —
 //!                                  rust's FrameArray equivalent is
 //!                                  `Vec::clear` retaining capacity
+//!           RUST_BATCH_OK_3_13.5   the batched swarm (scripts/swarm.rs):
+//!                                  3 boids × 5 ticks of x += 0.5 through
+//!                                  ONE batch_get + ONE batch_set per tick
+//!                                  (contract v1.3 — needs engine ≥ 2.6.0)
 //!   deinit  RUST_CTRL_DONE        hunger system (reverse registration)
 //!           RUST_DEINIT           spawner
 //!
@@ -70,6 +74,7 @@ use crate::labelle::Scripts;
 
 mod hunger;
 mod spawner;
+mod swarm;
 
 /// The game registration entry point (the game's `scripts/mod.rs`,
 /// staged as `native/src/game/mod.rs` — see the plugin README's rust
@@ -77,6 +82,10 @@ mod spawner;
 pub fn register(scripts: &mut Scripts) {
     scripts.add("spawner", Box::new(spawner::Spawner::default()));
     scripts.add("hunger", Box::new(hunger::HungerSystem::default()));
+    // The bulk-access swarm (contract v1.3, labelle-scripting#44) —
+    // registers LAST so its per-tick token lands after the hunger
+    // system's; see scripts/swarm.rs for the batch-iterator story.
+    scripts.add("swarm", Box::new(swarm::Swarm::default()));
 }
 
 // ── Shared payload parsing ──────────────────────────────────────────────
