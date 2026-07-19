@@ -54,6 +54,24 @@ class PackedRt < Labelle::Script
     raise "plain get_into failed" unless Labelle.get_into(e1, p2, @scratch)
     Labelle.log("crystal: plain:#{p2.a}")
 
+    # JSON-fallback coercion (round 1): a whole-number float is spelled
+    # `2` by the host's serializer — an int-class token — and must
+    # still land in the f32 view field on the fallback path.
+    raise "int set failed" unless Labelle.set_component(e1, "Plain", %({"a":2}))
+    p3 = PlainView.new
+    raise "plain int get_into failed" unless Labelle.get_into(e1, p3, @scratch)
+    Labelle.log("crystal: plain int:#{p3.a}")
+
+    # Whole-number set_from -> get_into round trip (crystal's own
+    # encoder spells 3.0 with the ".0", but the host may re-serialize
+    # integrally — either spelling must land).
+    whole = PlainView.new
+    whole.a = 3.0_f32
+    raise "whole set refused" unless Labelle.set_from(e1, whole)
+    p4 = PlainView.new
+    raise "whole get_into failed" unless Labelle.get_into(e1, p4, @scratch)
+    Labelle.log("crystal: plain whole:#{p4.a}")
+
     # Entity 2: crystal has a REAL UInt64, so a bit-63 seed rides tag 3
     # bit-exact — no signed detour.
     e2 = Labelle.create_entity
@@ -215,6 +233,18 @@ class BatchIterEdge < Labelle::Script
       Labelle.log("crystal: raise swallowed")
     rescue ex
       Labelle.log("crystal: block raised: #{ex.message}")
+    end
+
+    # DUPLICATE COMPONENT NAMES: two copies of the same fields per row
+    # would let the unchanged copy overwrite the other's writes —
+    # refused before any host call, nothing written.
+    begin
+      Labelle.batch(PosView, PosView) do |p, _q|
+        p.x = 555.0_f32
+      end
+      Labelle.log("crystal: dup accepted")
+    rescue ex : ArgumentError
+      Labelle.log("crystal: dup refused: #{ex.message}")
     end
 
     # NESTED batch calls alias the shared stream buffer — refused.

@@ -239,6 +239,76 @@ public readonly struct Scalar
     public long AsI64 => _bits;
     public ulong AsU64 => unchecked((ulong)_bits);
     public bool AsBool => _bits != 0;
+
+    // ── cross-class coercion (the JSON-fallback contract) ────────────
+    // The JSON route types number tokens by SHAPE — `1` classifies as an
+    // int even when the target field is f32, and both the host's
+    // serializer and our own JSON-fallback encoder spell whole-number
+    // floats that way. Views should assign through these Try* accessors
+    // (see the IPackedView doc): int classes always land in a float
+    // field (the host parser's own rounding); a FLOAT class lands in an
+    // int field only when EXACT (finite, integral, in range — mirroring
+    // the packed SET refusal rules); false = skip the field, keeping its
+    // value. The 64-bit pair keeps its two's-complement bitcast.
+
+    public bool TryF32(out float v)
+    {
+        switch (Tag)
+        {
+            case Kind.F32: v = _f; return true;
+            case Kind.I64: v = _bits; return true;
+            case Kind.U64: v = unchecked((ulong)_bits); return true;
+            default: v = 0; return false;
+        }
+    }
+
+    public bool TryI64(out long v)
+    {
+        switch (Tag)
+        {
+            case Kind.I64:
+            case Kind.U64: // the bitcast pair
+                v = _bits;
+                return true;
+            case Kind.F32:
+                if (float.IsFinite(_f) && _f == MathF.Truncate(_f) &&
+                    _f >= -9223372036854775808f && _f < 9223372036854775808f)
+                {
+                    v = (long)_f;
+                    return true;
+                }
+                v = 0;
+                return false;
+            default: v = 0; return false;
+        }
+    }
+
+    public bool TryU64(out ulong v)
+    {
+        switch (Tag)
+        {
+            case Kind.U64:
+            case Kind.I64: // the bitcast pair
+                v = unchecked((ulong)_bits);
+                return true;
+            case Kind.F32:
+                if (float.IsFinite(_f) && _f == MathF.Truncate(_f) &&
+                    _f >= 0f && _f < 18446744073709551616f)
+                {
+                    v = (ulong)_f;
+                    return true;
+                }
+                v = 0;
+                return false;
+            default: v = 0; return false;
+        }
+    }
+
+    public bool TryBool(out bool v)
+    {
+        v = _bits != 0;
+        return Tag == Kind.Bool;
+    }
 }
 
 /// <summary>
@@ -264,10 +334,12 @@ public interface IFieldSink
 /// </code>
 /// <see cref="Labelle.GetInto{T}"/> / <see cref="Labelle.SetFrom{T}"/> drive
 /// the two methods; both are mechanical (compare the wire name, assign /
-/// emit each field in declaration order). C# has real long/ulong, so the
-/// codec's 64-bit two's-complement bitcast pair applies directly — assign
-/// <c>v.AsU64</c> in a ulong field whatever 64-bit tag arrived (and
-/// vice versa); <see cref="Scalar"/> carries the bits losslessly.
+/// emit each field in declaration order). ASSIGN THROUGH THE
+/// <c>Try*</c> ACCESSORS (<c>if (v.TryF32(out var f)) Power = f;</c>):
+/// they implement the documented cross-class coercion — the JSON
+/// fallback types whole-number floats as int-class tokens, which must
+/// still land in float fields — and the codec's 64-bit two's-complement
+/// bitcast pair (a ulong field accepts either 64-bit tag bit-exact).
 /// </summary>
 public interface IPackedView
 {
@@ -281,8 +353,8 @@ public interface IPackedView
 
 /// <summary>
 /// A typed per-entity view over the batch stream (contract v1.3) — a
-/// FLOAT-ONLY <c>struct</c> (bools ride as 0/1 floats) whose sequential
-/// fields mirror the component's declaration order:
+/// struct of FLOAT FIELDS ONLY whose sequential fields mirror the
+/// component's declaration order:
 /// <code>
 /// struct Pos : IBatchComponent { public float X, Y; public static string Name => "Pos"; }
 /// </code>
@@ -290,6 +362,11 @@ public interface IPackedView
 /// <c>ref</c>s of these structs (zero copy, write-through — the RFC's
 /// ref-struct/Span enumeration), so the struct's size IS the declared
 /// stride, cross-checked against the host stream before the first call.
+/// FLOAT-ONLY is enforced (a cached reflection check; the rust macro's
+/// compile-time restriction, C#-spelled): a 1-byte CLR bool or an int
+/// overlaid on a 4-byte float slot would read/write garbage — keep
+/// bool/int-carrying components on the packed per-entity paths, or
+/// model a flag as a float field compared against 0.
 /// </summary>
 public interface IBatchComponent
 {
@@ -603,6 +680,8 @@ public static unsafe class Labelle
     /// </summary>
     public static bool GetInto<T>(EntityId id, T view, ref byte[] scratch) where T : IPackedView
     {
+        ArgumentNullException.ThrowIfNull(view);
+        ArgumentNullException.ThrowIfNull(scratch);
         var nb = PackedName<T>.Utf8;
         nuint n;
         fixed (byte* np = nb)
@@ -640,6 +719,7 @@ public static unsafe class Labelle
     /// </summary>
     public static bool SetFrom<T>(EntityId id, T view) where T : IPackedView
     {
+        ArgumentNullException.ThrowIfNull(view);
         var sink = _collect ??= new CollectSink();
         sink.Fields.Clear();
         view.EachField(sink);
@@ -931,6 +1011,8 @@ public static unsafe class Labelle
     /// </summary>
     public static int BatchGet(string namesJson, ref float[] buf, out int floatCount)
     {
+        ArgumentNullException.ThrowIfNull(namesJson);
+        ArgumentNullException.ThrowIfNull(buf);
         floatCount = 0;
         if (!BulkAccess) ThrowBatchUnsupported();
         var scratch = _packedScratch ??= new byte[4096];
@@ -973,6 +1055,8 @@ public static unsafe class Labelle
     /// </summary>
     public static void BatchSet(string namesJson, float[] buf, int floatCount)
     {
+        ArgumentNullException.ThrowIfNull(namesJson);
+        ArgumentNullException.ThrowIfNull(buf);
         if (!BulkAccess) ThrowBatchUnsupported();
         var scratch = _packedScratch ??= new byte[4096];
         if (scratch.Length < floatCount * 4) scratch = _packedScratch = new byte[floatCount * 4];
@@ -1020,6 +1104,7 @@ public static unsafe class Labelle
     public static int Batch<T1>(BatchAction<T1> f)
         where T1 : unmanaged, IBatchComponent
     {
+        ArgumentNullException.ThrowIfNull(f);
         return BatchWhile<T1>((ref T1 a) =>
         {
             f(ref a);
@@ -1033,6 +1118,7 @@ public static unsafe class Labelle
     public static int BatchWhile<T1>(BatchFunc<T1> f)
         where T1 : unmanaged, IBatchComponent
     {
+        ArgumentNullException.ThrowIfNull(f);
         var s1 = ViewStride<T1>();
         return BatchCore(BatchNames<T1>.Text, s1, (span, stride, count) =>
         {
@@ -1051,6 +1137,7 @@ public static unsafe class Labelle
         where T1 : unmanaged, IBatchComponent
         where T2 : unmanaged, IBatchComponent
     {
+        ArgumentNullException.ThrowIfNull(f);
         return BatchWhile<T1, T2>((ref T1 a, ref T2 b) =>
         {
             f(ref a, ref b);
@@ -1064,6 +1151,17 @@ public static unsafe class Labelle
         where T1 : unmanaged, IBatchComponent
         where T2 : unmanaged, IBatchComponent
     {
+        ArgumentNullException.ThrowIfNull(f);
+        // Duplicate component names would put two copies of the same
+        // fields in every row and let the unchanged copy overwrite the
+        // other's writes on the positional write-back — refuse before
+        // any host call (the ruby block tier's duplicate-name refusal,
+        // one level up).
+        if (T1.Name == T2.Name)
+            throw new ArgumentException(
+                $"labelle: Batch: component '{T1.Name}' is named by both views — the " +
+                "stream would carry two copies per entity and the write-back would " +
+                "silently lose one's writes; batch each component once");
         var s1 = ViewStride<T1>();
         var s2 = ViewStride<T2>();
         return BatchCore(BatchNames<T1, T2>.Text, s1 + s2, (span, stride, count) =>
@@ -1079,17 +1177,57 @@ public static unsafe class Labelle
 
     private delegate void BatchRowLoop(Span<float> span, int stride, int count);
 
-    /// <summary>A view struct's stride in stream floats — its size, which
-    /// must be whole floats (float-only sequential fields; bools ride as
-    /// 0/1 floats). Throws on a struct the stream cannot back.</summary>
+    /// <summary>
+    /// Per-view-type validation + stride, computed ONCE per generic
+    /// instantiation: a batch view must be a sequential struct of FLOAT
+    /// FIELDS ONLY — the rows are reinterpreted in place over the f32
+    /// stream (zero copy), so any other field type (a 1-byte CLR bool,
+    /// an int) would read/write raw float bits as garbage. This is the
+    /// same restriction rust enforces at compile time (its macro has no
+    /// non-float arm); C# spells it as a cached reflection check.
+    /// Bool-carrying components stay on the packed per-entity paths (or
+    /// model the flag as a float field and compare against 0).
+    /// </summary>
+    private static class ViewInfo<T> where T : unmanaged, IBatchComponent
+    {
+        public static readonly int Stride;
+        public static readonly string? Error;
+
+        static ViewInfo()
+        {
+            var fields = typeof(T).GetFields(
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance);
+            foreach (var f in fields)
+            {
+                if (f.FieldType != typeof(float))
+                {
+                    Error = $"labelle: batch view '{typeof(T).Name}' ({T.Name}) field " +
+                        $"'{f.Name}' is {f.FieldType.Name} — batch views must be float-only " +
+                        "structs (the rows are reinterpreted zero-copy over the f32 stream); " +
+                        "keep bool/int-carrying components on the packed per-entity paths";
+                    return;
+                }
+            }
+            var size = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+            if (fields.Length == 0 || size != fields.Length * 4)
+            {
+                Error = $"labelle: batch view '{typeof(T).Name}' ({T.Name}) has " +
+                    (fields.Length == 0
+                        ? "no fields — a marker view has nothing to iterate; filter marker " +
+                          "components through the raw BatchGet names instead"
+                        : "padding the stream cannot back (sequential float fields only)");
+                return;
+            }
+            Stride = size / 4;
+        }
+    }
+
     private static int ViewStride<T>() where T : unmanaged, IBatchComponent
     {
-        var size = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
-        if (size % 4 != 0)
-            throw new BatchRefusedException(
-                $"labelle: batch view '{typeof(T).Name}' ({T.Name}) is not float-sized " +
-                "(views must be sequential float-only structs; bools ride as 0/1 floats)");
-        return size / 4;
+        if (ViewInfo<T>.Error is { } err) throw new BatchRefusedException(err);
+        return ViewInfo<T>.Stride;
     }
 
     private static int BatchCore(string namesJson, int stride, BatchRowLoop loop)

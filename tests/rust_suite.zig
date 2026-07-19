@@ -324,7 +324,12 @@ test "bulk v1.3: packed codec round-trips typed views, JSON stays the fallback" 
     // The schema-less component round-trips through JSON — with SORTED
     // keys (single key here; the log proves the value came back).
     try expect(mock.logsContain("rust: plain:2.5"));
-    try expectComponent(1, "Plain", "{\"a\":2.5}");
+    // JSON-fallback coercion (round 1): whole-number floats are spelled
+    // as int-class tokens (`{"a":2}` — by the host AND by our own
+    // fallback encoder) and must still land in the f32 view field.
+    try expect(mock.logsContain("rust: plain int:2"));
+    try expect(mock.logsContain("rust: plain whole:3"));
+    try expectComponent(1, "Plain", "{\"a\":3}");
     // A bit-63 u64 rides tag 3 bit-exact (rust has a real u64); the
     // host stored the unsigned value via the packed path (schema-order
     // keys again).
@@ -417,6 +422,9 @@ test "bulk stage 3: closure-tier exit semantics — early exit commits, panic ab
     // The panicking closure aborted the whole write (x stays 11, the
     // 999 never landed) — and the panic never crossed the FFI boundary.
     try expect(mock.logsContain("rust: panic aborted:true"));
+    // Duplicate component names refused before any host call (the 555
+    // never landed — x still 11).
+    try expect(mock.logsContain("rust: dup refused:true"));
     // Layout mismatch (a zero-stream-float component vs a one-field
     // view) refused before any closure call.
     try expect(mock.logsContain("rust: mismatch refused:true"));

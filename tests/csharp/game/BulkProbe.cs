@@ -25,12 +25,14 @@ internal sealed class StatsView : IPackedView
 
     public bool SetField(ReadOnlySpan<byte> name, in Scalar v)
     {
-        if (name.SequenceEqual("power"u8)) { Power = v.AsF32; return true; }
-        if (name.SequenceEqual("score"u8)) { Score = v.AsI64; return true; }
-        if (name.SequenceEqual("alive"u8)) { Alive = v.AsBool; return true; }
-        // The 64-bit bitcast pair: whatever 64-bit tag arrived, AsU64
-        // carries the bits losslessly.
-        if (name.SequenceEqual("seed"u8)) { Seed = v.AsU64; return true; }
+        // The Try* accessors carry the documented coercion matrix: the
+        // JSON fallback's int-class whole numbers land in float fields,
+        // exact floats land in int fields, and the 64-bit bitcast pair
+        // rides TryU64/TryI64 losslessly.
+        if (name.SequenceEqual("power"u8)) { if (v.TryF32(out var f)) Power = f; return true; }
+        if (name.SequenceEqual("score"u8)) { if (v.TryI64(out var i)) Score = i; return true; }
+        if (name.SequenceEqual("alive"u8)) { if (v.TryBool(out var b)) Alive = b; return true; }
+        if (name.SequenceEqual("seed"u8)) { if (v.TryU64(out var u)) Seed = u; return true; }
         return false;
     }
 
@@ -51,7 +53,7 @@ internal sealed class PlainView : IPackedView
 
     public bool SetField(ReadOnlySpan<byte> name, in Scalar v)
     {
-        if (name.SequenceEqual("a"u8)) { A = v.AsF32; return true; }
+        if (name.SequenceEqual("a"u8)) { if (v.TryF32(out var f)) A = f; return true; }
         return false;
     }
 
@@ -83,6 +85,16 @@ internal struct PlainStream : IBatchComponent
 {
     public float A;
     public static string Name => "Plain";
+}
+
+/// A bool-carrying view — the float-only enforcement's test double: a
+/// 1-byte CLR bool overlaid on a 4-byte float slot would read garbage,
+/// so ViewInfo refuses the TYPE before any host call.
+internal struct BadBoolView : IBatchComponent
+{
+    public float X;
+    public bool Flag;
+    public static string Name => "BatchPos";
 }
 #pragma warning restore CS0649
 
@@ -125,6 +137,19 @@ public sealed class BulkProbe : Script
         var p2 = new PlainView();
         if (!Labelle.GetInto(e, p2, ref _scratch)) { Labelle.Log("CS_BULK_PLAIN_GET_FAIL"); return; }
         Labelle.Log($"CS_BULK_PLAIN_{F(p2.A)}");
+
+        // JSON-fallback coercion (round 1): a whole-number float is
+        // spelled `2` in JSON — an int-class token — and must still
+        // land in the f32 view field on the fallback path.
+        Labelle.SetComponent(e, "Plain", "{\"a\":2}");
+        var p3 = new PlainView();
+        if (Labelle.GetInto(e, p3, ref _scratch)) Labelle.Log($"CS_BULK_PLAIN_INT_{F(p3.A)}");
+        // And our OWN JSON fallback spells whole floats the same way —
+        // the SetFrom -> GetInto round trip must survive it.
+        var whole = new PlainView { A = 3.0f };
+        var p4 = new PlainView();
+        if (Labelle.SetFrom(e, whole) && Labelle.GetInto(e, p4, ref _scratch))
+            Labelle.Log($"CS_BULK_PLAIN_WHOLE_{F(p4.A)}");
 
         // A bit-63 u64 rides tag 3 bit-exact (C# has a real ulong).
         var e2 = Labelle.CreateEntity();
@@ -185,6 +210,26 @@ public sealed class BulkProbe : Script
         {
             if (ReadX(t1) == 11.0f) Labelle.Log("CS_BULK_THROW_ABORTED");
         }
+
+        // DUPLICATE COMPONENT NAMES: two copies of the same fields per
+        // row would let the unchanged copy overwrite the other's writes
+        // — refused before any host call, nothing written.
+        try
+        {
+            Labelle.Batch<BatchPos, BatchPos>((ref BatchPos bp, ref BatchPos _) => bp.X = 555.0f);
+            Labelle.Log("CS_BULK_DUP_ACCEPTED");
+        }
+        catch (System.ArgumentException) { Labelle.Log("CS_BULK_DUP_REFUSED"); }
+
+        // FLOAT-ONLY enforcement: a bool-carrying view type is refused
+        // before any host call (the zero-copy overlay would read a
+        // 1-byte bool as float garbage).
+        try
+        {
+            Labelle.Batch<BadBoolView>((ref BadBoolView _) => { });
+            Labelle.Log("CS_BULK_BOOLVIEW_ACCEPTED");
+        }
+        catch (BatchRefusedException) { Labelle.Log("CS_BULK_BOOLVIEW_REFUSED"); }
 
         // NESTED Batch calls alias the shared stream buffer — refused.
         try

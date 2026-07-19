@@ -146,7 +146,12 @@ test "csharp bulk v1.3: packed codec round-trips typed views, JSON stays the fal
     try expectComponent(2, "Stats", "{\"power\":1.5,\"score\":-42,\"alive\":true,\"seed\":123}");
     // The schema-less component round-trips through JSON.
     try expect(mock.logsContain("CS_BULK_PLAIN_2.5"));
-    try expectComponent(2, "Plain", "{\"a\":2.5}");
+    // JSON-fallback coercion (round 1): whole-number floats are spelled
+    // as int-class tokens (`{"a":2}` — by the host AND by our own
+    // fallback encoder) and must still land in the f32 view field.
+    try expect(mock.logsContain("CS_BULK_PLAIN_INT_2"));
+    try expect(mock.logsContain("CS_BULK_PLAIN_WHOLE_3"));
+    try expectComponent(2, "Plain", "{\"a\":3}");
     // A bit-63 u64 rides tag 3 bit-exact (C# has a real ulong).
     try expect(mock.logsContain("CS_BULK_U64_OK"));
     try expectComponent(3, "Stats", "{\"power\":0,\"score\":0,\"alive\":false,\"seed\":9223372036854775809}");
@@ -169,6 +174,13 @@ test "csharp bulk v1.3: batch refusals are loud — int fields, stale set, nesti
     // The exact-size positional-coupling guard fired; nothing applied.
     try expect(!mock.logsContain("CS_BULK_STALE_ACCEPTED"));
     try expect(mock.logsContain("CS_BULK_STALE_REFUSED"));
+    // Duplicate component names refused before any host call.
+    try expect(!mock.logsContain("CS_BULK_DUP_ACCEPTED"));
+    try expect(mock.logsContain("CS_BULK_DUP_REFUSED"));
+    // Float-only enforcement: the bool-carrying view TYPE refused
+    // before any host call (zero-copy overlay would read garbage).
+    try expect(!mock.logsContain("CS_BULK_BOOLVIEW_ACCEPTED"));
+    try expect(mock.logsContain("CS_BULK_BOOLVIEW_REFUSED"));
     // Nested Batch calls refused.
     try expect(!mock.logsContain("CS_BULK_NESTED_ACCEPTED"));
     try expect(mock.logsContain("CS_BULK_NESTED_REFUSED"));

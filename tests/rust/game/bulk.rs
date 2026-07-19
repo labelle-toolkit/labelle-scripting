@@ -41,6 +41,18 @@ labelle::batch_view! {
     }
 }
 
+/// A second view over the SAME component name — the duplicate-name
+/// refusal's test double (`batch2::<BatchPos, dup::BatchPos>`).
+mod dup {
+    use crate::labelle;
+    labelle::batch_view! {
+        BatchPos {
+            x: f32 = 0.0,
+            y: f32 = 0.0,
+        }
+    }
+}
+
 /// A batch view whose declared stride DISAGREES with the host stream:
 /// "Plain" has no packed schema, so it contributes ZERO stream floats
 /// (the mock's stand-in for a non-scalar component) while this view
@@ -102,6 +114,28 @@ impl Script for PackedRt {
             "plain get_into failed"
         );
         labelle::log(&format!("rust: plain:{}", p2.a));
+
+        // JSON-fallback coercion (round 1): a whole-number float is
+        // spelled `2` in JSON — an int-class token — and must still
+        // land in the f32 view field on the fallback path.
+        assert!(labelle::set_component(e1, "Plain", "{\"a\":2}"));
+        let mut p3 = Plain::default();
+        assert!(
+            labelle::get_into(e1, &mut p3, &mut self.scratch),
+            "plain int get_into failed"
+        );
+        labelle::log(&format!("rust: plain int:{}", p3.a));
+
+        // And our OWN JSON fallback spells whole floats the same way —
+        // the set_from -> get_into round trip must survive it.
+        let whole = Plain { a: 3.0 };
+        assert!(labelle::set_from(e1, &whole), "whole set refused");
+        let mut p4 = Plain::default();
+        assert!(
+            labelle::get_into(e1, &mut p4, &mut self.scratch),
+            "whole get_into failed"
+        );
+        labelle::log(&format!("rust: plain whole:{}", p4.a));
 
         // Entity 2: rust has a REAL u64, so a bit-63 seed rides tag 3
         // bit-exact — no signed detour (the bitcast pair stays the
@@ -304,6 +338,17 @@ impl Script for BatchIterEdge {
             });
         }));
         labelle::log(&format!("rust: panic aborted:{}", r.is_err()));
+
+        // DUPLICATE COMPONENT NAMES: two copies of the same fields per
+        // row would let the unchanged copy overwrite the other's writes
+        // — refused before any host call, nothing written.
+        let r = labelle::batch2::<BatchPos, dup::BatchPos>(|p, _q| {
+            p.x = 555.0;
+        });
+        labelle::log(&format!(
+            "rust: dup refused:{}",
+            r == Err(BatchError::DuplicateComponent)
+        ));
 
         // LAYOUT MISMATCH: "Plain" contributes zero stream floats while
         // the typed view declares one — refused before any closure call.

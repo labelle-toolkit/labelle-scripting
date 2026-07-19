@@ -839,6 +839,16 @@ module Labelle
   end
 
   def self.batch(a : T.class, b : U.class, & : T, U -> _) forall T, U
+    # Duplicate component names would put two copies of the same fields
+    # in every row and let the unchanged copy overwrite the other's
+    # writes on the positional write-back — refuse before any host call
+    # (the ruby block tier's duplicate-name refusal, one level up).
+    if T.labelle_component_name == U.labelle_component_name
+      raise ArgumentError.new(
+        "labelle: Labelle.batch: component '#{T.labelle_component_name}' is named by " \
+        "both views — the stream would carry two copies per entity and the write-back " \
+        "would silently lose one's writes; batch each component once")
+    end
     batch_impl(
       %(["#{T.labelle_component_name}","#{U.labelle_component_name}"]),
       T.labelle_stride + U.labelle_stride) do |base|
@@ -889,6 +899,40 @@ module Labelle
     end
   end
 
+  # ── cross-class scalar coercion (the JSON-fallback contract) ─────────
+  # The JSON route types number tokens by SHAPE — `1` classifies as an
+  # int even when the target field is f32, and both the host's
+  # serializer and our own JSON-fallback encoder spell whole-number
+  # floats that way. The generated `__labelle_set_field` arms therefore
+  # coerce across numeric classes exactly where the host's own JSON
+  # parse would: int classes always land in an f32 field (the host
+  # parser's rounding), and a FLOAT class lands in an int field only
+  # when EXACT (finite, integral, in range — mirroring the packed SET
+  # refusal rules; skipped otherwise).
+
+  # :nodoc: exact-integral gate for float-class values landing in
+  # int-typed fields. Nil = not exactly representable (the field is
+  # skipped, keeping its value).
+  def self.coerce_f32_i64(v : Float32) : Int64?
+    return nil unless v.finite? && v == v.trunc
+    return nil unless v >= -9223372036854775808.0_f32 && v < 9223372036854775808.0_f32
+    v.to_i64
+  end
+
+  # :nodoc:
+  def self.coerce_f32_u64(v : Float32) : UInt64?
+    return nil unless v.finite? && v == v.trunc
+    return nil unless v >= 0.0_f32 && v < 18446744073709551616.0_f32
+    v.to_u64
+  end
+
+  # :nodoc:
+  def self.coerce_f32_i32(v : Float32) : Int32?
+    return nil unless v.finite? && v == v.trunc
+    return nil unless v >= -2147483648.0_f32 && v <= 2147483520.0_f32 # last f32 below i32 max
+    v.to_i32
+  end
+
   # `Labelle.packed_view StatsView, "Stats", {power: f32, score: i64,
   # alive: bool, seed: u64}` — mint the typed per-component view class
   # `Labelle.get_into`/`Labelle.set_from` refill/write over the packed
@@ -928,19 +972,41 @@ module Labelle
           {% t = ftype.stringify %}
           if fname == {{fname2.id.stringify}}.to_slice
             {% if t == "f32" %}
-              @{{fname2.id}} = v if v.is_a?(Float32)
+              # JSON-fallback coercion: `1` classifies as an int-class
+              # token — land it here with the host parser's rounding.
+              case v
+              when Float32 then @{{fname2.id}} = v
+              when Int64   then @{{fname2.id}} = v.to_f32
+              when UInt64  then @{{fname2.id}} = v.to_f32
+              end
             {% elsif t == "i64" %}
               case v
               when Int64  then @{{fname2.id}} = v
               when UInt64 then @{{fname2.id}} = v.to_i64! # the bitcast pair
+              when Float32
+                # Float class: coerce only where exact (see the module's
+                # coercion doc).
+                if x = ::Labelle.coerce_f32_i64(v)
+                  @{{fname2.id}} = x
+                end
               end
             {% elsif t == "u64" %}
               case v
               when UInt64 then @{{fname2.id}} = v
               when Int64  then @{{fname2.id}} = v.to_u64! # the bitcast pair
+              when Float32
+                if x = ::Labelle.coerce_f32_u64(v)
+                  @{{fname2.id}} = x
+                end
               end
             {% elsif t == "i32" %}
-              @{{fname2.id}} = v.to_i32! if v.is_a?(Int64)
+              case v
+              when Int64 then @{{fname2.id}} = v.to_i32!
+              when Float32
+                if x = ::Labelle.coerce_f32_i32(v)
+                  @{{fname2.id}} = x
+                end
+              end
             {% elsif t == "bool" %}
               @{{fname2.id}} = v if v.is_a?(Bool)
             {% end %}
@@ -979,6 +1045,9 @@ module Labelle
   # rides raw, bool as 0/1 — an int-typed field fails to COMPILE, the
   # macro spelling of the host's batch int-refusal.
   macro batch_view(name, component, fields)
+    {% if fields.empty? %}
+      {% raise "Labelle.batch_view: at least one field is required (a zero-field marker view has nothing to iterate and a zero stride cannot walk the rows — filter marker components through the raw batch_get names instead)" %}
+    {% end %}
     class {{name.id}}
       def self.labelle_component_name : String
         {{component}}

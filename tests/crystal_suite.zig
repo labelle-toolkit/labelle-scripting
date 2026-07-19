@@ -375,7 +375,12 @@ test "bulk v1.3: packed codec round-trips typed views, JSON stays the fallback" 
     try expectComponent(1, "Stats", "{\"power\":1.5,\"score\":-42,\"alive\":true,\"seed\":123}");
     // The schema-less component round-trips through JSON.
     try expect(mock.logsContain("crystal: plain:2.5"));
-    try expectComponent(1, "Plain", "{\"a\":2.5}");
+    // JSON-fallback coercion (round 1): whole-number floats spelled as
+    // int-class tokens (`{"a":2}`) must still land in the f32 view
+    // field; a whole-number set_from round-trips too.
+    try expect(mock.logsContain("crystal: plain int:2.0"));
+    try expect(mock.logsContain("crystal: plain whole:3.0"));
+    try expectComponent(1, "Plain", "{\"a\":3.0}");
     // A bit-63 u64 rides tag 3 bit-exact (crystal has a real UInt64);
     // the host stored the unsigned value via the packed path.
     try expect(mock.logsContain("crystal: u64rt:true"));
@@ -473,6 +478,11 @@ test "bulk stage 3: block-tier exit semantics — break commits, raise aborts, n
     // never landed) — and the raise stayed catchable in-script.
     try expect(!mock.logsContain("crystal: raise swallowed"));
     try expect(mock.logsContain("crystal: block raised: boom"));
+    // Duplicate component names refused before any host call (the 555
+    // never landed).
+    try expect(!mock.logsContain("crystal: dup accepted"));
+    try expect(mock.logsContain("crystal: dup refused:"));
+    try expect(mock.logsContain("named by both views"));
     // Nested batch calls refused loudly.
     try expect(!mock.logsContain("crystal: nested accepted"));
     try expect(mock.logsContain("crystal: nested refused:"));

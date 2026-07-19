@@ -476,13 +476,35 @@ pub enum Scalar {
 /// f32 / bool / i32 / i64 / u64 — the schema vocabulary's scalar corner
 /// (i32 rides the i64 tag; the host range-checks on SET and emits
 /// in-range values on GET).
+///
+/// CROSS-CLASS COERCION (the JSON-fallback contract): the JSON route
+/// types number tokens by SHAPE — `1` classifies as an int even when
+/// the target field is f32, and both the host's serializer and our own
+/// JSON-fallback encoder spell whole-number floats that way. So
+/// `from_scalar` coerces across numeric classes exactly where the
+/// host's own JSON parse would: int classes always land in an f32
+/// field (same rounding as the host parsing the token into f32), and
+/// a FLOAT class lands in an int field only when EXACT (finite,
+/// integral, in range) — mirroring the packed SET refusal rules, skip
+/// (None) otherwise. The 64-bit arms additionally accept the OTHER
+/// 64-bit tag via two's-complement bitcast — the documented lossless
+/// pair. None = the value cannot land in this field type (the caller
+/// skips the field; the host is the authority on GET).
 pub trait PackedField: Copy {
     fn to_scalar(self) -> Scalar;
-    /// None = the tagged value cannot land in this field type (the
-    /// caller skips the field; the host is the authority on GET). The
-    /// 64-bit arms accept the OTHER 64-bit tag via two's-complement
-    /// bitcast — the documented lossless pair.
+    /// See the trait doc for the coercion matrix.
     fn from_scalar(v: Scalar) -> Option<Self>;
+}
+
+/// `v` as an exactly-representable integral f64, or None — the shared
+/// "coerce only where exact" gate for float-class values landing in
+/// int-typed fields (see [`PackedField`]).
+fn exact_integral(v: f32) -> Option<f64> {
+    if v.is_finite() && v.fract() == 0.0 {
+        Some(v as f64)
+    } else {
+        None
+    }
 }
 
 impl PackedField for f32 {
@@ -492,7 +514,11 @@ impl PackedField for f32 {
     fn from_scalar(v: Scalar) -> Option<f32> {
         match v {
             Scalar::F32(x) => Some(x),
-            _ => None,
+            // JSON-fallback coercion: `1` classifies as an int — land it
+            // here with the host parser's own rounding.
+            Scalar::I64(x) => Some(x as f32),
+            Scalar::U64(x) => Some(x as f32),
+            Scalar::Bool(_) => None,
         }
     }
 }
@@ -515,7 +541,16 @@ impl PackedField for i64 {
         match v {
             Scalar::I64(x) => Some(x),
             Scalar::U64(x) => Some(x as i64), // the bitcast pair
-            _ => None,
+            // Float class: coerce only where exact (see the trait doc).
+            Scalar::F32(x) => match exact_integral(x) {
+                Some(f)
+                    if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) =>
+                {
+                    Some(f as i64)
+                }
+                _ => None,
+            },
+            Scalar::Bool(_) => None,
         }
     }
 }
@@ -527,7 +562,12 @@ impl PackedField for u64 {
         match v {
             Scalar::U64(x) => Some(x),
             Scalar::I64(x) => Some(x as u64), // the bitcast pair
-            _ => None,
+            // Float class: coerce only where exact (see the trait doc).
+            Scalar::F32(x) => match exact_integral(x) {
+                Some(f) if (0.0..18_446_744_073_709_551_616.0).contains(&f) => Some(f as u64),
+                _ => None,
+            },
+            Scalar::Bool(_) => None,
         }
     }
 }
@@ -538,7 +578,13 @@ impl PackedField for i32 {
     fn from_scalar(v: Scalar) -> Option<i32> {
         match v {
             Scalar::I64(x) => x.try_into().ok(),
-            _ => None,
+            Scalar::U64(x) => x.try_into().ok(),
+            // Float class: coerce only where exact (see the trait doc).
+            Scalar::F32(x) => match exact_integral(x) {
+                Some(f) if (-2_147_483_648.0..=2_147_483_647.0).contains(&f) => Some(f as i32),
+                _ => None,
+            },
+            Scalar::Bool(_) => None,
         }
     }
 }
@@ -974,6 +1020,13 @@ pub enum BatchError {
     /// disagrees with the view layout. Use the raw
     /// `batch_get`/`batch_set` flat loop for these components.
     LayoutMismatch,
+    /// (Closure tier only.) The same component named more than once:
+    /// the stream would carry two copies of its fields per entity and
+    /// the positional write-back would let the unchanged second copy
+    /// OVERWRITE the first's writes — silent write loss, refused up
+    /// front (the ruby block tier's duplicate-name refusal, one level
+    /// up). The raw tier deliberately stays script-owned.
+    DuplicateComponent,
 }
 
 impl std::fmt::Display for BatchError {
@@ -1002,6 +1055,12 @@ impl std::fmt::Display for BatchError {
                 "labelle: batch: the typed views' stride does not match the host stream (a \
                  non-scalar field the stream skips confused the layout) — use the raw \
                  batch_get/batch_set flat loop for these components"
+            ),
+            BatchError::DuplicateComponent => write!(
+                f,
+                "labelle: batch: the same component is named more than once — the stream \
+                 would carry two copies per entity and the positional write-back would let \
+                 the unchanged copy overwrite the other's writes; batch each component once"
             ),
         }
     }
@@ -1224,6 +1283,15 @@ fn batch_core(
     stride: usize,
     row_fn: &mut dyn FnMut(&mut [f32]) -> bool,
 ) -> Result<u32, BatchError> {
+    // Duplicate component names would put two copies of the same fields
+    // in every row — refuse before any host call (see the variant doc).
+    for i in 0..names.len() {
+        for j in i + 1..names.len() {
+            if names[i] == names[j] {
+                return Err(BatchError::DuplicateComponent);
+            }
+        }
+    }
     BATCH_SCRATCH.with(|cell| {
         let mut guard = cell.try_borrow_mut().unwrap_or_else(|_| {
             panic!(
@@ -1662,9 +1730,14 @@ macro_rules! __lbl_bv_ty {
 /// component name; fields must mirror the component's declaration
 /// (same names, DECLARATION order — the order the host stream walks),
 /// which the stride cross-check enforces before the first closure call.
+/// AT LEAST ONE field is required — the macro has no zero-field arm
+/// (same mechanism as the no-int-type arm): a marker component
+/// contributes nothing to the stream and has nothing to iterate, and a
+/// zero stride cannot chunk the row walk. Filter marker components
+/// through the raw `batch_get` names instead.
 #[macro_export]
 macro_rules! batch_view {
-    ($name:ident { $($fname:ident : $fty:ident = $fdef:expr),* $(,)? }) => {
+    ($name:ident { $($fname:ident : $fty:ident = $fdef:expr),+ $(,)? }) => {
         #[derive(Clone, Copy, Debug, PartialEq)]
         pub struct $name {
             $(pub $fname: $crate::__lbl_bv_ty!($fty),)*
