@@ -58,8 +58,9 @@
     // siblings to pin — the one `local:` dep is the plugin itself, plus
     // the labelle-null sibling above).
     .core_version = "1.26.0",
-    // >= 2.6.0: the batched swarm script needs the contract v1.3
-    // bulk-access exports (labelle-scripting#41/#44 — engine 2.6.0).
-    .engine_version = "2.6.0",
+    // >= 2.7.0: the batched swarm script defaults to the contract v1.4
+    // id-tagged batch (labelle-scripting#57 — engine 2.7.0 carries the
+    // batch_id_row_prefix marker; the v1.3 bulk-access floor was 2.6.0).
+    .engine_version = "2.7.0",
     .gfx_version = "1.28.1",
 }

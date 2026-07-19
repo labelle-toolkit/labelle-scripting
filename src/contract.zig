@@ -215,6 +215,79 @@ pub extern fn labelle_component_batch_set(
     buf_len: usize,
 ) i32;
 
+// ── ID-tagged bulk component access (contract v1.4, labelle-engine#788) ──
+//
+// Additive over v1.3, same convention: the two `_ids` exports below are
+// marked "since v1.4" in labelle_script.h and exist only on engine hosts
+// ≥ 2.7.0. Detection is `host_has_id_batch` — a COMPTIME `@hasDecl` probe
+// of the engine module's `batch_id_row_prefix` marker, the exact twin of
+// `host_has_bulk_access`. Every reference to the two symbols in the
+// bindings is gated on it, so a game built against an engine in the
+// [2.6.0, 2.7.0) window never names them (no link error) and the bindings
+// fall back to the POSITIONAL v1.3 pair (`labelle_component_batch_get`/
+// `_batch_set`). On a ≥ 2.7.0 host the bindings default to the id path,
+// which closes the positional-coupling holes (same-count destroy+spawn,
+// onSet-mid-apply mutation, recycled generational handles).
+
+/// COMPTIME capability probe for the v1.4 id-tagged batch exports — the
+/// twin of `host_has_bulk_access`, keyed on `batch_id_row_prefix`, the
+/// marker decl labelle-engine gained in the SAME release (2.7.0) that
+/// exports the two `_ids` symbols. `@hasDecl` on an extern can't see host
+/// exports, so — as with the v1.3 probe — this reads the engine module's
+/// decl, which is exactly the link-time truth on every platform. The
+/// in-repo test binaries stand in the one-decl stub (src/engine_stub.zig),
+/// which carries this marker alongside `batch_int_refused` so the probe is
+/// TRUE and matches the mock world's `_ids` exports.
+pub const host_has_id_batch = blk: {
+    const engine = @import("labelle-engine");
+    break :blk @hasDecl(engine, "script_contract") and
+        @hasDecl(engine.script_contract, "batch_id_row_prefix");
+};
+
+/// The id-tagged batch variant's per-row prefix width: each entity's f32
+/// stream is preceded by its entity id as a little-endian u64 — 8 bytes —
+/// in `labelle_component_batch_get_ids`'s output (after the u32 count
+/// header) and in `labelle_component_batch_set_ids`'s input. Mirrors the
+/// engine's `script_contract.batch_id_row_prefix`.
+pub const BATCH_ID_ROW_PREFIX: usize = 8;
+
+/// ID-TAGGED batched read (since v1.4) — `labelle_component_batch_get`'s
+/// safer twin. Resolves the SAME entity set in the same order and writes
+/// `[u32 count]` then, per entity, `[u64 entity_id][f32 stream]`: the
+/// identical per-entity floats the positional variant emits, each row
+/// prefixed by the entity's id as a little-endian u64 (`BATCH_ID_ROW_PREFIX`
+/// bytes). Everything else mirrors `_batch_get` exactly — int-field refusal
+/// (`BATCH_INT_REFUSED`), required-size return, 0 = malformed / not bound,
+/// NULL/cap-0 sizing probe, count-0 header for zero matches. The id column
+/// is BINDING-INTERNAL (held for the get→set round trip); the flat-float
+/// script API never sees it.
+pub extern fn labelle_component_batch_get_ids(
+    names_json: [*]const u8,
+    names_json_len: usize,
+    out: ?[*]u8,
+    out_cap: usize,
+) usize;
+
+/// ID-TAGGED batched write (since v1.4) — applies `[u64 id][f32 stream]`
+/// rows (the exact layout `_batch_get_ids` emitted, minus the u32 count
+/// header) BY ID instead of positionally: each row's entity is resolved
+/// from its embedded id, and a row whose entity has VANISHED — or no longer
+/// carries every named component, or whose slot was recycled to a new
+/// generation — is SKIPPED (its floats consumed, nothing written) rather
+/// than failing the batch. This CLOSES the positional variant's residual
+/// holes (same-count destroy+spawn, onSet-mid-apply). No positional
+/// preflight — a SHAPE check instead: `buf_len` must be a whole number of
+/// rows (count × (8 + stride)). Returns 0 = ok (skips included);
+/// -1 = malformed names / unknown component / buf_len not a whole number of
+/// rows / not bound / a genuine apply failure on a live present component;
+/// -2 = int-field refusal (identical to `_batch_set`).
+pub extern fn labelle_component_batch_set_ids(
+    names_json: [*]const u8,
+    names_json_len: usize,
+    buf: ?[*]const u8,
+    buf_len: usize,
+) i32;
+
 /// 1 when the entity carries the component, else 0.
 pub extern fn labelle_component_has(id: u64, name: [*]const u8, name_len: usize) i32;
 

@@ -268,25 +268,31 @@ public sealed class BulkProbe : Script
         }
         catch (BatchRefusedException) { Labelle.Log("CS_BULK_MISMATCH_REFUSED"); }
 
-        // STALE-SET GUARD: destroy between the paired raw calls — the
-        // exact-size preflight refuses, NOTHING is applied.
+        // DESTROY+SPAWN SKIP (v1.4): a same-count destroy+spawn between the
+        // paired raw calls no longer shifts a stale row onto the new entity
+        // — the id path applies the survivors, skips the dead row, and never
+        // touches the spawned replacement (its id was not in the buffer).
         var count = Labelle.BatchGet("[\"BatchPos\",\"BatchVel\"]", ref _raw, out var floats);
         for (var i = 0; i < floats; i++) _raw[i] += 100.0f;
         Labelle.DestroyEntity(t3);
+        var t4 = Labelle.CreateEntity();
+        Labelle.SetComponent(t4, "BatchPos", "{\"x\":7,\"y\":8}");
+        Labelle.SetComponent(t4, "BatchVel", "{\"vx\":9,\"vy\":9}");
         try
         {
             Labelle.BatchSet("[\"BatchPos\",\"BatchVel\"]", _raw, floats);
-            Labelle.Log("CS_BULK_STALE_ACCEPTED");
+            // Survivor t1 got its marker (11 + 100); the spawned t4 is
+            // untouched (the stale t3 row did NOT land on it).
+            if (count == 3 && ReadX(t1) == 111.0f && ReadX(t4) == 7.0f)
+                Labelle.Log("CS_BULK_STALE_SKIPPED");
         }
-        catch (BatchRefusedException)
-        {
-            if (count == 3 && ReadX(t1) == 11.0f) Labelle.Log("CS_BULK_STALE_REFUSED");
-        }
+        catch (BatchRefusedException) { Labelle.Log("CS_BULK_STALE_LEAKED"); }
 
         // Drop the throwaways; mint the three steady-state entities the
         // Update iterator drives (asserted by id from the Zig side).
         Labelle.DestroyEntity(t1);
         Labelle.DestroyEntity(t2);
+        Labelle.DestroyEntity(t4);
         for (var i = 0; i < 3; i++)
         {
             var it = Labelle.CreateEntity();

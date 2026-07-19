@@ -1194,9 +1194,15 @@ test "bulk v1.3: batch refuses int-carrying components loudly (never a silent co
     try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
 }
 
-test "bulk v1.3: batch_set raises when the entity set changed since batch_get" {
+test "bulk v1.4: id-tagged batch_set skips a destroy+spawn stale row (never lands on the new occupant)" {
     fresh();
-    scripting.registerScript("batch_stale",
+    // The whole point of #57: a same-count destroy+spawn between batch_get
+    // and batch_set can no longer shift a stale row onto the new entity.
+    // The positional variant WOULD (row 1's data would land on the spawned
+    // entity that took the query slot); the id-tagged variant matches rows
+    // to entities BY ID — the destroyed entity's id is dead (skipped), and
+    // the spawned entity's id was never in the buffer (untouched).
+    scripting.registerScript("batch_idswap",
         \\NAMES = ["BatchPos", "BatchVel"].freeze
         \\def init
         \\  @es = []
@@ -1210,12 +1216,18 @@ test "bulk v1.3: batch_set raises when the entity set changed since batch_get" {
         \\end
         \\def update(_dt)
         \\  count = Labelle.batch_get(NAMES, @buf)
-        \\  @es[1].destroy # the forbidden move: destroy between get and set
+        \\  # Rewrite every field to a distinctive marker.
+        \\  (count * 4).times { |k| @buf[k] = 100 + k }
+        \\  # The same-count destroy+spawn between the paired calls.
+        \\  @es[1].destroy
+        \\  fresh = Labelle::Entity.create
+        \\  fresh.set("BatchPos", x: 7, y: 8)
+        \\  fresh.set("BatchVel", vx: 9, vy: 9)
         \\  begin
         \\    Labelle.batch_set(NAMES, @buf, count)
-        \\    Labelle.log("stale write accepted")
-        \\  rescue RuntimeError => ex
-        \\    Labelle.log("stale refused: #{ex.message}")
+        \\    Labelle.log("id-batch write accepted")
+        \\  rescue => ex
+        \\    Labelle.log("id-batch refused: #{ex.message}")
         \\  end
         \\end
     );
@@ -1223,11 +1235,16 @@ test "bulk v1.3: batch_set raises when the entity set changed since batch_get" {
     defer scripting.Controller.deinit();
 
     scripting.Controller.tick(.{}, 0.016);
-    // The exact-size positional-coupling guard fired and surfaced as a
-    // catchable RuntimeError telling the script to re-get.
-    try expect(!mock.logsContain("stale write accepted"));
-    try expect(mock.logsContain("stale refused:"));
-    try expect(mock.logsContain("entity set changed"));
+    // The write is accepted (no positional refusal) — the id path skips the
+    // dead row instead of failing the whole batch.
+    try expect(mock.logsContain("id-batch write accepted"));
+    try expect(!mock.logsContain("id-batch refused:"));
+    // Surviving entity 1 got its marker row.
+    try expectComponent(1, "BatchPos", "{\"x\":100,\"y\":101}");
+    // The SPAWNED entity (id 3) kept its own values — the stale row for the
+    // destroyed entity 2 did NOT land on it (positional WOULD have).
+    try expectComponent(3, "BatchPos", "{\"x\":7,\"y\":8}");
+    try expectComponent(3, "BatchVel", "{\"vx\":9,\"vy\":9}");
 }
 
 test "bulk stage 2: Labelle.batch block iterator round-trips through ONE reused view" {

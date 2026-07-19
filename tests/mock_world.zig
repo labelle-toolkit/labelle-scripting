@@ -731,6 +731,134 @@ export fn labelle_component_batch_set(
     return 0;
 }
 
+// ── contract exports: id-tagged bulk access (contract v1.4, #788) ────────
+//
+// The id-tagged twins of `_batch_get`/`_batch_set`. Wire format mirrors
+// engine v2.7.0's script_contract exactly: get writes `[u32 count]` then
+// per entity `[u64 id][f32 stream]`; set takes `[u64 id][f32 stream]` rows
+// (no header) and applies BY ID — a row whose id names a DEAD or unknown
+// entity (destroyed/recycled since the get) is SKIPPED, its floats
+// consumed, nothing written. The mock's monotonic never-reused ids ARE the
+// generational-handle model: a destroyed entity's id resolves to null
+// (`world.find`), so a stale row can never write to a new occupant.
+
+/// The id-tagged batch's per-row prefix width (8 = little-endian u64 id),
+/// mirroring engine `script_contract.batch_id_row_prefix`.
+pub const batch_id_row_prefix: usize = 8;
+
+export fn labelle_component_batch_get_ids(
+    names_json: [*]const u8,
+    names_json_len: usize,
+    out: ?[*]u8,
+    out_cap: usize,
+) usize {
+    var storage: [8][]const u8 = undefined;
+    const names = parseNames(names_json[0..names_json_len], &storage) orelse return 0;
+    // Int-field refusal decides first (engine order), same as `_batch_get`.
+    for (names) |nm| {
+        if (packedTypeOf(nm)) |t| {
+            if (typeHasIntField(t)) return batch_int_refused;
+        }
+    }
+    const buf: []u8 = if (out) |p| p[0..out_cap] else &.{};
+    var count: u32 = 0;
+    var pos: usize = 4; // the u32 count header
+    outer: for (world.entities[0..world.entity_count]) |*e| {
+        if (!e.alive) continue;
+        for (names) |nm| {
+            if (!entityHas(e, nm)) continue :outer;
+        }
+        count += 1;
+        // Each row leads with the entity's u64 id (little-endian) — what
+        // `_batch_set_ids` matches rows by.
+        if (pos + 8 <= buf.len) {
+            std.mem.writeInt(u64, buf[pos..][0..8], e.id, .little);
+        }
+        pos += 8;
+        for (names) |nm| {
+            const t = packedTypeOf(nm) orelse continue;
+            const json = blk: {
+                for (e.comps[0..e.comp_count]) |*comp| {
+                    if (std.mem.eql(u8, comp.nameSlice(), nm)) break :blk comp.jsonSlice();
+                }
+                unreachable; // entityHas guaranteed presence
+            };
+            for (t.fields) |f| {
+                const v = jsonScalar(json, f.name) orelse defaultScalar(f.kind);
+                if (pos + 4 <= buf.len) {
+                    std.mem.writeInt(u32, buf[pos..][0..4], @bitCast(scalarToF32(v)), .little);
+                }
+                pos += 4; // advance past the cap: required-size return
+            }
+        }
+    }
+    if (buf.len >= 4) std.mem.writeInt(u32, buf[0..4], count, .little);
+    return pos;
+}
+
+export fn labelle_component_batch_set_ids(
+    names_json: [*]const u8,
+    names_json_len: usize,
+    buf_ptr: ?[*]const u8,
+    buf_len: usize,
+) i32 {
+    var storage: [8][]const u8 = undefined;
+    const names = parseNames(names_json[0..names_json_len], &storage) orelse return -1;
+    for (names) |nm| {
+        if (packedTypeOf(nm)) |t| {
+            if (typeHasIntField(t)) return -2; // the get sentinel's i32 twin
+        }
+    }
+    const buf = if (buf_ptr) |p| p[0..buf_len] else &[_]u8{};
+    // Stride = sum of each named component's f32 bytes (schema-less = 0).
+    var stride: usize = 0;
+    for (names) |nm| {
+        if (packedTypeOf(nm)) |t| stride += t.fields.len * 4;
+    }
+    const row_size = batch_id_row_prefix + stride;
+    // SHAPE check (replaces the positional preflight): a whole number of rows.
+    if (row_size == 0 or buf.len % row_size != 0) return -1;
+    var pos: usize = 0;
+    while (pos < buf.len) {
+        const id = std.mem.readInt(u64, buf[pos..][0..8], .little);
+        pos += batch_id_row_prefix;
+        const row_end = pos + stride;
+        // Re-anchor at the row boundary so a skipped row leaves the NEXT
+        // row's floats aligned.
+        defer pos = row_end;
+        const e = world.find(id) orelse continue; // vanished/recycled → skip
+        // Entity must still carry every named component (else it left the
+        // query since the get) — skip the whole row.
+        var still_matches = true;
+        for (names) |nm| {
+            if (!entityHas(e, nm)) {
+                still_matches = false;
+                break;
+            }
+        }
+        if (!still_matches) continue;
+        var rp = pos;
+        for (names) |nm| {
+            const t = packedTypeOf(nm) orelse continue; // filter, no data
+            var jbuf: [JSON_CAP]u8 = undefined;
+            var w = std.Io.Writer.fixed(&jbuf);
+            w.writeByte('{') catch return -1;
+            for (t.fields, 0..) |f, fi| {
+                const fv: f32 = @bitCast(std.mem.readInt(u32, buf[rp..][0..4], .little));
+                rp += 4;
+                const v: ScalarVal = switch (f.kind) {
+                    .boolean => .{ .b = fv != 0 },
+                    else => .{ .f = fv },
+                };
+                writeJsonField(&w, f, v, fi == 0) catch return -1;
+            }
+            w.writeByte('}') catch return -1;
+            setComponent(e.id, nm, w.buffered());
+        }
+    }
+    return 0;
+}
+
 // ── contract exports: queries ────────────────────────────────────────────
 
 export fn labelle_query(
@@ -898,12 +1026,28 @@ pub fn setComponentDirect(id: u64, name: []const u8, json: []const u8) void {
     setComponent(id, name, json);
 }
 
+pub fn destroyEntityDirect(id: u64) void {
+    labelle_entity_destroy(id);
+}
+
 pub fn setPackedDirect(id: u64, name: []const u8, buf: []const u8) i32 {
     return labelle_component_set_packed(id, name.ptr, name.len, buf.ptr, buf.len);
 }
 
 pub fn batchSetDirect(names_json: []const u8, buf: []const u8) i32 {
     return labelle_component_batch_set(names_json.ptr, names_json.len, buf.ptr, buf.len);
+}
+
+pub fn batchGetDirect(names_json: []const u8, out: []u8) usize {
+    return labelle_component_batch_get(names_json.ptr, names_json.len, out.ptr, out.len);
+}
+
+pub fn batchGetIdsDirect(names_json: []const u8, out: []u8) usize {
+    return labelle_component_batch_get_ids(names_json.ptr, names_json.len, out.ptr, out.len);
+}
+
+pub fn batchSetIdsDirect(names_json: []const u8, buf: []const u8) i32 {
+    return labelle_component_batch_set_ids(names_json.ptr, names_json.len, buf.ptr, buf.len);
 }
 
 /// The stored JSON of a component, or null when entity/component is gone.

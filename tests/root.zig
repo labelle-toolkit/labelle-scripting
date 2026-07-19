@@ -106,6 +106,14 @@ comptime {
     if (scripting.language == .lua) _ = @import("eval_shared_suite.zig");
 }
 
+// The id-tagged batch codec suite (contract v1.4, #57): src/id_batch.zig +
+// the mock's `_ids` exports, driven VM-free. Language-independent, so it
+// rides the LUA binary only — the same one-mirror rule as the eval-shared
+// suite above.
+comptime {
+    if (scripting.language == .lua) _ = @import("id_batch_suite.zig");
+}
+
 // The dev-experience suite (labelle-engine#740): hot reload, the update
 // error throttle, sandbox-by-construction pins. Rides EVERY language
 // binary — the VM family exercises reload/throttle end to end, the

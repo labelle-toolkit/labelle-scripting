@@ -179,9 +179,11 @@ test "csharp bulk v1.3: batch refusals are loud — int fields, stale set, nesti
     // ArgumentOutOfRangeException before any buffer read.
     try expect(mock.logsContain("CS_BULK_SET_COUNT_OVER_REFUSED"));
     try expect(mock.logsContain("CS_BULK_SET_COUNT_NEG_REFUSED"));
-    // The exact-size positional-coupling guard fired; nothing applied.
-    try expect(!mock.logsContain("CS_BULK_STALE_ACCEPTED"));
-    try expect(mock.logsContain("CS_BULK_STALE_REFUSED"));
+    // The id-tagged path (v1.4) skips the dead row and never lands it on
+    // the spawned replacement — the write is accepted, survivors updated,
+    // the new entity untouched (positional WOULD have leaked the stale row).
+    try expect(!mock.logsContain("CS_BULK_STALE_LEAKED"));
+    try expect(mock.logsContain("CS_BULK_STALE_SKIPPED"));
     // Duplicate component names refused before any host call.
     try expect(!mock.logsContain("CS_BULK_DUP_ACCEPTED"));
     try expect(mock.logsContain("CS_BULK_DUP_REFUSED"));
@@ -225,16 +227,17 @@ test "csharp bulk stage 3: the ref-struct iterator round-trips the steady state"
 
     tick(0.016);
     try expect(mock.logsContain("CS_BULK_ITER_3"));
-    // Entities 8..10 are the iterator's set (see BulkProbe.cs's id
-    // ledger); write-through refs mapped [X, Y | Vx, Vy] as the stream
-    // lays out, and the bounce flipped entity 10's Vx.
-    try expectComponent(8, "BatchPos", "{\"x\":11,\"y\":-10}");
-    try expectComponent(9, "BatchPos", "{\"x\":12,\"y\":-10}");
-    try expectComponent(10, "BatchPos", "{\"x\":13,\"y\":-10}");
-    try expectComponent(10, "BatchVel", "{\"vx\":-10,\"vy\":-10}");
-    try expectComponent(8, "BatchVel", "{\"vx\":10,\"vy\":-10}");
-    // Second tick is steady state (entity 10 moves backward, bounced).
+    // Entities 9..11 are the iterator's set (see BulkProbe.cs's id
+    // ledger — the v1.4 destroy+spawn probe mints one extra throwaway t4,
+    // so the steady set starts at id 9); write-through refs mapped
+    // [X, Y | Vx, Vy] as the stream lays out, the bounce flipped 11's Vx.
+    try expectComponent(9, "BatchPos", "{\"x\":11,\"y\":-10}");
+    try expectComponent(10, "BatchPos", "{\"x\":12,\"y\":-10}");
+    try expectComponent(11, "BatchPos", "{\"x\":13,\"y\":-10}");
+    try expectComponent(11, "BatchVel", "{\"vx\":-10,\"vy\":-10}");
+    try expectComponent(9, "BatchVel", "{\"vx\":10,\"vy\":-10}");
+    // Second tick is steady state (entity 11 moves backward, bounced).
     tick(0.016);
-    try expectComponent(8, "BatchPos", "{\"x\":21,\"y\":-20}");
-    try expectComponent(10, "BatchPos", "{\"x\":3,\"y\":-20}");
+    try expectComponent(9, "BatchPos", "{\"x\":21,\"y\":-20}");
+    try expectComponent(11, "BatchPos", "{\"x\":3,\"y\":-20}");
 }

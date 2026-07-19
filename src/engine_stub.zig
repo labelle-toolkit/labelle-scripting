@@ -22,4 +22,10 @@ pub const script_contract = struct {
     /// The v1.3 marker decl (mirrors labelle-engine's
     /// `script_contract.batch_int_refused`, C's `(size_t)-2`).
     pub const batch_int_refused: usize = @import("std").math.maxInt(usize) - 1;
+
+    /// The v1.4 marker decl (mirrors labelle-engine's
+    /// `script_contract.batch_id_row_prefix`, 8) — turns
+    /// `contract.host_has_id_batch` TRUE, so the test binaries default to
+    /// the id-tagged batch path, matching the mock world's `_ids` exports.
+    pub const batch_id_row_prefix: usize = 8;
 };

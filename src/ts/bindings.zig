@@ -56,6 +56,7 @@
 
 const std = @import("std");
 const contract = @import("../contract.zig");
+const id_batch = @import("../id_batch.zig");
 const vm_mod = @import("vm.zig");
 const codec = @import("json.zig");
 const c = vm_mod.c;
@@ -636,16 +637,29 @@ fn batchGetImpl(ctx: ?*c.Context, argv: ?[*]const c.Value, argc: c_int) JsError!
             _ = c.JS_ThrowTypeError(ctx, "labelle: batch_get requires an Array to fill");
             return error.JsError;
         }
+        // Contract v1.4 default: the id-tagged read (`_batch_get_ids`),
+        // stashing ids binding-side and handing the SAME positional
+        // `[u32 count][f32 stream]` to this decode loop (unchanged API).
+        // v1.3-only host: the positional `_batch_get`.
+        const batchGet = if (comptime contract.host_has_id_batch)
+            contract.labelle_component_batch_get_ids
+        else
+            contract.labelle_component_batch_get;
         var buf = try io_scratch.ensure(ctx, SCRATCH_INITIAL_CAP);
-        var n = contract.labelle_component_batch_get(names.s.ptr, names.s.len, buf, io_scratch.cap);
+        var n = batchGet(names.s.ptr, names.s.len, buf, io_scratch.cap);
         // The refusal sentinel must be checked BEFORE the grow-retry: it
         // is (size_t)-2, which would otherwise read as a required size.
         if (n == contract.BATCH_INT_REFUSED) return throwBatchIntRefused(ctx, names.s);
         if (n == 0) return c.Value.int(0); // not bound / malformed
         if (n > io_scratch.cap) {
             buf = try io_scratch.ensure(ctx, n);
-            n = contract.labelle_component_batch_get(names.s.ptr, names.s.len, buf, io_scratch.cap);
+            n = batchGet(names.s.ptr, names.s.len, buf, io_scratch.cap);
             if (n == 0 or n > io_scratch.cap) return c.Value.int(0); // belt
+        }
+        // Strip the id column in place (id path only): compact to the
+        // positional layout and stash the ids for `raw_batch_set`.
+        if (comptime contract.host_has_id_batch) {
+            n = id_batch.stripIds(buf[0..io_scratch.cap], n);
         }
         if (n < 4) return c.Value.int(0);
         const count = std.mem.readInt(u32, buf[0..4], .little);
@@ -754,7 +768,14 @@ fn batchSetImpl(ctx: ?*c.Context, argv: ?[*]const c.Value, argc: c_int) JsError!
             }
             std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f32v), .little);
         }
-        const rc = contract.labelle_component_batch_set(names.s.ptr, names.s.len, buf, bytes);
+        // Contract v1.4 default: `_batch_set_ids` — re-attach the ids
+        // stashed by the paired `raw_batch_get` and apply BY ID (a
+        // destroy+spawn since the get skips the stale row). v1.3-only
+        // host: the positional set.
+        const rc = if (comptime contract.host_has_id_batch)
+            id_batch.setWithIds(names.s, buf[0..bytes])
+        else
+            contract.labelle_component_batch_set(names.s.ptr, names.s.len, buf, bytes);
         if (rc == -2) return throwBatchIntRefused(ctx, names.s);
         if (rc != 0) {
             var msg_buf: [512]u8 = undefined;
