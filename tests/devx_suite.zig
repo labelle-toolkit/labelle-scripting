@@ -436,6 +436,362 @@ test "hot reload retries a failed read on the next poll (atomic-save race)" {
     try expect(mock.logsContain("devx v2 update"));
 }
 
+// ── multi-root watching (labelle-scripting#51) ─────────────────────────
+
+test "multi-root: a second root ADDS — no clobber, both roots reload, per-root stems" {
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    const io = std.testing.io;
+    var game_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer game_dir.cleanup();
+    var pack_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer pack_dir.cleanup();
+
+    // Game scripts in root A, a local pack's scripts in root B — the
+    // assembler dev-splice shape (#51: pack script dirs must co-watch).
+    const game_file = "10_counter" ++ src.ext;
+    const pack_file = "20_late" ++ src.ext;
+    try game_dir.dir.writeFile(io, .{ .sub_path = game_file, .data = src.v1 });
+    scripting.registerScript("counter", src.v1);
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Root A registered FIRST and primed…
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, game_dir.dir);
+    try expectEqual(@as(usize, 1), scripting.hot_reload.watchedRootCount());
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump()); // baseline A
+
+    // …then root B ADDS (the single-slot bug replaced A here).
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, pack_dir.dir);
+    try expectEqual(@as(usize, 2), scripting.hot_reload.watchedRootCount());
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump()); // baseline B
+
+    // An edit in root A still lands — A's tracking survived B's arrival.
+    try game_dir.dir.writeFile(io, .{ .sub_path = game_file, .data = src.v2 });
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
+    try expectEqual(@as(usize, 2), mock.logCount("devx init ran"));
+
+    // A file born in root B reports under ITS root's registered stem
+    // (ordering prefix stripped per root) and self-registers.
+    try pack_dir.dir.writeFile(io, .{ .sub_path = pack_file, .data = src.late });
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
+    try expectEqual(@as(usize, 1), mock.logCount("devx late init"));
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.logsContain("devx v2 update"));
+    try expect(mock.logsContain("devx late update"));
+}
+
+test "multi-root lossless: one root's scan abort defers ITS edit only; the other root drains" {
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    const io = std.testing.io;
+    var dir_a = std.testing.tmpDir(.{ .iterate = true });
+    defer dir_a.cleanup();
+    var dir_b = std.testing.tmpDir(.{ .iterate = true });
+    defer dir_b.cleanup();
+
+    const file_a = "10_counter" ++ src.ext;
+    const file_b = "20_late" ++ src.ext;
+    try dir_a.dir.writeFile(io, .{ .sub_path = file_a, .data = src.v1 });
+    try dir_b.dir.writeFile(io, .{ .sub_path = file_b, .data = src.v1 });
+    scripting.registerScript("counter", src.v1);
+    scripting.registerScript("late", src.v1);
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, dir_a.dir);
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, dir_b.dir);
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump()); // baselines
+
+    // Both roots change; root A's scan (polled first) aborts. The abort
+    // is scoped to A — B's drain still lands, and A's edit is DEFERRED
+    // (baseline kept), not lost.
+    try dir_a.dir.writeFile(io, .{ .sub_path = file_a, .data = src.v2 });
+    try dir_b.dir.writeFile(io, .{ .sub_path = file_b, .data = src.v2 });
+    const errors_before = watch.scan_error_count;
+    watch.debug_fail_scan = true;
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
+    try expectEqual(errors_before + 1, watch.scan_error_count);
+
+    // Next clean pump re-reports root A's deferred edit — lossless.
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump());
+}
+
+test "multi-root: the dirty-mark read retry is scoped to its own root" {
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    const io = std.testing.io;
+    var dir_a = std.testing.tmpDir(.{ .iterate = true });
+    defer dir_a.cleanup();
+    var dir_b = std.testing.tmpDir(.{ .iterate = true });
+    defer dir_b.cleanup();
+
+    const file_b = "20_late" ++ src.ext;
+    try dir_b.dir.writeFile(io, .{ .sub_path = file_b, .data = src.v1 });
+    scripting.registerScript("late", src.v1);
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, dir_a.dir);
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, dir_b.dir);
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump()); // baselines
+
+    // The atomic-save race on a SECOND-root file: the failed read must
+    // dirty-mark B's own watcher entry and retry from there.
+    try dir_b.dir.writeFile(io, .{ .sub_path = file_b, .data = src.v2 });
+    scripting.hot_reload.debug_fail_next_read = true;
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump());
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.logsContain("devx v2 update"));
+}
+
+test "watchDir is idempotent per path: re-registering replaces, a new path adds" {
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "scripts");
+    try tmp.dir.createDirPath(io, "packs/sky/scripts");
+
+    var path_buf: [512]u8 = undefined;
+    const base_len = try tmp.dir.realPath(io, &path_buf);
+    var scripts_buf: [600]u8 = undefined;
+    const scripts_path = try std.fmt.bufPrint(&scripts_buf, "{s}/scripts", .{path_buf[0..base_len]});
+    var pack_buf: [600]u8 = undefined;
+    const pack_path = try std.fmt.bufPrint(&pack_buf, "{s}/packs/sky/scripts", .{path_buf[0..base_len]});
+
+    // A trailing-slash + `/.` spelling of the SAME dir — canonicalizes
+    // (realpath) to the same root, so the dedup catches it.
+    var alias_buf: [640]u8 = undefined;
+    const scripts_alias = try std.fmt.bufPrint(&alias_buf, "{s}/./scripts/", .{path_buf[0..base_len]});
+
+    try scripting.hot_reload.watchDir(io, std.testing.allocator, scripts_path);
+    try expectEqual(@as(usize, 1), scripting.hot_reload.watchedRootCount());
+    // Same path again: REPLACED (no duplicate root double-reporting).
+    try scripting.hot_reload.watchDir(io, std.testing.allocator, scripts_path);
+    try expectEqual(@as(usize, 1), scripting.hot_reload.watchedRootCount());
+    // A DIFFERENT SPELLING of the same dir (`/./scripts/`) canonicalizes
+    // to the same root → still REPLACED, not a second root (#51 round-2).
+    try scripting.hot_reload.watchDir(io, std.testing.allocator, scripts_alias);
+    try expectEqual(@as(usize, 1), scripting.hot_reload.watchedRootCount());
+    // A genuinely different path ADDS.
+    try scripting.hot_reload.watchDir(io, std.testing.allocator, pack_path);
+    try expectEqual(@as(usize, 2), scripting.hot_reload.watchedRootCount());
+
+    // And the replaced root still watches: prime, edit, report.
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump());
+    try tmp.dir.writeFile(io, .{ .sub_path = "scripts/10_counter" ++ src.ext, .data = src.v1 });
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
+    try expectEqual(@as(usize, 1), mock.logCount("devx init ran"));
+}
+
+test "watchDir with an empty path never clobbers an existing (opened) root" {
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const file = "10_counter" ++ src.ext;
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = src.v1 });
+    scripting.registerScript("counter", src.v1);
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // An opened-handle root stores an EMPTY path. A watchDir("") must not
+    // match it by empty-string equality and silently replace it.
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, tmp.dir);
+    try expectEqual(@as(usize, 1), scripting.hot_reload.watchedRootCount());
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump()); // baseline
+
+    // watchDir("") either errors on open or adds a fresh root — but it
+    // NEVER replaces the opened root above (the empty-path identity guard).
+    scripting.hot_reload.watchDir(io, std.testing.allocator, "") catch {};
+
+    // The original opened root is intact: its edit still reports.
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = src.v2 });
+    try expect(scripting.hot_reload.pump() >= 1);
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.logsContain("devx v2 update"));
+}
+
+// ── wall-clock pump (labelle-scripting#51 — reload while paused) ───────
+
+test "pumpFrame reloads with NO Controller.tick at all (paused game) and throttles on wall-clock" {
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    defer scripting.hot_reload.poll_interval_ms = 250;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const file = "10_counter" ++ src.ext;
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = src.v1 });
+    scripting.registerScript("counter", src.v1);
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, tmp.dir);
+
+    // First frame pump primes the baseline (the countdown-starts-spent
+    // analog of the tick path).
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pumpFrame());
+
+    // The paused-game scenario: the generated loop skips Controller.tick
+    // entirely at time_scale == 0, but keeps calling pumpFrame every
+    // frame. Within one interval the pump is wall-clock-throttled (the
+    // interval is widened so a slow CI can't make it spuriously due)…
+    scripting.hot_reload.poll_interval_ms = 3_600_000;
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = src.v2 });
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pumpFrame());
+    // …and once due (interval forced open), the edit reloads WITHOUT any
+    // Controller.tick having run.
+    scripting.hot_reload.poll_interval_ms = 0;
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pumpFrame());
+    try expectEqual(@as(usize, 2), mock.logCount("devx init ran"));
+    // The reloaded behavior ticks once the game unpauses.
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.logsContain("devx v2 update"));
+}
+
+test "pumpFrame throttle resets when a root is added: a late root polls promptly" {
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    defer scripting.hot_reload.poll_interval_ms = 250;
+    const io = std.testing.io;
+    var dir_a = std.testing.tmpDir(.{ .iterate = true });
+    defer dir_a.cleanup();
+    var dir_b = std.testing.tmpDir(.{ .iterate = true });
+    defer dir_b.cleanup();
+
+    const file_b = "20_late" ++ src.ext;
+    try dir_b.dir.writeFile(io, .{ .sub_path = file_b, .data = src.v1 });
+    try scripting.Controller.setup(.{}); // no scripts registered → no init yet
+    defer scripting.Controller.deinit();
+
+    // Root A watched, pumpFrame primes it and STAMPS the throttle clock.
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, dir_a.dir);
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pumpFrame());
+
+    // WIDEN the interval so a plain pumpFrame would now be throttled OUT
+    // (return early WITHOUT polling). Then add root B. Adding a root
+    // resets the throttle stamp (#51 round-2) — so this pumpFrame runs
+    // and primes B, instead of being stuck an hour behind A's stamp.
+    // Had the stamp NOT reset, B would never prime here, and its edit
+    // below would be swallowed into a first-time baseline (→ 0 reloads).
+    scripting.hot_reload.poll_interval_ms = 3_600_000;
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, dir_b.dir);
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pumpFrame()); // B PRIMED (not throttled)
+
+    // Edit B, force the interval open, pump: because B was primed above,
+    // this is a real CHANGE → one reload (init replays). Without the
+    // reset it would instead be B's first baseline and reload nothing.
+    try dir_b.dir.writeFile(io, .{ .sub_path = file_b, .data = src.v2 });
+    scripting.hot_reload.poll_interval_ms = 0;
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pumpFrame());
+    try expectEqual(@as(usize, 1), mock.logCount("devx init ran"));
+}
+
+test "multi-root prefix: a namespaced root reloads under <prefix><stem>, never aliasing the game root" {
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    const io = std.testing.io;
+    var game_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer game_dir.cleanup();
+    var pack_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer pack_dir.cleanup();
+
+    // Both roots ship a same-stem file `10_counter` → stem "counter".
+    // The game registers "counter"; the pack registers "sky__counter"
+    // (the namespace the assembler will emit once pack scripts are
+    // consumed). Editing the PACK file must reload sky__counter, never
+    // clobber the game's counter.
+    const file = "10_counter" ++ src.ext;
+    try game_dir.dir.writeFile(io, .{ .sub_path = file, .data = src.v1 });
+    try pack_dir.dir.writeFile(io, .{ .sub_path = file, .data = src.late });
+    scripting.registerScript("counter", src.v1);
+    scripting.registerScript("sky__counter", src.v1);
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, game_dir.dir);
+    try scripting.hot_reload.watchOpenedDirNamed(io, std.testing.allocator, pack_dir.dir, "sky__");
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump()); // baselines
+
+    // Edit ONLY the pack file. It reports stem "counter" from its root,
+    // which reloads under the root's prefix → "sky__counter". The game's
+    // "counter" registration is untouched.
+    try pack_dir.dir.writeFile(io, .{ .sub_path = file, .data = src.v2 });
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
+    scripting.Controller.tick(.{}, 0.016);
+    // The pack's counter now runs v2 behavior; the game's counter never
+    // reloaded (still v1) — no cross-root alias.
+    try expect(mock.logsContain("devx v2 update"));
+    // Prove non-alias: the game file, edited, reloads the GAME counter
+    // under the bare stem — a distinct registration.
+    try game_dir.dir.writeFile(io, .{ .sub_path = file, .data = src.v2 });
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
+}
+
+test "watchDirPrefixTooLong: an over-long namespace is refused, not truncated" {
+    if (scripting.language != .lua) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const long_prefix = "x" ** (scripting.hot_reload.max_name_prefix + 1);
+    try std.testing.expectError(
+        error.WatchDirPrefixTooLong,
+        scripting.hot_reload.watchOpenedDirNamed(io, std.testing.allocator, tmp.dir, long_prefix),
+    );
+    try expectEqual(@as(usize, 0), scripting.hot_reload.watchedRootCount());
+}
+
 test "ruby: a script discovered mid-run inits BEFORE its controllers set up" {
     // The boot order — every init, then controller setup — must hold for
     // the reload lifecycle too: a controller's setup may depend on
