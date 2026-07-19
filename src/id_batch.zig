@@ -90,6 +90,16 @@ var stash_count: usize = 0; // entities the get resolved
 var stash_stride: usize = 0; // f32-stream BYTES per row, from the get
 var id_store: []u64 = &.{}; // ids[0..stash_count] valid while stash_valid
 
+/// AMBIGUOUS-INTERLEAVE POISON (scripting#58 round 3). The `(names, count,
+/// stride)` identity cannot tell two DIFFERENT same-shape batches apart
+/// (no per-buffer handle crosses the flat-float API). So when a new
+/// `batch_get` arrives while a same-identity stash is still PENDING, the
+/// ids could belong to either buffer — poison the stash, and the next
+/// matching `batch_set` degrades to the POSITIONAL path (safe, just not
+/// id-optimized) instead of pairing with possibly-wrong ids. This ENFORCES
+/// the "no nested batch over the same names" rule the preludes document.
+var stash_poison: bool = false;
+
 var row_scratch: []u8 = &.{};
 
 /// Test seam: reallocations across the buffers (proves they settle).
@@ -100,6 +110,7 @@ fn clearStash() void {
     stash_names_len = 0;
     stash_count = 0;
     stash_stride = 0;
+    stash_poison = false;
 }
 
 /// Record the names key for the current stash; false when it can't be held
@@ -147,6 +158,13 @@ fn ensureRows(n: usize) []u8 {
 /// decodes the positional variant. Every call FIRST invalidates any prior
 /// stash (a new get supersedes the old pending batch).
 pub fn stripIds(names: []const u8, raw: []u8, n: usize) usize {
+    // Capture the pending stash's identity BEFORE clearing, to detect an
+    // ambiguous same-shape interleave (a new get arriving while an
+    // un-consumed same-identity stash is still live — see `stash_poison`).
+    const prev_pending = stash_valid;
+    const prev_names_match = prev_pending and namesMatch(names);
+    const prev_count = stash_count;
+    const prev_stride = stash_stride;
     // A new get always supersedes the previous pending batch — interleaved
     // gets can never leave two live stashes.
     clearStash();
@@ -155,7 +173,11 @@ pub fn stripIds(names: []const u8, raw: []u8, n: usize) usize {
     if (count == 0) {
         // Empty result: record an empty pairing so the paired empty set is
         // recognized (and any nonempty later set is treated as unpaired).
-        if (recordNames(names)) stash_valid = true;
+        if (recordNames(names)) {
+            stash_valid = true;
+            // Same-names count-0 twice while pending → ambiguous.
+            if (prev_names_match and prev_count == 0) stash_poison = true;
+        }
         return 4; // count header only, no rows
     }
     const body = n - 4;
@@ -180,6 +202,11 @@ pub fn stripIds(names: []const u8, raw: []u8, n: usize) usize {
         stash_valid = true;
         stash_count = count;
         stash_stride = stride;
+        // If the SUPERSEDED stash had the identical identity, two same-shape
+        // buffers are live at once — poison so the paired set can't mispair
+        // ids across them (it will take the positional path instead).
+        if (prev_names_match and prev_count == count and prev_stride == stride)
+            stash_poison = true;
     }
     return dst;
 }
@@ -197,9 +224,16 @@ pub fn stripIds(names: []const u8, raw: []u8, n: usize) usize {
 /// int -2, unknown -1). Returns the contract rc.
 pub fn setWithIds(names: []const u8, stream: []const u8) i32 {
     if (stash_valid and namesMatch(names) and stream.len == stash_count * stash_stride) {
-        // Paired id-path set — consumed whatever the outcome, so spent ids
-        // can never be reused by a later unpaired set.
+        // Paired-shape set — consumed whatever the outcome (so spent ids
+        // can never be reused, and a poisoned interleave forces every
+        // subsequent set positional too).
         defer clearStash();
+        if (stash_poison) {
+            // Ambiguous same-shape interleave: the stashed ids may belong to
+            // a different buffer. Degrade to positional rather than mispair.
+            const p: ?[*]const u8 = if (stream.len == 0) null else stream.ptr;
+            return contract.labelle_component_batch_set(names.ptr, names.len, p, stream.len);
+        }
         if (stash_count == 0) {
             // Empty paired set: zero rows.
             return contract.labelle_component_batch_set_ids(names.ptr, names.len, null, 0);
@@ -230,9 +264,11 @@ pub fn stashedCount() usize {
     return if (stash_valid) stash_count else 0;
 }
 
-/// Test seam: drop any pending stash so a suite can assert the
-/// no-stash/standalone path from a known-clean state. Never needed in a
-/// game (the lifecycle clears itself), but tests share this process-global.
-pub fn resetStash() void {
+/// Drop any pending stash. Called by the bindings on EVERY non-success
+/// `batch_get` exit (a refused / not-bound / malformed get, before it can
+/// call `stripIds`) so a failed get can never leave stale ids for a later
+/// set to mispair with — parity with `stripIds`'s own clear-on-entry. Also
+/// the suites' known-clean-state seam.
+pub fn invalidateStash() void {
     clearStash();
 }

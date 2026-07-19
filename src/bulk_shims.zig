@@ -117,10 +117,18 @@ export fn labelle_scripting_bulk_batch_get(
         // Id path: fetch `[u32 count][ (u64 id)(floats) ]*`, then compact
         // in place to `[u32 count][floats]*` and stash the ids.
         const n = contract.labelle_component_batch_get_ids(names_json, names_json_len, out, out_cap);
-        // Sentinels / grow-retry pass straight through (the id-tagged
-        // required size is the caller's grow target — a bit larger than
-        // the compacted size, which is fine; the retry lands ≤ cap).
-        if (n == contract.BATCH_INT_REFUSED or n == 0) return n;
+        // A REFUSED / not-bound / malformed get is terminal — it never
+        // reaches `stripIds`, so clear the stash HERE (parity with the
+        // codec's clear-on-entry); otherwise a failed get would leave a
+        // prior get's stale ids for the next set to mispair with. The
+        // sizing-probe (out == null) and grow-retry (n > out_cap) legs are
+        // NOT terminal — the caller retries the same query, and that
+        // retry's `stripIds` must still see the pending stash to detect an
+        // ambiguous interleave — so they pass through without clearing.
+        if (n == contract.BATCH_INT_REFUSED or n == 0) {
+            id_batch.invalidateStash();
+            return n;
+        }
         const buf = out orelse return n; // sizing probe: report raw required
         if (n > out_cap) return n; // grow-retry against the raw required size
         return id_batch.stripIds(names_json[0..names_json_len], buf[0..n], n);

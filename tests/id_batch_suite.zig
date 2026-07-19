@@ -205,7 +205,7 @@ test "id_batch: interleaved get/get/set/set never crosses ids between queries" {
     // reattach B's ids to A's stream — it degrades to the positional path,
     // which re-queries A's own entities. set(B) stays on the id path.
     mock.reset();
-    id_batch.resetStash();
+    id_batch.invalidateStash();
     const a1 = mock.createEntityDirect();
     const a2 = mock.createEntityDirect();
     setPos(a1, 1, 1);
@@ -248,7 +248,7 @@ test "id_batch: interleaved get/get/set/set never crosses ids between queries" {
 
 test "id_batch: a standalone set (no paired get) uses the positional path, not the id reader" {
     mock.reset();
-    id_batch.resetStash();
+    id_batch.invalidateStash();
     const e1 = mock.createEntityDirect();
     setPos(e1, 1, 2);
     try expectEqual(@as(usize, 0), id_batch.stashedCount());
@@ -264,7 +264,7 @@ test "id_batch: a standalone set (no paired get) uses the positional path, not t
 
 test "id_batch: a resized stream is refused via positional, not misread as id rows" {
     mock.reset();
-    id_batch.resetStash();
+    id_batch.invalidateStash();
     const e1 = mock.createEntityDirect();
     const e2 = mock.createEntityDirect();
     setPos(e1, 1, 2);
@@ -284,7 +284,7 @@ test "id_batch: a resized stream is refused via positional, not misread as id ro
 
 test "id_batch: the stash is consumed after a set — a later unpaired set can't reuse spent ids" {
     mock.reset();
-    id_batch.resetStash();
+    id_batch.invalidateStash();
     const e1 = mock.createEntityDirect();
     const e2 = mock.createEntityDirect();
     setPos(e1, 1, 2);
@@ -317,4 +317,66 @@ test "id_batch: the stash is consumed after a set — a later unpaired set can't
     try expectEqualStrings("{\"x\":60,\"y\":61}", mock.componentJson(e2, "BatchPos").?);
     // The SPAWNED e3 was updated too → positional re-query, not stale ids.
     try expectEqualStrings("{\"x\":62,\"y\":63}", mock.componentJson(e3, "BatchPos").?);
+}
+
+test "id_batch: same-shape interleaved gets poison the stash (paired set degrades to positional)" {
+    // Two gets of the same names+count+stride while the first is still
+    // pending: the identity can't tell the buffers apart, so the stash is
+    // poisoned and the paired set takes the POSITIONAL path instead of
+    // pairing with possibly-wrong ids. Observable via a count-change: the
+    // positional path REFUSES the count-2 stream (-1), whereas the id path
+    // would have returned 0 (skipping the dead row) and mutated e1.
+    mock.reset();
+    id_batch.invalidateStash();
+    const e1 = mock.createEntityDirect();
+    const e2 = mock.createEntityDirect();
+    setPos(e1, 1, 2);
+    setPos(e2, 3, 4);
+    var buf1: [256]u8 = undefined;
+    var buf2: [256]u8 = undefined;
+    _ = getAndStash(NAMES, &buf1); // get1: stash {names, count 2, stride 8}
+    _ = getAndStash(NAMES, &buf2); // get2: SAME identity while get1 pending → poison
+    try expectEqual(@as(usize, 2), id_batch.stashedCount());
+
+    // Change the current query count, then set the (poisoned) stream.
+    mock.destroyEntityDirect(e2);
+    var stream: [16]u8 = undefined;
+    writeF32(&stream, 0, 77);
+    writeF32(&stream, 4, 78);
+    writeF32(&stream, 8, 79);
+    writeF32(&stream, 12, 80);
+    // Poison → positional _batch_set, whose preflight refuses the count-2
+    // stream against the now-count-1 query.
+    try expectEqual(@as(i32, -1), id_batch.setWithIds(NAMES, &stream));
+    // Nothing written — the poisoned set never reached the id reader.
+    try expectEqualStrings("{\"x\":1,\"y\":2}", mock.componentJson(e1, "BatchPos").?);
+}
+
+test "id_batch: a failed get clears the stash — the next set goes positional, not stale-id" {
+    // Finding #1: a terminal-failure get never reaches `stripIds`, so the
+    // binding/shim calls `invalidateStash()` on that exit (modeled here).
+    // Without it a failed get would leave a prior get's ids for the next
+    // set to mispair with.
+    mock.reset();
+    id_batch.invalidateStash();
+    const e1 = mock.createEntityDirect();
+    const e2 = mock.createEntityDirect();
+    setPos(e1, 1, 2);
+    setPos(e2, 3, 4);
+    var buf: [256]u8 = undefined;
+    _ = getAndStash(NAMES, &buf); // a successful get leaves a pending stash
+    try expectEqual(@as(usize, 2), id_batch.stashedCount());
+
+    // A failing get (refused / not bound) drops the stash on its exit path.
+    id_batch.invalidateStash();
+    try expectEqual(@as(usize, 0), id_batch.stashedCount());
+
+    // Destroy e2, then set: with no stash the set goes positional (refuses
+    // the count-changed 2-row stream, -1). A leftover stale stash would
+    // instead take the id path (skip the dead e2, return 0, mutate e1).
+    mock.destroyEntityDirect(e2);
+    var stream: [16]u8 = undefined;
+    @memset(&stream, 0);
+    try expectEqual(@as(i32, -1), id_batch.setWithIds(NAMES, &stream));
+    try expectEqualStrings("{\"x\":1,\"y\":2}", mock.componentJson(e1, "BatchPos").?);
 }

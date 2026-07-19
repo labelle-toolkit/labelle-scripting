@@ -730,13 +730,25 @@ fn rawBatchGet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
         var buf = io_scratch.ensure(mrb, SCRATCH_INITIAL_CAP);
         var n = batchGet(names.ptr, names.len, buf, io_scratch.cap);
         // The refusal sentinel must be checked BEFORE the grow-retry: it is
-        // (size_t)-2, which would otherwise read as a required size.
-        if (n == contract.BATCH_INT_REFUSED) raiseBatchIntRefused(mrb, names);
-        if (n == 0) return c.Value.int(0); // not bound / malformed
+        // (size_t)-2, which would otherwise read as a required size. A
+        // terminal-failure get never reaches `stripIds`, so it must drop any
+        // prior stash itself (else a failed get leaves stale ids for the
+        // next set to mispair with).
+        if (n == contract.BATCH_INT_REFUSED) {
+            if (comptime contract.host_has_id_batch) id_batch.invalidateStash();
+            raiseBatchIntRefused(mrb, names);
+        }
+        if (n == 0) {
+            if (comptime contract.host_has_id_batch) id_batch.invalidateStash();
+            return c.Value.int(0); // not bound / malformed
+        }
         if (n > io_scratch.cap) {
             buf = io_scratch.ensure(mrb, n);
             n = batchGet(names.ptr, names.len, buf, io_scratch.cap);
-            if (n == 0 or n > io_scratch.cap) return c.Value.int(0); // belt
+            if (n == 0 or n > io_scratch.cap) {
+                if (comptime contract.host_has_id_batch) id_batch.invalidateStash();
+                return c.Value.int(0); // belt
+            }
         }
         // Strip the id column in place (id path only): compacts the buffer
         // to the positional layout and stashes the ids for `raw_batch_set`.

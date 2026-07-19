@@ -561,9 +561,15 @@ fn rawBatchGet(L: ?*c.State) callconv(.c) c_int {
         var buf = ensureScratch(L, SCRATCH_INITIAL_CAP);
         var n = batchGet(names.ptr, names.len, buf, scratch.cap);
         // The refusal sentinel must be checked BEFORE the grow-retry: it
-        // is (size_t)-2, which would otherwise read as a required size.
-        if (n == contract.BATCH_INT_REFUSED) raiseBatchIntRefused(L, names);
+        // is (size_t)-2, which would otherwise read as a required size. A
+        // terminal-failure get never reaches `stripIds`, so it drops any
+        // prior stash itself (else stale ids linger for the next set).
+        if (n == contract.BATCH_INT_REFUSED) {
+            if (comptime contract.host_has_id_batch) id_batch.invalidateStash();
+            raiseBatchIntRefused(L, names);
+        }
         if (n == 0) {
+            if (comptime contract.host_has_id_batch) id_batch.invalidateStash();
             c.lua_pushinteger(L, 0); // not bound / malformed
             return 1;
         }
@@ -571,6 +577,7 @@ fn rawBatchGet(L: ?*c.State) callconv(.c) c_int {
             buf = ensureScratch(L, n);
             n = batchGet(names.ptr, names.len, buf, scratch.cap);
             if (n == 0 or n > scratch.cap) { // belt
+                if (comptime contract.host_has_id_batch) id_batch.invalidateStash();
                 c.lua_pushinteger(L, 0);
                 return 1;
             }
