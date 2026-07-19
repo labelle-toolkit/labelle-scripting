@@ -162,7 +162,7 @@ class BatchFlat < Labelle::Script
   end
 end
 
-# ── scenario "bulk_stale": the positional-coupling guard ───────────────
+# ── scenario "bulk_stale": the id-tagged destroy+spawn skip (v1.4) ──────
 
 class BatchStale < Labelle::Script
   @es = [] of Labelle::EntityId
@@ -180,15 +180,20 @@ class BatchStale < Labelle::Script
 
   def update(dt : Float32) : Nil
     Labelle.batch_get(BatchFlat::NAMES, @buf, @scratch)
-    # Mutate everything so a wrongly-accepted write would be visible…
-    @buf.map! { |v| v + 100.0_f32 }
-    # …then the forbidden move: destroy between the paired calls.
+    # Rewrite every field to a distinctive marker.
+    @buf.each_index { |k| @buf[k] = (100 + k).to_f32 }
+    # The same-count destroy+spawn between the paired calls: the id path
+    # skips the dead row rather than shifting it onto the new entity that
+    # takes the query slot (which the positional variant would have done).
     Labelle.destroy_entity(@es[1])
+    fresh = Labelle.create_entity
+    BulkUtil.set_json(fresh, "BatchPos", %({"x":7,"y":8}))
+    BulkUtil.set_json(fresh, "BatchVel", %({"vx":9,"vy":9}))
     begin
       Labelle.batch_set(BatchFlat::NAMES, @buf, 2, @scratch)
-      Labelle.log("crystal: stale write accepted")
+      Labelle.log("crystal: id-batch accepted")
     rescue ex : Labelle::BatchError
-      Labelle.log("crystal: stale refused: #{ex.message}")
+      Labelle.log("crystal: id-batch refused: #{ex.message}")
     end
   end
 end

@@ -247,18 +247,22 @@ test "bulk v1.3: batch_get/batch_set round-trip the whole query as one f32 strea
     try expectComponent(4, "BatchPos", "{\"x\":7,\"y\":8}");
 }
 
-test "bulk v1.3: batch_set errors when the entity set changed since batch_get" {
+test "bulk v1.4: id-tagged batch_set skips a destroy+spawn stale row (new occupant untouched)" {
     fresh();
     selectScenario("bulk_stale");
     try scripting.Controller.setup(.{});
     defer scripting.Controller.deinit();
 
     scripting.Controller.tick(.{}, 0.016);
-    // The exact-size positional-coupling guard fired and surfaced as
-    // ErrBatchEntitySetChanged — safe to catch and re-get.
-    try expect(mock.logsContain("go: stale refused:true"));
-    // NOTHING was applied: the survivor keeps its batch_get-era value.
-    try expectComponent(1, "BatchPos", "{\"x\":0,\"y\":0}");
+    // The id path accepts the write (no positional refusal) — it skips the
+    // dead row rather than failing the batch.
+    try expect(mock.logsContain("go: id-batch accepted:true"));
+    // The survivor got its marker row…
+    try expectComponent(1, "BatchPos", "{\"x\":100,\"y\":101}");
+    // …and the SPAWNED entity (id 3) kept its own values: the stale row for
+    // the destroyed entity 2 did NOT land on it (positional WOULD have).
+    try expectComponent(3, "BatchPos", "{\"x\":7,\"y\":8}");
+    try expectComponent(3, "BatchVel", "{\"vx\":9,\"vy\":9}");
 }
 
 test "bulk v1.3: the typed view tier round-trips through Batch2" {

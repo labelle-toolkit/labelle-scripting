@@ -253,7 +253,7 @@ impl Script for BatchFlat {
     }
 }
 
-// ── scenario "bulk_stale": the positional-coupling guard ────────────────
+// ── scenario "bulk_stale": the id-tagged destroy+spawn skip (v1.4) ───────
 
 #[derive(Default)]
 pub struct BatchStale {
@@ -273,19 +273,23 @@ impl Script for BatchStale {
     }
 
     fn update(&mut self, _dt: f32) {
-        let _count =
+        let count =
             labelle::batch_get(NAMES, &mut self.buf, &mut self.scratch).expect("batch_get refused");
-        // Mutate everything so a wrongly-accepted write would be visible…
-        for v in self.buf.iter_mut() {
-            *v += 100.0;
+        let _ = count;
+        // Rewrite every field to a distinctive marker.
+        for (k, v) in self.buf.iter_mut().enumerate() {
+            *v = 100.0 + k as f32;
         }
-        // …then the forbidden move: destroy between the paired calls.
+        // The same-count destroy+spawn between the paired calls: the id
+        // path skips the dead row rather than shifting it onto the new
+        // entity that takes the query slot (which the positional variant
+        // would have done).
         labelle::destroy_entity(self.es[1]);
+        let fresh = labelle::create_entity();
+        set_json(fresh, "BatchPos", "{\"x\":7,\"y\":8}");
+        set_json(fresh, "BatchVel", "{\"vx\":9,\"vy\":9}");
         let r = labelle::batch_set(NAMES, &self.buf, &mut self.scratch);
-        labelle::log(&format!(
-            "rust: stale refused:{}",
-            r == Err(BatchError::EntitySetChanged)
-        ));
+        labelle::log(&format!("rust: id-batch accepted:{}", r.is_ok()));
     }
 }
 

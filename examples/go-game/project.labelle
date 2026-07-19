@@ -59,12 +59,12 @@
     // siblings to pin — the one `local:` dep is the plugin itself, plus
     // the labelle-null sibling above).
     .core_version = "1.26.0",
-    // >= 2.6.0: keeps this example on the same engine floor as the
-    // rust/crystal examples (the contract v1.3 bulk-access exports the
-    // plugin's go batch tier binds — labelle-scripting#44 — resolve
-    // through the always-present shims regardless, but pinning the same
-    // floor keeps the four native examples on one engine).
-    .engine_version = "2.6.0",
+    // >= 2.7.0: keeps this example on the same engine floor as the
+    // rust/crystal examples (the id-tagged batch the plugin's go batch
+    // tier now defaults to — labelle-scripting#57 — resolves through the
+    // always-present shims, but pinning the 2.7.0 marker floor keeps the
+    // four native examples on one engine).
+    .engine_version = "2.7.0",
     .gfx_version = "1.28.1",
     // Pin the assembler SOURCE package explicitly (the rust/crystal/csharp
     // examples don't need to — they ride v0.88.0, whose scaffold default

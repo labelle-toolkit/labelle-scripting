@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const contract = @import("../contract.zig");
+const id_batch = @import("../id_batch.zig");
 const vm_mod = @import("vm.zig");
 const c = vm_mod.c;
 const Vm = vm_mod.Vm;
@@ -717,16 +718,42 @@ fn rawBatchGet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
         _ = c.mrb_get_args(mrb, "sA", &np, &nl, &arr);
         const names = np[0..@intCast(nl)];
 
+        // Contract v1.4 default: the id-tagged read (`_batch_get_ids`),
+        // which stashes each entity's id binding-side and hands the SAME
+        // positional `[u32 count][f32 stream]` back to this decode loop —
+        // the flat-float API is unchanged. On a v1.3-only host the
+        // comptime const falls back to the positional `_batch_get`.
+        const batchGet = if (comptime contract.host_has_id_batch)
+            contract.labelle_component_batch_get_ids
+        else
+            contract.labelle_component_batch_get;
         var buf = io_scratch.ensure(mrb, SCRATCH_INITIAL_CAP);
-        var n = contract.labelle_component_batch_get(names.ptr, names.len, buf, io_scratch.cap);
+        var n = batchGet(names.ptr, names.len, buf, io_scratch.cap);
         // The refusal sentinel must be checked BEFORE the grow-retry: it is
-        // (size_t)-2, which would otherwise read as a required size.
-        if (n == contract.BATCH_INT_REFUSED) raiseBatchIntRefused(mrb, names);
-        if (n == 0) return c.Value.int(0); // not bound / malformed
+        // (size_t)-2, which would otherwise read as a required size. A
+        // terminal-failure get never reaches `stripIds`, so it must drop any
+        // prior stash itself (else a failed get leaves stale ids for the
+        // next set to mispair with).
+        if (n == contract.BATCH_INT_REFUSED) {
+            if (comptime contract.host_has_id_batch) id_batch.invalidateStash();
+            raiseBatchIntRefused(mrb, names);
+        }
+        if (n == 0) {
+            if (comptime contract.host_has_id_batch) id_batch.invalidateStash();
+            return c.Value.int(0); // not bound / malformed
+        }
         if (n > io_scratch.cap) {
             buf = io_scratch.ensure(mrb, n);
-            n = contract.labelle_component_batch_get(names.ptr, names.len, buf, io_scratch.cap);
-            if (n == 0 or n > io_scratch.cap) return c.Value.int(0); // belt
+            n = batchGet(names.ptr, names.len, buf, io_scratch.cap);
+            if (n == 0 or n > io_scratch.cap) {
+                if (comptime contract.host_has_id_batch) id_batch.invalidateStash();
+                return c.Value.int(0); // belt
+            }
+        }
+        // Strip the id column in place (id path only): compacts the buffer
+        // to the positional layout and stashes the ids for `raw_batch_set`.
+        if (comptime contract.host_has_id_batch) {
+            n = id_batch.stripIds(names, buf[0..n], n);
         }
         if (n < 4) return c.Value.int(0);
         const count = std.mem.readInt(u32, buf[0..4], .little);
@@ -811,7 +838,14 @@ fn rawBatchSet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
             );
             std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f), .little);
         }
-        const rc = contract.labelle_component_batch_set(names.ptr, names.len, buf, bytes);
+        // Contract v1.4 default: `_batch_set_ids` — re-attach the ids
+        // stashed by the paired `raw_batch_get` and apply BY ID, so a
+        // destroy+spawn since the get skips the stale row instead of
+        // landing it on the new occupant. v1.3-only host: positional set.
+        const rc = if (comptime contract.host_has_id_batch)
+            id_batch.setWithIds(names, buf[0..bytes])
+        else
+            contract.labelle_component_batch_set(names.ptr, names.len, buf, bytes);
         if (rc == -2) raiseBatchIntRefused(mrb, names);
         if (rc != 0) raiseFmt(
             mrb,

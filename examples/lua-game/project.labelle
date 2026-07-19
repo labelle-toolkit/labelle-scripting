@@ -49,11 +49,13 @@
         },
     },
     // Registry-resolved toolkit releases (the one `local:` dep is the
-    // plugin itself, plus the labelle-null sibling above). 2.6.0 = the
-    // bulk-access floor (contract v1.3, labelle-scripting#41):
-    // scripts/10_swarm.lua exercises labelle.batch, which RAISES on
-    // older hosts by design (no silent batch fallback).
+    // plugin itself, plus the labelle-null sibling above). 2.7.0 = the
+    // id-tagged batch floor (contract v1.4, labelle-scripting#57 — the
+    // batch_id_row_prefix marker; v1.3 bulk-access was 2.6.0):
+    // scripts/10_swarm.lua exercises labelle.batch, which now DEFAULTS to
+    // the id-tagged variant and RAISES on pre-2.6.0 hosts by design (no
+    // silent batch fallback).
     .core_version = "1.26.0",
-    .engine_version = "2.6.0",
+    .engine_version = "2.7.0",
     .gfx_version = "1.28.1",
 }

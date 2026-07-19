@@ -99,7 +99,7 @@ func (b *BatchFlat) Update(dt float32) {
 	}
 }
 
-// ── scenario "bulk_stale": the positional-coupling guard ────────────────
+// ── scenario "bulk_stale": the id-tagged destroy+spawn skip (v1.4) ───────
 
 type BatchStale struct {
 	labelle.NoopScript
@@ -122,14 +122,19 @@ func (b *BatchStale) Update(dt float32) {
 	if err != nil {
 		panic("batch_get refused")
 	}
-	// Mutate everything so a wrongly-accepted write would be visible…
+	// Rewrite every field to a distinctive marker.
 	for i := range b.buf {
-		b.buf[i] += 100
+		b.buf[i] = float32(100 + i)
 	}
-	// …then the forbidden move: destroy between the paired calls.
+	// The same-count destroy+spawn between the paired calls: the id path
+	// skips the dead row rather than shifting it onto the new entity that
+	// takes the query slot (which the positional variant would have done).
 	labelle.DestroyEntity(b.es[1])
+	fresh := labelle.CreateEntity()
+	setJSON(fresh, "BatchPos", `{"x":7,"y":8}`)
+	setJSON(fresh, "BatchVel", `{"vx":9,"vy":9}`)
 	err = labelle.BatchSet(batchNames, b.buf)
-	labelle.Logf("go: stale refused:%v", errors.Is(err, labelle.ErrBatchEntitySetChanged))
+	labelle.Logf("go: id-batch accepted:%v", err == nil)
 }
 
 // ── scenario "bulk_iter": the typed view tier (steady state) ────────────

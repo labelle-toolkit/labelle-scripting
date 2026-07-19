@@ -52,6 +52,7 @@
 //! probe-matches-link-truth invariant a generated game has.
 
 const contract = @import("contract.zig");
+const id_batch = @import("id_batch.zig");
 
 /// 1 when the host engine exports the contract v1.3 bulk-access
 /// symbols (labelle-engine >= 2.6.0), else 0. The native bindings call
@@ -97,31 +98,62 @@ export fn labelle_scripting_bulk_set_packed(
     return -1;
 }
 
-/// Forward of `labelle_component_batch_get` (contract v1.3). On a
-/// pre-v1.3 host: 0 (malformed/not-bound) — belt only; the binding
-/// wrappers check `labelle_scripting_bulk_capability` first and raise
-/// the loud unsupported error instead of ever reading this 0.
+/// Forward of the batched read (contract v1.3+). On an engine ≥ 2.7.0
+/// (contract v1.4) this DEFAULTS to the id-tagged `_batch_get_ids` and
+/// strips the id column binding-side: `out` still returns the positional
+/// `[u32 count][f32 stream]` the native decoders expect (the id column is
+/// stashed for the paired set), so rust/crystal/csharp/go stay UNCHANGED
+/// while gaining the destroy+spawn safety. On a v1.3-only host it forwards
+/// the positional `_batch_get`. On a pre-v1.3 host: 0 (malformed/not-bound)
+/// — belt only; the binding wrappers check `labelle_scripting_bulk_capability`
+/// first and raise the loud unsupported error instead of ever reading it.
 export fn labelle_scripting_bulk_batch_get(
     names_json: [*]const u8,
     names_json_len: usize,
     out: ?[*]u8,
     out_cap: usize,
 ) usize {
-    if (comptime contract.host_has_bulk_access) {
+    if (comptime contract.host_has_id_batch) {
+        // Id path: fetch `[u32 count][ (u64 id)(floats) ]*`, then compact
+        // in place to `[u32 count][floats]*` and stash the ids.
+        const n = contract.labelle_component_batch_get_ids(names_json, names_json_len, out, out_cap);
+        // A REFUSED / not-bound / malformed get is terminal — it never
+        // reaches `stripIds`, so clear the stash HERE (parity with the
+        // codec's clear-on-entry); otherwise a failed get would leave a
+        // prior get's stale ids for the next set to mispair with. The
+        // sizing-probe (out == null) and grow-retry (n > out_cap) legs are
+        // NOT terminal — the caller retries the same query, and that
+        // retry's `stripIds` must still see the pending stash to detect an
+        // ambiguous interleave — so they pass through without clearing.
+        if (n == contract.BATCH_INT_REFUSED or n == 0) {
+            id_batch.invalidateStash();
+            return n;
+        }
+        const buf = out orelse return n; // sizing probe: report raw required
+        if (n > out_cap) return n; // grow-retry against the raw required size
+        return id_batch.stripIds(names_json[0..names_json_len], buf[0..n], n);
+    } else if (comptime contract.host_has_bulk_access) {
         return contract.labelle_component_batch_get(names_json, names_json_len, out, out_cap);
     }
     return 0;
 }
 
-/// Forward of `labelle_component_batch_set` (contract v1.3). On a
-/// pre-v1.3 host: -1 — belt only, like `..._batch_get`'s 0.
+/// Forward of the batched write (contract v1.3+). On an engine ≥ 2.7.0
+/// this DEFAULTS to `_batch_set_ids`: `buf` is the pure positional f32
+/// stream the native code packs (unchanged), and the shim re-attaches the
+/// ids stashed by the paired `_batch_get` to apply BY ID (skipping
+/// vanished/recycled entities). On a v1.3-only host it forwards the
+/// positional `_batch_set`. On a pre-v1.3 host: -1 — belt only.
 export fn labelle_scripting_bulk_batch_set(
     names_json: [*]const u8,
     names_json_len: usize,
     buf: ?[*]const u8,
     buf_len: usize,
 ) i32 {
-    if (comptime contract.host_has_bulk_access) {
+    if (comptime contract.host_has_id_batch) {
+        const stream: []const u8 = if (buf) |p| p[0..buf_len] else &.{};
+        return id_batch.setWithIds(names_json[0..names_json_len], stream);
+    } else if (comptime contract.host_has_bulk_access) {
         return contract.labelle_component_batch_set(names_json, names_json_len, buf, buf_len);
     }
     return -1;

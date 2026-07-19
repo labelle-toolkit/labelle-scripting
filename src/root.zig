@@ -46,6 +46,13 @@ const build_options = @import("scripting_options");
 
 pub const contract = @import("contract.zig");
 
+/// Binding-side id-column codec for the contract v1.4 id-tagged batch
+/// (labelle-engine#788): the get→set round-trip that holds each entity's
+/// id binding-internal so the flat-float script API stays unchanged.
+/// Re-exported so the id_batch suite exercises the codec directly against
+/// the mock world's `_ids` exports.
+pub const id_batch = @import("id_batch.zig");
+
 /// Console-eval shared pieces (labelle-scripting#4): result shape, params
 /// decoding, bounded response-JSON builder. Engine-free — see
 /// `Controller.evalCommand` / `handleEvalCommand` below for the seams.

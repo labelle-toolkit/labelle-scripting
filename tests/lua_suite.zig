@@ -928,36 +928,48 @@ test "bulk v1.3: batch refuses int-carrying components loudly (never a silent co
     try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
 }
 
-test "bulk v1.3: batch_set raises when the entity set changed since batch_get" {
+test "bulk v1.4: id-tagged batch_set skips a destroy+spawn stale row (never lands on the new occupant)" {
     fresh();
-    scripting.registerScript("batch_stale",
+    // #57's new capability: a same-count destroy+spawn between batch_get and
+    // batch_set can no longer shift a stale row onto the spawned entity that
+    // took the query slot — the id path matches rows to entities BY ID.
+    scripting.registerScript("batch_idswap",
         \\local NAMES = { "BatchPos", "BatchVel" }
         \\local es = {}
         \\local buf = {}
         \\function init()
         \\  for i = 1, 2 do
         \\    local e = Entity.new()
-        \\    e:set("BatchPos", { x = i, y = 0 })
+        \\    e:set("BatchPos", { x = i - 1, y = 0 })
         \\    e:set("BatchVel", { vx = 1, vy = 1 })
         \\    es[i] = e
         \\  end
         \\end
         \\function update(dt)
         \\  local count = labelle.batch_get(NAMES, buf)
-        \\  es[2]:destroy() -- the forbidden move: destroy between get and set
+        \\  for k = 1, count * 4 do buf[k] = 99 + k end
+        \\  es[2]:destroy() -- destroy between get and set
+        \\  local fresh_e = Entity.new() -- ...and spawn a same-count replacement
+        \\  fresh_e:set("BatchPos", { x = 7, y = 8 })
+        \\  fresh_e:set("BatchVel", { vx = 9, vy = 9 })
         \\  local ok, err = pcall(function() labelle.batch_set(NAMES, buf, count) end)
-        \\  if ok then labelle.log("stale write accepted") else labelle.log("stale refused: " .. err) end
+        \\  if ok then labelle.log("id-batch write accepted") else labelle.log("id-batch refused: " .. err) end
         \\end
     );
     try scripting.Controller.setup(.{});
     defer scripting.Controller.deinit();
 
     scripting.Controller.tick(.{}, 0.016);
-    // The exact-size positional-coupling guard fired and surfaced as a
-    // catchable error telling the script to re-get.
-    try expect(!mock.logsContain("stale write accepted"));
-    try expect(mock.logsContain("stale refused:"));
-    try expect(mock.logsContain("entity set changed"));
+    // The write is accepted (no positional refusal) — the id path skips the
+    // dead row rather than failing the batch.
+    try expect(mock.logsContain("id-batch write accepted"));
+    try expect(!mock.logsContain("id-batch refused:"));
+    // Surviving entity 1 got its marker row (buf[1]=100, buf[2]=101).
+    try expectComponent(1, "BatchPos", "{\"x\":100,\"y\":101}");
+    // The SPAWNED entity (id 3) kept its own values — the stale row for the
+    // destroyed entity 2 did NOT land on it (positional WOULD have).
+    try expectComponent(3, "BatchPos", "{\"x\":7,\"y\":8}");
+    try expectComponent(3, "BatchVel", "{\"vx\":9,\"vy\":9}");
 }
 
 test "bulk stage 3: the labelle.batch for-in iterator round-trips through ONE reused view" {
