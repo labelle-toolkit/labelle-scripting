@@ -360,11 +360,17 @@ pub const hot_reload = struct {
 
         // Resolve the slot BEFORE opening: same-path → replace in place;
         // new path → append (capacity-checked so a failed registration
-        // never leaks a fresh handle).
+        // never leaks a fresh handle). The identity match is guarded on a
+        // NON-EMPTY path (and a full `mem.eql`, never a prefix): an empty
+        // `dir_path` carries no identity — it must never match a
+        // `watchOpenedDir` root (whose stored path is empty by
+        // construction, `r.path() == ""`) and silently replace it. A
+        // path past `max_root_path` also carries no stored identity, so
+        // it likewise can't match (it re-registers as a fresh root).
         var slot: ?*Root = null;
-        if (dir_path.len <= max_root_path) {
+        if (dir_path.len > 0 and dir_path.len <= max_root_path) {
             for (roots[0..root_count]) |*r| {
-                if (std.mem.eql(u8, r.path(), dir_path)) {
+                if (r.path_len > 0 and std.mem.eql(u8, r.path(), dir_path)) {
                     slot = r;
                     break;
                 }
@@ -377,9 +383,11 @@ pub const hot_reload = struct {
 
         if (slot) |r| {
             // Replacement: the previous handle was opened here, so it is
-            // ours to close (a borrowed watchOpenedDir handle never has a
-            // path and can't match).
-            if (r.opened_here) r.watcher.dir.close(io);
+            // ours to close — using the io that OPENED it (`r.watcher.io`,
+            // matching `stopWatching`), not necessarily the io passed to
+            // this call. A borrowed watchOpenedDir handle never has a path
+            // and can't match, so `opened_here` is always true here.
+            if (r.opened_here) r.watcher.dir.close(r.watcher.io);
             r.watcher = watch.Watcher.init(io, dir, ext);
             r.opened_here = true;
         } else {

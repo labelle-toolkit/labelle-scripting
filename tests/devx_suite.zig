@@ -585,6 +585,37 @@ test "watchDir is idempotent per path: re-registering replaces, a new path adds"
     try expectEqual(@as(usize, 1), mock.logCount("devx init ran"));
 }
 
+test "watchDir with an empty path never clobbers an existing (opened) root" {
+    if (comptime !is_vm_family) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const file = "10_counter" ++ src.ext;
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = src.v1 });
+    scripting.registerScript("counter", src.v1);
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // An opened-handle root stores an EMPTY path. A watchDir("") must not
+    // match it by empty-string equality and silently replace it.
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, tmp.dir);
+    try expectEqual(@as(usize, 1), scripting.hot_reload.watchedRootCount());
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump()); // baseline
+
+    // watchDir("") either errors on open or adds a fresh root — but it
+    // NEVER replaces the opened root above (the empty-path identity guard).
+    scripting.hot_reload.watchDir(io, std.testing.allocator, "") catch {};
+
+    // The original opened root is intact: its edit still reports.
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = src.v2 });
+    try expect(scripting.hot_reload.pump() >= 1);
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.logsContain("devx v2 update"));
+}
+
 // ── wall-clock pump (labelle-scripting#51 — reload while paused) ───────
 
 test "pumpFrame reloads with NO Controller.tick at all (paused game) and throttles on wall-clock" {
