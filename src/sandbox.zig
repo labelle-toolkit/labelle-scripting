@@ -33,7 +33,7 @@
 //!     os/std module layer) is deliberately not compiled (build.zig
 //!     `quickjs_sources`), and the labelle prelude binds no filesystem
 //!     API. The ts suite pins `os`/`std`/`require` undefined.
-//!   - native (rust/crystal/csharp) — no sandbox story by design
+//!   - native (rust/crystal/csharp/go) — no sandbox story by design
 //!     (RFC-LANGUAGE-PLUGINS: "full native performance, no VM, no
 //!     sandbox"); compiled game code links the game binary itself.
 //!

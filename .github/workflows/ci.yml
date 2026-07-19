@@ -60,6 +60,21 @@ jobs:
         with:
           dotnet-version: "7.0.x"
 
+      # The go sub-module's suite (labelle-engine#746): `zig build test`
+      # `go build -buildmode=c-archive`s tests/go's script archive (the
+      # SHIPPED native-go/ glue + labelle package recomposed around the
+      # suite's scenario package via a go.mod `replace`) and links it into
+      # the go test binary. cgo must be enabled (the contract binding IS
+      # cgo) — the default when a C compiler is present, which the ubuntu
+      # runner has. build.zig SKIPS the go binary when `go` is absent, so
+      # this step is what makes the lane actually run — drop it and go
+      # silently goes uncovered. gofmt checks below. Pinned minor:
+      # `go build -C` needs >= 1.20; bump deliberately, never float.
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
       # The lua dep is lazy — `zig build test` fetches it on demand
       # (network needed once; hash-pinned in build.zig.zon).
       #
@@ -105,6 +120,20 @@ jobs:
         # compile as the plugin package's game module out of the game's
         # scripts/ dir) — check the dir.
         run: crystal tool format --check native-crystal tests/crystal examples/crystal-game/scripts
+
+      - name: Go formatting
+        # gofmt over the shipped module, the test module and the example
+        # game's scripts (they compile as the plugin module's game package
+        # out of the game's scripts/ dir — no manifest of their own, like
+        # the rust/crystal examples). gofmt -l prints mis-formatted files;
+        # a non-empty list fails the step.
+        run: |
+          BAD=$(gofmt -l native-go tests/go examples/go-game/scripts)
+          if [ -n "$BAD" ]; then
+            echo "E: gofmt found unformatted files:"
+            printf '%s\n' "$BAD"
+            exit 1
+          fi
 
   # Ruby example game (labelle-scripting#10) — the ruby counterpart of the
   # assembler's `examples/scripting-smoke`, living in THIS repo so every
@@ -1246,6 +1275,238 @@ jobs:
             exit 1
           fi
           echo "PASS: the 100% crystal game (zero .zig) generated, built and ran green — hooks/ is proven OPTIONAL (14 tokens, ZIG_FEED_SEEN_0.5 alone gone)"
+
+  # Go example game (labelle-engine#746) — the THIRD native-compiled example,
+  # rust-example's c-archive twin, living in THIS repo so every push runs a
+  # real go game through the real assembler against the real engine:
+  # examples/go-game pins its scripting plugin `local:../..` (the CURRENT
+  # checkout), so native-go/ (labelle.go, batch.go, glue.go), the glue and
+  # src/go/vm.zig under review are exactly what `go build` compiles and the
+  # generated game links. Go's permanent regression net — and the end-to-end
+  # proof that generate → stage → go build -buildmode=c-archive → link → run
+  # works (the `.language_builds` c-archive recipe with the desktop `.os`
+  # allowlist), not just the mock-host suite.
+  #
+  # v1 SCOPE (demand-driven, labelle-engine#746): go ships NO declare tool
+  # yet, so this example's Hunger/Worker components and the hunger__feed
+  # event are authored in ZIG (components/*.zig, events/*.zig — the
+  # pre-declare convention), NOT declared in .go. So — unlike the
+  # rust/crystal jobs — there are no declare-phase assertions here, and the
+  # purity variant is intentionally absent (a 100%-go game needs a
+  # tools/declare-go, the documented follow-up). The transcript diff is the
+  # end-to-end proof: it requires the Zig-declared Hunger component to work
+  # through the real ECS driven entirely by go scripts over the contract.
+  go-example:
+    runs-on: ubuntu-latest
+    # Cold toolkit fetch + engine compile + one c-archive build normally
+    # lands well under 15; bound a wedged runner far below GitHub's 6h.
+    timeout-minutes: 30
+    env:
+      # The pinned labelle-assembler release the example generates with — a
+      # BINARY release (tag → release.yml assets). Go is `.kind = .native`
+      # with a `.language_builds` static_lib step, exactly the rust shape,
+      # and the assembler consumes `.languages` + `.language_builds`
+      # GENERICALLY (it never learns "go" or "cargo" — plugin.labelle's
+      # `.languages` doc). So any release whose generic native path is
+      # mature handles go with zero assembler changes; pinned at a recent
+      # release to ride that maturity. Bump deliberately, never float.
+      ASSEMBLER_VERSION: v0.94.0
+    steps:
+      # Checkout into a subdir so the example's sibling pins resolve:
+      # examples/go-game/../../../labelle-null = $GITHUB_WORKSPACE/labelle-null.
+      - uses: actions/checkout@v4
+        with:
+          path: labelle-scripting
+          # Read-only job: never persist the GITHUB_TOKEN in .git/config.
+          persist-credentials: false
+
+      # Sibling checkout for the null backend — same reason and same
+      # pattern as rust-example above (the `script_contract.bind`
+      # touchpoint is on labelle-null main, unreleased).
+      - name: Checkout labelle-null (bind touchpoint is unreleased)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The generated game's build SHELLS OUT to `go build` (the plugin's
+      # declared `.language_builds` step) — the toolchain must exist before
+      # `zig build`. cgo must be enabled (the contract binding IS cgo); the
+      # default when a C compiler is present, which the ubuntu runner has.
+      # Same pin story as the test job: `go build -C` needs >= 1.20.
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Download the pinned labelle-assembler release binary
+        run: |
+          curl -fL -o labelle-assembler \
+            "https://github.com/labelle-toolkit/labelle-assembler/releases/download/${ASSEMBLER_VERSION}/labelle-assembler-linux-x86_64"
+          chmod +x labelle-assembler
+
+      # Mirrors rust-example's flow: generate → codegen greps → build
+      # (fingerprint dance) → bounded headless run → ordered-transcript
+      # diff. The native-family deltas are the point of every grep below.
+      # Frame-by-frame timeline: scripts/game.go's header.
+      - name: Generate + build + run the go example game
+        run: |
+          # Actions' default shell has no pipefail — without it the tee
+          # below masks a failed generate with exit 0.
+          set -o pipefail
+
+          # Fresh HOME for the whole flow: the assembler keeps its package
+          # cache under ~/.labelle — never let a runner's (or a developer's)
+          # real one leak into the run. Go needs no HOME-survival dance
+          # (unlike rust's RUSTUP_HOME/CARGO_HOME): the toolchain resolves
+          # from its install prefix, and its only HOME-derived paths (the
+          # build/module caches under $HOME/.cache/go-build,
+          # $HOME/go/pkg/mod) land harmlessly inside the fresh HOME.
+          export HOME="$RUNNER_TEMP/labelle-home"
+          mkdir -p "$HOME"
+
+          cd labelle-scripting/examples/go-game
+          ASM=$GITHUB_WORKSPACE/labelle-assembler
+
+          # Fetch core/engine/gfx releases into the package cache. The
+          # scripting plugin needs no fetch (`local:../..` — this checkout)
+          # and neither does the backend (`backend_package` pins the sibling
+          # labelle-null clone above).
+          $ASM install --project-root .
+          $ASM generate --project-root . 2>&1 | tee generate.log
+
+          # Belt and braces on top of the exit code: never trust artifacts
+          # past a failed generate.
+          if grep -q 'generate failed' generate.log; then
+            echo "E: generate reported failure"
+            exit 1
+          fi
+
+          M=.labelle/null_desktop/main.zig
+          B=.labelle/null_desktop/build.zig
+
+          # THE native-family assertion: go arrives as machine code —
+          # nothing embeds, nothing registers. A registerScript line here
+          # means the splice fell back to the embed family.
+          if grep -q 'registerScript' $M; then
+            echo "E: registerScript emitted for a native-compiled language"
+            exit 1
+          fi
+          # The Zig-authored components wired into the game's component
+          # registry (go v1 has no declare tool — they are components/*.zig,
+          # read like any Zig game's components).
+          grep -qF 'components/hunger.zig' $M
+          grep -qF 'components/worker.zig' $M
+          # The Zig-authored event's union row.
+          grep -qF 'events/hunger__feed.zig' $M
+          # Splice (family-shared): the generated flag half of the
+          # templates' double-gate.
+          grep -qF 'const scripting_enabled = true;' $M
+          # labelle-null template: the bind touchpoint (proves the sibling
+          # checkout — not the stale v0.3.0 release — was staged).
+          grep -qF 'engine.script_contract.bind(&g);' $M
+          # Splice: the Controller tick that drives inbox dispatch + every
+          # script's Update(dt) through the c-archive glue.
+          grep -qF 'scripting.Controller.tick(&g, scaled_dt);' $M
+          # Splice: the event tap between plugin ticks and dispatchEvents.
+          grep -qF 'engine.script_contract.drainEvents(&g);' $M
+          # Game-root hooks scan: the native hunger__feed subscriber
+          # (hooks/feed_watcher.zig) folded into the GameHooks receiver
+          # tuple — the Zig half of the cross-layer events interop.
+          grep -qF 'feed_u_watcher.FeedWatcher' $M
+          # Build wiring: the plugin's -Dlanguage option selects the go
+          # dispatcher (src/go/vm.zig — no VM compiled in).
+          grep -qF '.language = .go' $B
+          # Build wiring (.language_builds → the c-archive step): the
+          # emitted go build command, verbatim through the declared argv
+          # prefix.
+          grep -qF 'b.addSystemCommand(&.{ "go", "build", "-C"' $B
+          # Build wiring: the {staticlib:...}-expanded artifact and its link
+          # onto the game binary (liblabelle_go_scripts.a here).
+          grep -qF 'labelle_go_scripts' $B
+          # Staging is a LIVE LINK, not a copy: the game's scripts/ IS the
+          # staged module's game package (module root scripts/game.go), so
+          # edits flow into the next `zig build` without a re-generate.
+          STAGED=.labelle/deps/labelle-scripting/native-go/game
+          test -L "$STAGED"
+          cmp scripts/game.go "$STAGED/game.go"
+
+          cd .labelle/null_desktop
+
+          # BUILD RELEASESAFE, NOT DEBUG (the go family's one hard build
+          # constraint — unlike rust/crystal, which build Debug here). Go's
+          # cgo calls the host on a SWITCHED stack (the runtime's
+          # asmcgocall system-stack transition), and the engine's Debug
+          # allocator captures a stack trace on every alloc by walking the
+          # frame-pointer chain — that walk derails across the go cgo frame
+          # and SEGFAULTS the moment a go script makes its first
+          # host-allocating contract call (e.g. Subscribe → the engine's
+          # `alloc.dupe`). ReleaseSafe keeps runtime safety AND info-level
+          # logging (so the GO_* transcript below prints — GameLog gates
+          # info at Debug/ReleaseSafe, warn+ at ReleaseFast) while using a
+          # non-stack-capturing allocator, sidestepping the crash. rust and
+          # crystal never hit this: they call the host on the SAME stack, so
+          # the frame-pointer walk stays valid in Debug. Documented in
+          # src/go/vm.zig and native-go/labelle.go's coexistence matrix.
+          #
+          # labelle-cli-equivalent fixFingerprint dance — the assembler
+          # emits a placeholder fingerprint.
+          set +e
+          ERR=$(zig build -Doptimize=ReleaseSafe 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build -Doptimize=ReleaseSafe
+
+          # Headless bounded run: no window, no GL — the binary runs to
+          # completion (rc=0) or crashes.
+          LABELLE_NULL_FRAMES=5 ./zig-out/bin/go_game > run.log 2>&1
+
+          # Pin the exact ordered milestone sequence — token-for-token the
+          # rust transcript's shape (minus the batch-swarm token: go's
+          # example is the wiring proof, not exhaustive parity). Tokens
+          # carry BEHAVIOR: every GO_LEVEL_* value is the level the script
+          # wrote through the real ECS that tick (each reachable only via
+          # the previous tick's persisted write), GO_FED_LEVEL_0.875 is
+          # re-READ after the feed handler's write — the emitted id and f32
+          # 0.5 amount round-tripped the engine bus bit-exact —
+          # ZIG_FEED_SEEN_0.5 is the NATIVE game-root hook consuming the
+          # same emit at tick 2's dispatchEvents (one tick BEFORE the go
+          # handler's inbox), and GO_BUFFERS_OK pins the `s = s[:0]`
+          # capacity-retaining idiom flat. Timeline: scripts/game.go.
+          grep -oE '(GO|ZIG)_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          GO_INIT
+          GO_CTRL_READY
+          GO_LEVEL_0.625
+          GO_FEED_SENT
+          GO_LEVEL_0.375
+          ZIG_FEED_SEEN_0.5
+          GO_ENGINE_TICK_SEEN
+          GO_FED_LEVEL_0.875
+          GO_LEVEL_0.625
+          GO_LEVEL_0.375
+          GO_LEVEL_0.125
+          GO_STARVING
+          GO_BUFFERS_OK
+          GO_CTRL_DONE
+          GO_DEINIT
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: go-example milestone sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: go drove the real engine — Script-interface structs compiled by the plugin's go build c-archive step, buffer-reuse wrappers, cross-script hunger__feed (go AND native Zig hook off one bus) + engine__tick over 5 headless frames, against this repo's HEAD"
 
   # C# example game (labelle-engine#743) — the CoreCLR-hosted counterpart of
   # rust-example / crystal-example, living in THIS repo so every push runs a

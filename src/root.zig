@@ -21,7 +21,8 @@
 //!
 //! Language sub-modules: build.zig selects exactly one (`-Dlanguage=lua`,
 //! `-Dlanguage=ruby`, `-Dlanguage=typescript`, `-Dlanguage=rust`,
-//! `-Dlanguage=crystal` or `-Dlanguage=csharp`) and surfaces the choice
+//! `-Dlanguage=crystal`, `-Dlanguage=csharp` or `-Dlanguage=go`) and
+//! surfaces the choice
 //! through the `scripting_options` module; the comptime switch below is
 //! what keeps unselected backends out of analysis entirely. Each backend
 //! directory (src/lua/, src/ruby/, src/ts/, src/rust/, …) exposes the same
@@ -32,9 +33,10 @@
 //! Two integration FAMILIES share that surface (RFC-LANGUAGE-PLUGINS):
 //! embedded-VM backends (lua/ruby/typescript) run sources delivered via
 //! `registerScript`; the compiled backends (rust — src/rust/vm.zig,
-//! crystal — src/crystal/vm.zig, csharp — src/csharp/vm.zig) are thin
+//! crystal — src/crystal/vm.zig, csharp — src/csharp/vm.zig, go —
+//! src/go/vm.zig) are thin
 //! dispatchers onto entry points of a compiled artifact (cargo staticlib /
-//! crystal object linked into the game, or — for csharp — a managed
+//! crystal object / go c-archive linked into the game, or — for csharp — a managed
 //! assembly the embedded CoreCLR runtime loads at runtime through
 //! hostfxr), and registered sources are refused (compiled code can't run
 //! from text). The Controller below is family-agnostic on purpose.
@@ -89,6 +91,10 @@ const Backend = switch (build_options.language) {
     .csharp => struct {
         pub const vm = @import("csharp/vm.zig");
         pub const bindings = @import("csharp/bindings.zig");
+    },
+    .go => struct {
+        pub const vm = @import("go/vm.zig");
+        pub const bindings = @import("go/bindings.zig");
     },
 };
 
@@ -172,7 +178,7 @@ pub fn clearScripts() void {
 
 /// Whether the ACTIVE backend can re-load a script into a running VM —
 /// the VM family (lua/ruby/typescript) can re-eval; the native family
-/// (rust/crystal/csharp) is compiled into/beside the game binary and is
+/// (rust/crystal/csharp/go) is compiled into/beside the game binary and is
 /// explicitly OUT of hot-reload scope in v1 (a dev-mode dylib swap is
 /// the RFC's sketched future, not this ticket).
 pub const supports_reload = @hasDecl(Backend.vm.Vm, "reloadScript");
@@ -231,7 +237,7 @@ pub fn reloadScript(name: []const u8, source: [:0]const u8) bool {
         // Refused OUTRIGHT (no registration either): the native backends
         // refuse registered sources wholesale — pretending to accept one
         // here would just defer the confusion to the next setup.
-        logHost("hot reload is not supported for the native language family (rust/crystal/csharp) — restart the game");
+        logHost("hot reload is not supported for the native language family (rust/crystal/csharp/go) — restart the game");
         return false;
     } else {
         const entry = findOrRegister(name, source);

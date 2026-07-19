@@ -18,7 +18,7 @@
     // suite (and vice versa). Assemblers older than v0.83.0 ignore this
     // key and keep the fast-path.
     .params_schema = .{
-        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript", "rust", "crystal", "csharp" }, .required = true },
+        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "ruby", "typescript", "rust", "crystal", "csharp", "go" }, .required = true },
         // Mod sandbox profile (labelle-engine#740): no filesystem/OS
         // access for scripts. Default OFF — games keep today's full
         // stdlib; the profile is the base for the future mods tier. The
@@ -171,6 +171,24 @@
            .stage_subdir = "native-csharp/src/game",   // rev 19 B1: the plugin-crate dir game sources stage over; build steps stay in .language_builds
            .declare = .{ .tool = "labelle-declare-csharp", .dir = "tools/declare-csharp",
                          .events = true } },
+        // go (labelle-engine#746, demand-driven) — a c-archive in the SAME
+        // `.kind = .native` family as rust/crystal: the assembler stages the
+        // game's scripts/ over `.stage_subdir` (native-go/game) and runs the
+        // `.language_builds` `go build -buildmode=c-archive` step exactly as it
+        // stages+builds rust — the go archive links into the game binary like
+        // rust's staticlib, where the labelle_* contract externs resolve
+        // against the host's exports. The one family delta (the go RUNTIME
+        // rides into the binary as a guest — scheduler/GC/signal handlers,
+        // self-initializing from a boot constructor) lives entirely inside
+        // native-go/ and src/go/vm.zig, invisible to the assembler's native
+        // consume path. The module root is the game's `scripts/game.go` (its
+        // `Register` entry, staged over native-go/game/game.go). NO `.declare`
+        // in v1 (demand-driven — the wiring is proven first; a
+        // `components/*.go` declare tool is the documented follow-up), exactly
+        // as typescript shipped a period without one.
+        .{ .name = "go", .extensions = .{".go"}, .kind = .native,
+           .module_root = "game.go",              // scripts/game.go (the go package's Register entry)
+           .stage_subdir = "native-go/game" },    // the plugin-module dir game sources link over; build steps stay in .language_builds
     },
     // Per-LANGUAGE build steps (labelle-engine#741, native-compiled
     // family) — the #586 `.build` Step schema, applied only when the
@@ -299,6 +317,44 @@
                     .name = "dotnet-publish-scripts",
                     .command = .{ "dotnet", "publish", "{package}/native-csharp/LabelleScripts.csproj", "-c", "Release", "--self-contained", "false", "-o", "{cache}" },
                     .platforms = .{"desktop"},
+                },
+            },
+        },
+        // Go (labelle-engine#746, third native language) — the c-archive
+        // recipe: `go build -buildmode=c-archive` emits a self-contained
+        // static archive (the go runtime rides inside it) whose ONLY
+        // labelle-namespace globals are the cgo //export entries — there is
+        // no crystal-style localization pass, because go does not carry a
+        // `main` into c-archive mode (main() is compiled out) and the
+        // runtime's own symbols are already prefixed. The `-C` into the
+        // staged native-go module dir runs the build where the game's
+        // scripts/ linked over `native-go/game`, and `-o` (a cache-relative
+        // staticlib name) names
+        // the archive per target OS (liblabelle_go_scripts.a on unix). System
+        // libs are the cgo runtime's: on linux the go scheduler needs
+        // pthread (and dl for the runtime's lazy symbol lookups); macOS needs
+        // none beyond the system libs zig already links (proven by this
+        // repo's local c-archive link test). Desktop-first: cross-compiling
+        // cgo to mobile triples needs an NDK/sysroot toolchain (the crystal
+        // precedent — future work), so the step declares the desktop
+        // allowlist and a non-desktop go generate fails up front. Assembler
+        // floor: the same native-language splice family as rust/crystal
+        // (v0.85.0+ forward-compat tolerates this entry for non-selected
+        // consumers). CGO_ENABLED must be 1 (the default when a C compiler is
+        // present — the contract binding IS cgo); the env is the toolchain's,
+        // not set here.
+        .{
+            .language = "go",
+            .steps = .{
+                .{
+                    .name = "go-build-scripts",
+                    .command = .{ "go", "build", "-C", "{package}/native-go", "-buildmode=c-archive", "-o", "{cache}/{staticlib:labelle_go_scripts}", "./glue" },
+                    .artifact = "{cache}/{staticlib:labelle_go_scripts}",
+                    .link = .static_lib,
+                    .platforms = .{"desktop"},
+                    .system_libs = .{
+                        .linux = .{ "pthread", "dl" },
+                    },
                 },
             },
         },
