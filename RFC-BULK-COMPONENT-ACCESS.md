@@ -141,7 +141,25 @@ world.Batch<Position, Velocity>((ref Position p, ref Velocity v) => {
 
 TypeScript, Lua, etc. expose their own (`world.batch([...], (e) => {...})`, `for e in world.batch(...) do ... end`).
 
-**Performance note — this is the crux of keeping the batch primitive language-agnostic.** The block adds a per-entity dispatch (the yield + field-accessor calls). In an **interpreted** VM (mruby, QuickJS) that reintroduces some VM overhead versus the raw hand-indexed loop — it is still batched (no per-entity FFI), so still vastly cheaper than per-entity `get`/`set`, but a measurable tax over `@buf[b+2]`. In a **JIT'd** runtime (**C# CoreCLR**, V8-class JS) the delegate/lambda inlines and the `ref struct`/`Span` iteration approaches the flat-loop speed — you get ergonomics *and* performance. So the layering is deliberate: expose the raw `batch_get`/`batch_set` primitive (max speed, ugly) once at the contract level, and let each language own the iterator — interpreted languages offer the block for ergonomics and the raw loop for the last drop of speed; JIT languages get both from the block. (The exact interpreted-block tax is a measure-me: prototype the Ruby `Labelle.batch { |e| }` variant and compare to the 305 ns/entity flat loop.)
+**Performance note — this is the crux of keeping the batch primitive language-agnostic.** The block adds a per-entity dispatch (the yield + field-accessor calls). In an **interpreted** VM (mruby, QuickJS) that reintroduces some VM overhead versus the raw hand-indexed loop — it is still batched (no per-entity FFI), so still vastly cheaper than per-entity `get`/`set`, but a measurable tax over `@buf[b+2]`. In a **JIT'd** runtime (**C# CoreCLR**, V8-class JS) the delegate/lambda inlines and the `ref struct`/`Span` iteration approaches the flat-loop speed — you get ergonomics *and* performance. So the layering is deliberate: expose the raw `batch_get`/`batch_set` primitive (max speed, ugly) once at the contract level, and let each language own the iterator — interpreted languages offer the block for ergonomics and the raw loop for the last drop of speed; JIT languages get both from the block.
+
+**The Ruby yield tax, measured (stage 2).** Shipped as `Labelle.batch` in `src/ruby/prelude.rb` and measured on the same rig and method as the stage-1 numbers (2000-entity integrate+bounce, ReleaseFast, headless uncapped, two-point method T(2200)−T(200), min of reps; released engine 2.6.0; flat loop re-measured in the same session to validate the method — it reproduced stage 1's 0.649 within 1%):
+
+| Ruby approach | per-tick | per-entity | vs flat loop | vs naive |
+|---|---:|---:|---:|---:|
+| naive per-entity `get`/`set` | 5.37 ms | 2685 ns | 8.4× | 1× |
+| **`Labelle.batch { \|e\| }` block** | **1.25 ms** | **624 ns** | **1.9×** | **4.3× faster** |
+| `batch_get`/`batch_set` flat loop | 0.64 ms | 321 ns | 1× | 8.4× faster |
+
+The interpreted-block tax is **~1.9×** — the yield plus ~8–12 accessor dispatches per entity roughly doubles the flat loop, exactly the "measurable but far from catastrophic" band predicted above (correctness cross-checked: flat and block runs produce bit-identical position checksums at tick 600). Guidance this sets: **reach for the block by default** (readable, no hand-maintained offsets), drop to the flat loop for the hottest loops, never per-entity `get`/`set` over thousands.
+
+**Ruby implementation shape (the copy-this pattern for stage-3 ports, #44).** Pure prelude Ruby — no new Zig or contract surface:
+
+1. **Layout discovery**: on first use per names-set, JSON-`get` each named component once on the first matched entity — the host serializes struct fields in *declaration order*, the same order the batch stream walks — and keep the fields whose values are numeric/bool (the stream skips non-scalar fields the same way). Any way the probe could disagree with the stream is caught by a hard cross-check (`buf.size == count × stride`) before the first yield: a mismatch **raises** with "use the flat loop", never mis-maps. Duplicate field names across the named components also raise (the accessors could not disambiguate), as does a discovery re-query that comes back empty (an entity destroyed mid-tick — a clear "re-run next tick" raise, not a low-level nil error).
+2. **One reused view**: mint a class per names-set whose accessors (`define_method`, field name → captured stream offset) read/write the shared buffer at a moving base offset; a single instance is yielded for every entity (document that stashing `e` itself is a bug, same as `Labelle.each`). Reserve exactly the names the view machinery itself needs — `initialize` (a field accessor by that name would replace the constructor before `new` runs) and the base-offset writer — with a clear raise naming the component and field; every *other* field name is fair game and intentionally shadows inherited object methods within the view's scope.
+3. **Drive**: `batch_get` → yield per entity (bump the base) → `batch_set`. Empty query returns 0 without touching the block; a single non-array name is coerced to `[name]`, an empty names array refuses. **Exit semantics — break/return commit, raise aborts**: `break`/`return` inside the block is the normal iterator early-exit, so the writes made up to that point still flush through the one `batch_set` (not-yet-yielded entities round-trip unchanged, and `break value` becomes the call's return value); a raising block abandons the write entirely (all-or-nothing). In Ruby this is begin/rescue(mark abort + re-raise)/ensure(commit unless aborted) around the yield loop — nonlocal exits bypass `rescue` but run `ensure`; note mruby does not populate `$!`, so an `$!`-based ensure check would misfire. `batch_get`/`batch_set` refusals (int fields, set-drift, pre-v1.3 host) pass through unchanged — the block form's first act *is* `batch_get`, so an unsupported host raises the identical error.
+
+JIT'd runtimes (C#, V8-class JS) should skip the derived-accessor machinery where the type system already knows the layout (`ref struct` enumerator over `Span<float>`), and can expect near-flat-loop speed from the closure form.
 
 ## Results
 
@@ -176,7 +194,7 @@ What the numbers prove:
 
 - **Prototype is f32-only for the batch path.** Fields are coerced to/from `f32` in the flat stream. Production should either (a) key the stream by a per-component field-type descriptor, or (b) restrict `batch_*` to declared-scalar components and document the coercion. The single-component packed codec already handles i64/u64/bool/f32 with tags.
 - **Positional coupling.** `batch_get`/`batch_set` assume the query returns the same entities in the same order within a tick (true when no spawn/destroy happens between the two calls). A safer variant would embed entity ids and match on write; measure the cost of the id column before adopting.
-- **Layout is script-owned.** The script hardcodes the `[px,py,vx,vy]` stride from the `NAMES` order. A typed helper (`Labelle.batch(NAMES) { |view| ... }`) could hide the offsets without reintroducing per-entity dispatch — design TBD.
+- **Layout is script-owned.** ~~The script hardcodes the `[px,py,vx,vy]` stride from the `NAMES` order.~~ RESOLVED in stage 2 for the ergonomic tier: `Labelle.batch(NAMES) { |e| ... }` derives the layout host-side-truthfully (first-entity JSON probe, declaration order, stride cross-checked) and hides the offsets; the raw `batch_get`/`batch_set` tier deliberately stays script-owned for maximum speed. The block does reintroduce per-entity dispatch — measured at ~1.9× the flat loop (see Ergonomic layer).
 - **Type generality of packed SET.** The host requires a component to be fully default-constructible (`var comp: T = .{}`) to apply a partial packed write with REPLACE semantics; components without full field defaults fall back to JSON. (The BATCH set has no such requirement — stage 1 made it read-modify-write.)
 - **Test surface.** RESOLVED in stage 1: `tests/mock_world.zig` exports the four symbols behind a field-type schema table mirroring the engine host's semantics (refusals, preflight, bitcast pair included).
 - **Versioning.** RESOLVED in stage 1 — see "Decisions" below for the one shipped mechanism: additive to the major version, detected by the comptime engine-module probe `contract.host_has_bulk_access` (NOT by `@hasDecl` on the externs, which cannot see host exports).
@@ -195,7 +213,7 @@ Prototyped end-to-end and measured in local worktrees:
 
 1. Land the **packed codec** first — strictly-safe improvement (JSON fallback), fixes `into:`, no new API surface for game authors.
 2. Land **`batch_get`/`batch_set`** as the contract primitive, plus the thin per-language `batch_get`/`batch_set` wrappers; keep f32-only + document, or add the field-type descriptor.
-3. Add the **block/closure iterator** ergonomic layer per language (`Labelle.batch(names) { |e| ... }`, C# `world.Batch<..>((ref ..) => ..)`); measure the interpreted-block tax vs the raw flat loop.
+3. ~~Add the **block/closure iterator** ergonomic layer per language~~ — DONE for Ruby in stage 2 (#43): `Labelle.batch(names) { |e| ... }` shipped in the prelude, interpreted-block tax measured at ~1.9× the flat loop (624 vs 321 ns/entity — see the Ergonomic layer section). Other languages land with their stage-3 ports (#44), following the documented copy-this pattern.
 4. Port the binding changes to Lua / TypeScript (the contract is shared; only the per-language decode differs).
 5. ~~Add mock-world exports + capability gating~~ — DONE in stage 1: mock exports landed, and capability detection shipped as the comptime engine-module probe (see Decisions; the contract major stays 1, the exports are "since v1.3").
 6. Ship one batched example per language as a permanent perf regression net.
@@ -241,8 +259,14 @@ this repo's `feat/bulk-component-access`, contract **v1.3**):
 - **Id column deferred pending measurement.** The safer embed-entity-ids
   variant stays out until the cost of the id column is measured against the
   305 ns/entity baseline.
-- **Block iterator (`Labelle.batch { |e| }`) deferred to stage 2**, per
-  language, along with the interpreted-block-tax measurement.
+- **Block iterator (`Labelle.batch { |e| }`)** — ~~deferred to stage 2~~
+  SHIPPED for Ruby in stage 2 (#43), pure prelude (no new contract or
+  C-ABI surface, so no capability-gating changes): layout derived from a
+  first-entity JSON probe in declaration order with a hard stride
+  cross-check, one reused view yielded per entity, all-or-nothing write.
+  Interpreted-block tax measured at **~1.9× the flat loop** (624 vs
+  321 ns/entity; still 4.3× faster than naive) — see the Ergonomic
+  layer section for the table and the stage-3 porting pattern (#44).
 - **Versioning + capability detection (supersedes the earlier "paired
   engine version, link fails on old host" statement):** additive minor
   revision per the contract's convention — major stays 1, the four exports
