@@ -1,0 +1,19 @@
+-- components/dot.lua — the component DECLARED IN LUA (the original
+-- declare language: `labelle generate` runs this repo's tools/declare
+-- extractor over this file and the assembler codegens a REAL Zig registry
+-- component from the schema — `pub const Dot` with four f32 fields in
+-- .labelle/<target>/scripting_components.zig; CI greps it).
+--
+-- ALL-FLOAT on purpose (labelle-scripting#44): four f32 fields and no
+-- ints is exactly the shape the contract v1.3 batch stream carries —
+-- scripts/10_swarm.lua drives the whole set through `labelle.batch`
+-- every tick. An int-typed field here would make the host refuse the
+-- batch outright (ints cannot ride the f32 stream losslessly; their
+-- packed per-entity codec is the lossless path).
+--
+-- At RUNTIME this file is embedded and registered before scripts/ like
+-- every declaration chunk; lua scripts address the component by its NAME
+-- STRING ("Dot") — a top-level `Dot` lands in this chunk's private _ENV
+-- (lua's per-script isolation), so the string spelling is the
+-- cross-script one.
+Dot = labelle.component("Dot", { x = 0.0, y = 0.0, vx = 0.0, vy = 0.0 })

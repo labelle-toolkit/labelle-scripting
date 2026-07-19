@@ -73,6 +73,9 @@
     // siblings to pin — the one `local:` dep is the plugin itself, plus
     // the labelle-null sibling above).
     .core_version = "1.26.0",
-    .engine_version = "2.5.0",
+    // 2.6.0 = the bulk-access floor (contract v1.3, labelle-scripting#41):
+    // scripts/30_swarm.ts exercises labelle.batch, which RAISES on older
+    // hosts by design (no silent batch fallback).
+    .engine_version = "2.6.0",
     .gfx_version = "1.28.1",
 }

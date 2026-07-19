@@ -140,11 +140,14 @@ const shims = [_]Shim{
     .{ .name = "raw_entity_destroy", .func = rawEntityDestroy, .arity = 1 },
     .{ .name = "raw_prefab_spawn", .func = rawPrefabSpawn, .arity = 2 },
     .{ .name = "raw_component_set", .func = rawComponentSet, .arity = 3 },
+    .{ .name = "raw_component_set_from", .func = rawComponentSetFrom, .arity = 3 },
     .{ .name = "raw_component_get", .func = rawComponentGet, .arity = 2 },
     .{ .name = "raw_component_get_into", .func = rawComponentGetInto, .arity = 3 },
     .{ .name = "raw_component_has", .func = rawComponentHas, .arity = 2 },
     .{ .name = "raw_component_remove", .func = rawComponentRemove, .arity = 2 },
     .{ .name = "raw_query", .func = rawQuery, .arity = 1 },
+    .{ .name = "raw_batch_get", .func = rawBatchGet, .arity = 2 },
+    .{ .name = "raw_batch_set", .func = rawBatchSet, .arity = 3 },
     .{ .name = "raw_event_emit", .func = rawEventEmit, .arity = 2 },
     .{ .name = "raw_event_subscribe", .func = rawEventSubscribe, .arity = 1 },
     .{ .name = "raw_event_poll", .func = rawEventPoll, .arity = 0 },
@@ -308,9 +311,419 @@ fn componentGetIntoImpl(ctx: ?*c.Context, argv: ?[*]const c.Value, argc: c_int) 
         _ = c.JS_ThrowTypeError(ctx, "labelle: get(name, into) requires an object to refill");
         return error.JsError;
     }
+
+    // ── PACKED fast path (v1.3 hosts only — comptime-gated) ───────────
+    // Try the host's binary codec first: it writes the component's scalar
+    // fields as a self-describing little-endian record we assign straight
+    // onto the object with NO JSON parse (the ruby get_into pattern).
+    // Sizing mirrors the JSON get (one call; grow-retry-once on
+    // required > cap). Only the first-byte sentinel (0xFF, non-scalar
+    // component) or an absent component (0) drops us to JSON. On a
+    // pre-v1.3 engine the gate folds this block away entirely (the extern
+    // is never referenced → no link error) and every get rides JSON.
+    if (comptime contract.host_has_bulk_access) {
+        var buf = try io_scratch.ensure(ctx, SCRATCH_INITIAL_CAP);
+        var n = contract.labelle_component_get_packed(id, name.s.ptr, name.s.len, buf, io_scratch.cap);
+        if (n > io_scratch.cap) {
+            buf = try io_scratch.ensure(ctx, n);
+            n = contract.labelle_component_get_packed(id, name.s.ptr, name.s.len, buf, io_scratch.cap);
+        }
+        if (n >= 1 and n <= io_scratch.cap and buf[0] != 0xFF) {
+            try decodePackedInto(ctx, buf[0..n], into);
+            return c.Value.boolean(true);
+        }
+        // n == 0 (absent) → the JSON get below also returns absent.
+        // buf[0] == 0xFF (non-scalar component) → JSON path decodes it.
+    }
+
+    // ── JSON fallback (unchanged) ─────────────────────────────────────
     const json = (try getComponentJson(ctx, id, name.s)) orelse return c.Value.boolean(false);
     try codec.decodeObjectInto(ctx, json, into);
     return c.Value.boolean(true);
+}
+
+/// Decode a packed component record (the host's `_get_packed` binary
+/// format) straight onto the object: each field record assigns as a
+/// property via JS_SetProperty (accessor-backed fields keep working — the
+/// decodeObjectInto refill rule). Number materialization matches the JSON
+/// decoder exactly: integral values within ±2^53 become Numbers, 64-bit
+/// ints beyond become BigInt (the id-bearing range — tag 3 lands on the
+/// same unsigned BigInt the raw shims hand out), non-integral f32s become
+/// float Numbers. A malformed record stops early (fields decoded so far
+/// stay applied) — the host builds it, so this is belt-and-suspenders.
+fn decodePackedInto(ctx: ?*c.Context, rec: []const u8, into: c.Value) JsError!void {
+    const max_exact: f64 = @floatFromInt(codec.MAX_SAFE_INTEGER);
+    if (rec.len < 1) return;
+    const field_count = rec[0];
+    var pos: usize = 1;
+    var i: usize = 0;
+    while (i < field_count) : (i += 1) {
+        if (pos >= rec.len) return;
+        const name_len = rec[pos];
+        pos += 1;
+        if (pos + name_len > rec.len) return;
+        const fname = rec[pos..][0..name_len];
+        pos += name_len;
+        if (pos >= rec.len) return;
+        const tag = rec[pos];
+        pos += 1;
+        var v: c.Value = undefined;
+        switch (tag) {
+            0 => { // f32
+                if (pos + 4 > rec.len) return;
+                const f: f64 = @as(f32, @bitCast(std.mem.readInt(u32, rec[pos..][0..4], .little)));
+                pos += 4;
+                // Integral f32s materialize as integer Numbers — exactly
+                // what the JSON path yields for the host's "{d}" text.
+                v = if (@floor(f) == f and @abs(f) <= max_exact)
+                    codec.newNumberI64(@intFromFloat(f))
+                else
+                    c.Value.float(f);
+            },
+            1 => { // i64
+                if (pos + 8 > rec.len) return;
+                const iv = std.mem.readInt(i64, rec[pos..][0..8], .little);
+                pos += 8;
+                if (iv >= -@as(i64, @intCast(codec.MAX_SAFE_INTEGER)) and
+                    iv <= @as(i64, @intCast(codec.MAX_SAFE_INTEGER)))
+                {
+                    v = codec.newNumberI64(iv);
+                } else {
+                    v = c.JS_NewBigInt64(ctx, iv);
+                    if (v.isException()) return error.JsError;
+                }
+            },
+            2 => { // bool
+                if (pos + 1 > rec.len) return;
+                v = c.Value.boolean(rec[pos] != 0);
+                pos += 1;
+            },
+            3 => { // u64 — unsigned BigInt past 2^53, the id-bearing range
+                if (pos + 8 > rec.len) return;
+                const uv = std.mem.readInt(u64, rec[pos..][0..8], .little);
+                pos += 8;
+                if (uv <= codec.MAX_SAFE_INTEGER) {
+                    v = codec.newNumberI64(@intCast(uv));
+                } else {
+                    v = c.JS_NewBigUint64(ctx, uv);
+                    if (v.isException()) return error.JsError;
+                }
+            },
+            else => return,
+        }
+        const key_atom = c.JS_NewAtomLen(ctx, fname.ptr, fname.len);
+        if (key_atom == 0) {
+            c.JS_FreeValue(ctx, v);
+            return error.JsError;
+        }
+        const rc = c.JS_SetProperty(ctx, into, key_atom, v); // consumes v
+        c.JS_FreeAtom(ctx, key_atom);
+        if (rc < 0) return error.JsError;
+    }
+}
+
+fn rawComponentSetFrom(ctx: ?*c.Context, this: c.Value, argc: c_int, argv: ?[*]const c.Value) callconv(.c) c.Value {
+    _ = this;
+    return componentSetFromImpl(ctx, argv, argc) catch c.Value.exception;
+}
+
+/// `raw_component_set_from(id, name, obj)` — the write twin of the packed
+/// get_into fast path: tag each own enumerable property by its JS runtime
+/// type (int Number → i64, float Number → f32, bool, BigInt → i64 via the
+/// mod-2^64 wrap — the documented 64-bit two's-complement bitcast pair)
+/// and hand the host the binary record; the host coerces each into the
+/// target field's real type. Any bailout — a non-scalar value, a
+/// non-finite number, an over-wide record, a host refusal (rc != 0:
+/// non-scalar/f64 target, out-of-range value) — falls back to the JSON
+/// encoder, which keeps the exact pre-v1.3 semantics (including the one
+/// canonical TypeError for NaN/Inf). Returns the contract rc (0 = ok).
+fn componentSetFromImpl(ctx: ?*c.Context, argv: ?[*]const c.Value, argc: c_int) JsError!c.Value {
+    const id = try getId(ctx, arg(argv, argc, 0));
+    const name = try getStr(ctx, arg(argv, argc, 1), "component name");
+    defer c.JS_FreeCString(ctx, name.ptr);
+    const obj = arg(argv, argc, 2);
+    if (!obj.isObject()) {
+        _ = c.JS_ThrowTypeError(ctx, "labelle: set_from requires a component object");
+        return error.JsError;
+    }
+
+    // ── PACKED fast path (v1.3 hosts only — comptime-gated). NOTE the
+    // gate wraps the WHOLE labeled block: a runtime `break :pk` on a
+    // comptime-false condition would still ANALYZE the body — and with it
+    // the extern reference the gate exists to avoid.
+    if (comptime contract.host_has_bulk_access) pk: {
+        // Arrays encode as JSON arrays — never a field record (a packed
+        // record built from "0"/"1" index keys would silently apply
+        // all-defaults where the JSON path refuses the non-object).
+        if (c.JS_IsArray(obj)) break :pk;
+        var tab: ?[*]c.PropertyEnum = null;
+        var count: u32 = 0;
+        if (c.JS_GetOwnPropertyNames(ctx, &tab, &count, obj, c.GPN_STRING_MASK | c.GPN_ENUM_ONLY) < 0)
+            return error.JsError;
+        defer c.JS_FreePropertyEnum(ctx, tab, count);
+        if (count > 255) break :pk; // u8 field-count header
+        // Generous stack record: real components sit far under this; a
+        // pathological wide object just takes the JSON path.
+        var rec: [2048]u8 = undefined;
+        var w: usize = 1;
+        var nfields: u8 = 0;
+        for (0..count) |i| {
+            const pv = c.JS_GetProperty(ctx, obj, tab.?[i].atom);
+            if (pv.isException()) return error.JsError;
+            defer c.JS_FreeValue(ctx, pv);
+            // JSON.stringify's object rule, mirrored: undefined/function/
+            // symbol properties are simply absent (host defaults apply).
+            if (pv.isUndefined() or pv.tag == c.TAG_SYMBOL or c.JS_IsFunction(ctx, pv)) continue;
+            var nlen: usize = 0;
+            const np = c.JS_AtomToCStringLen(ctx, &nlen, tab.?[i].atom) orelse return error.JsError;
+            defer c.JS_FreeCString(ctx, np);
+            if (nlen > 255 or w + 1 + nlen + 9 > rec.len) break :pk;
+            rec[w] = @intCast(nlen);
+            w += 1;
+            @memcpy(rec[w..][0..nlen], np[0..nlen]);
+            w += nlen;
+            switch (pv.tag) {
+                c.TAG_INT => {
+                    rec[w] = 1;
+                    w += 1;
+                    std.mem.writeInt(i64, rec[w..][0..8], pv.u.int32, .little);
+                    w += 8;
+                },
+                c.TAG_FLOAT64 => {
+                    const f = pv.u.float64;
+                    // Non-finite PARITY with the JSON route: the encoder
+                    // throws ("json_encode: non-finite number"), so the
+                    // packed fast path must never smuggle a NaN/Inf into
+                    // the host — break to the JSON fallback and let it
+                    // raise the one canonical error for both routes.
+                    if (std.math.isNan(f) or std.math.isInf(f)) break :pk;
+                    const max_exact: f64 = @floatFromInt(codec.MAX_SAFE_INTEGER);
+                    if (@floor(f) == f and @abs(f) <= max_exact) {
+                        // Integral doubles tag as i64 — the packed twin of
+                        // the encoder's integral-when-integral rendering
+                        // (JS has one number type; an int-field write must
+                        // land exactly, not through f32's 24-bit mantissa).
+                        rec[w] = 1;
+                        w += 1;
+                        std.mem.writeInt(i64, rec[w..][0..8], @intFromFloat(f), .little);
+                        w += 8;
+                    } else {
+                        rec[w] = 0;
+                        w += 1;
+                        const f32v: f32 = @floatCast(f);
+                        std.mem.writeInt(u32, rec[w..][0..4], @bitCast(f32v), .little);
+                        w += 4;
+                    }
+                },
+                c.TAG_BOOL => {
+                    rec[w] = 2;
+                    w += 1;
+                    rec[w] = @intFromBool(pv.u.int32 != 0);
+                    w += 1;
+                },
+                c.TAG_BIG_INT, c.TAG_SHORT_BIG_INT => {
+                    // Ids: wrap mod 2^64 exactly like the JSON encoder's
+                    // unsigned rendering; the i64 tag reaches u64 fields
+                    // through the host's two's-complement bitcast pair.
+                    var iv: i64 = 0;
+                    if (c.JS_ToInt64Ext(ctx, &iv, pv) < 0) return error.JsError;
+                    rec[w] = 1;
+                    w += 1;
+                    std.mem.writeInt(i64, rec[w..][0..8], iv, .little);
+                    w += 8;
+                },
+                else => break :pk, // null/string/object/… → JSON path
+            }
+            nfields += 1;
+        }
+        rec[0] = nfields;
+        const rc = contract.labelle_component_set_packed(id, name.s.ptr, name.s.len, &rec, w);
+        if (rc == 0) return c.Value.int(0);
+        // rc != 0: host refused the packed set (non-scalar target /
+        // unrepresentable value / unknown) — fall through to JSON.
+    }
+
+    // ── JSON fallback: byte-identical to the pre-v1.3 set path ────────
+    const json = try codec.encodeToScratch(ctx, obj);
+    const rc = contract.labelle_component_set(id, name.s.ptr, name.s.len, json.ptr, json.len);
+    return c.Value.int(rc);
+}
+
+// ── batched query codec (the whole-query fast path) ──────────────────────
+
+/// The batch f32 stream cannot carry int-typed fields — i64/u64 silently
+/// corrupt past f32's 24-bit mantissa, so the host refuses the whole batch
+/// (contract v1.3: `(size_t)-2` from batch_get, -2 from batch_set) and the
+/// binding surfaces it LOUDLY as a TypeError. Never a silent JSON
+/// fallback: coerced-int corruption is exactly what the refusal prevents.
+fn throwBatchIntRefused(ctx: ?*c.Context, names_json: []const u8) JsError {
+    var buf: [512]u8 = undefined;
+    const msg: [:0]const u8 = std.fmt.bufPrintZ(
+        &buf,
+        "labelle: batch refused for {s}: a named component has an int-typed " ++
+            "field (i64/u64 cannot ride the f32 batch stream) — keep that " ++
+            "component on per-entity get/set (the packed codec carries ints " ++
+            "losslessly)",
+        .{names_json},
+    ) catch "labelle: batch refused (message too long to format)";
+    _ = c.JS_ThrowTypeError(ctx, "%s", msg.ptr);
+    return error.JsError;
+}
+
+const NO_BATCH_HOST_MSG = " — the host engine lacks batch support (script " ++
+    "contract v1.3 needs labelle-engine >= 2.6.0); use per-entity get/set " ++
+    "on this engine";
+
+fn rawBatchGet(ctx: ?*c.Context, this: c.Value, argc: c_int, argv: ?[*]const c.Value) callconv(.c) c.Value {
+    _ = this;
+    return batchGetImpl(ctx, argv, argc) catch c.Value.exception;
+}
+
+/// `raw_batch_get(names_json, arr)` — ONE contract call fills `arr` with
+/// every matching entity's scalar component data as a flat f32 stream
+/// (plain Numbers), returning the entity COUNT. The host writes
+/// `[u32 count][f32 stream]` into the io scratch (grow-and-retry on the
+/// required-size return); we decode the (n-4)/4 floats into the reused
+/// Array and TRIM its length to exactly that float count — trailing floats
+/// of a bigger past tick would otherwise ride into `raw_batch_set` and
+/// trip the host's exact-size coupling guard. An int-carrying named
+/// component THROWS TypeError (host refusal `(size_t)-2`); on a pre-v1.3
+/// engine the call throws Error — there is no batch fallback (degrading a
+/// whole-query read to nothing would be silent data loss).
+fn batchGetImpl(ctx: ?*c.Context, argv: ?[*]const c.Value, argc: c_int) JsError!c.Value {
+    // Comptime if/ELSE — not an early throw: only the taken branch is
+    // analyzed, so on a pre-v1.3 engine the externs below are never
+    // referenced (no link error) and the call throws instead.
+    if (comptime !contract.host_has_bulk_access) {
+        _ = c.JS_ThrowPlainError(ctx, "labelle: batch_get" ++ NO_BATCH_HOST_MSG);
+        return error.JsError;
+    } else {
+        const names = try getStr(ctx, arg(argv, argc, 0), "component-names json array");
+        defer c.JS_FreeCString(ctx, names.ptr);
+        const arr = arg(argv, argc, 1);
+        if (!c.JS_IsArray(arr)) {
+            _ = c.JS_ThrowTypeError(ctx, "labelle: batch_get requires an Array to fill");
+            return error.JsError;
+        }
+        var buf = try io_scratch.ensure(ctx, SCRATCH_INITIAL_CAP);
+        var n = contract.labelle_component_batch_get(names.s.ptr, names.s.len, buf, io_scratch.cap);
+        // The refusal sentinel must be checked BEFORE the grow-retry: it
+        // is (size_t)-2, which would otherwise read as a required size.
+        if (n == contract.BATCH_INT_REFUSED) return throwBatchIntRefused(ctx, names.s);
+        if (n == 0) return c.Value.int(0); // not bound / malformed
+        if (n > io_scratch.cap) {
+            buf = try io_scratch.ensure(ctx, n);
+            n = contract.labelle_component_batch_get(names.s.ptr, names.s.len, buf, io_scratch.cap);
+            if (n == 0 or n > io_scratch.cap) return c.Value.int(0); // belt
+        }
+        if (n < 4) return c.Value.int(0);
+        const count = std.mem.readInt(u32, buf[0..4], .little);
+        const nfloats = (n - 4) / 4;
+        var i: usize = 0;
+        while (i < nfloats) : (i += 1) {
+            const bits = std.mem.readInt(u32, buf[4 + i * 4 ..][0..4], .little);
+            const f: f64 = @as(f32, @bitCast(bits));
+            if (c.JS_SetPropertyUint32(ctx, arr, @intCast(i), c.Value.float(f)) < 0)
+                return error.JsError;
+        }
+        // Trim to exactly the stream's float count (capacity survives).
+        if (c.JS_SetPropertyStr(ctx, arr, "length", c.Value.int(@intCast(nfloats))) < 0)
+            return error.JsError;
+        return codec.newNumberI64(count);
+    }
+}
+
+fn rawBatchSet(ctx: ?*c.Context, this: c.Value, argc: c_int, argv: ?[*]const c.Value) callconv(.c) c.Value {
+    _ = this;
+    return batchSetImpl(ctx, argv, argc) catch c.Value.exception;
+}
+
+/// `raw_batch_set(names_json, arr, count)` — ONE contract call writes the
+/// whole swarm back: packs every element of `arr` (exactly what batch_get
+/// filled and trimmed) as raw f32 and hands the pure stream (no header) to
+/// the host, which re-queries the same entities and applies positionally.
+/// `count` is the caller's entity count (API symmetry); the array length
+/// is the authoritative float count. Host refusals THROW — both mean the
+/// write would corrupt data: -2 int-typed field → TypeError; -1 entity-set
+/// drift (the exact-size preflight; nothing was applied — re-run batch_get
+/// and recompute) → Error. Non-number elements AND non-finite numbers
+/// (NaN/Inf — the json_encode non-finite policy, applied at the binding)
+/// are a TypeError naming the element; in every throw NOTHING was handed
+/// to the host.
+fn batchSetImpl(ctx: ?*c.Context, argv: ?[*]const c.Value, argc: c_int) JsError!c.Value {
+    // Same comptime if/else gate as batchGetImpl — see the note there.
+    if (comptime !contract.host_has_bulk_access) {
+        _ = c.JS_ThrowPlainError(ctx, "labelle: batch_set" ++ NO_BATCH_HOST_MSG);
+        return error.JsError;
+    } else {
+        const names = try getStr(ctx, arg(argv, argc, 0), "component-names json array");
+        defer c.JS_FreeCString(ctx, names.ptr);
+        const arr = arg(argv, argc, 1);
+        if (!c.JS_IsArray(arr)) {
+            _ = c.JS_ThrowTypeError(ctx, "labelle: batch_set requires the batch_get Array");
+            return error.JsError;
+        }
+        // `count` (arg 2) is accepted for API symmetry; unused here.
+        var len: i64 = 0;
+        if (c.JS_GetLength(ctx, arr, &len) < 0) return error.JsError;
+        const nfloats: usize = @intCast(len);
+        const bytes = nfloats * 4;
+        const buf = try io_scratch.ensure(ctx, @max(bytes, 1));
+        var i: usize = 0;
+        while (i < nfloats) : (i += 1) {
+            const elem = c.JS_GetPropertyUint32(ctx, arr, @intCast(i));
+            if (elem.isException()) return error.JsError;
+            defer c.JS_FreeValue(ctx, elem);
+            if (!elem.isNumberTag()) {
+                var msg_buf: [128]u8 = undefined;
+                const msg: [:0]const u8 = std.fmt.bufPrintZ(
+                    &msg_buf,
+                    "labelle: batch_set: array element {d} is not a number — the " ++
+                        "f32 stream carries numbers only (nothing was written)",
+                    .{i},
+                ) catch unreachable;
+                _ = c.JS_ThrowTypeError(ctx, "%s", msg.ptr);
+                return error.JsError;
+            }
+            var f: f64 = 0;
+            if (c.JS_ToFloat64(ctx, &f, elem) < 0) return error.JsError;
+            // Non-finite refusal at the BINDING — the json_encode
+            // "non-finite number" TypeError policy applied to the stream:
+            // NaN/Inf must never ride into component fields. Strict from
+            // day one (this API is new in stage 3); ruby's identical gap
+            // retrofits the same binding-level check via #45.
+            if (std.math.isNan(f) or std.math.isInf(f)) {
+                var msg_buf: [160]u8 = undefined;
+                const msg: [:0]const u8 = std.fmt.bufPrintZ(
+                    &msg_buf,
+                    "labelle: batch_set: non-finite number at element {d} — the " ++
+                        "f32 stream refuses NaN/Inf, the json_encode non-finite " ++
+                        "policy (nothing was written)",
+                    .{i},
+                ) catch unreachable;
+                _ = c.JS_ThrowTypeError(ctx, "%s", msg.ptr);
+                return error.JsError;
+            }
+            const f32v: f32 = @floatCast(f);
+            std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f32v), .little);
+        }
+        const rc = contract.labelle_component_batch_set(names.s.ptr, names.s.len, buf, bytes);
+        if (rc == -2) return throwBatchIntRefused(ctx, names.s);
+        if (rc != 0) {
+            var msg_buf: [512]u8 = undefined;
+            const msg: [:0]const u8 = std.fmt.bufPrintZ(
+                &msg_buf,
+                "labelle: batch_set refused for {s}: the entity set changed between " ++
+                    "batch_get and batch_set (spawn/destroy between the paired calls " ++
+                    "— the buffer was computed against a stale set; re-run batch_get " ++
+                    "and recompute), or the names were malformed / the host not bound",
+                .{names.s},
+            ) catch "labelle: batch_set refused (message too long to format)";
+            _ = c.JS_ThrowPlainError(ctx, "%s", msg.ptr);
+            return error.JsError;
+        }
+        return c.Value.int(0);
+    }
 }
 
 fn rawComponentHas(ctx: ?*c.Context, this: c.Value, argc: c_int, argv: ?[*]const c.Value) callconv(.c) c.Value {

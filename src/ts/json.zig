@@ -46,8 +46,9 @@ const MAX_ENCODE_DEPTH = 32;
 
 /// Number.MAX_SAFE_INTEGER — the largest integer f64 holds exactly.
 /// Integer JSON tokens at or below it decode as plain Numbers; beyond it
-/// they become BigInt (the id-bearing range).
-const MAX_SAFE_INTEGER: u64 = 9007199254740991;
+/// they become BigInt (the id-bearing range). pub: the bindings' packed
+/// codec draws the same Number/BigInt line.
+pub const MAX_SAFE_INTEGER: u64 = 9007199254740991;
 
 /// The header's static-inline JS_NewInt64: int tag when it fits i32,
 /// float64 otherwise (exact for |v| ≤ 2^53, which is all callers pass).

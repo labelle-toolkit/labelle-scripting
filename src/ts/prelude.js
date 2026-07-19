@@ -123,10 +123,22 @@
     /**
      * Set (REPLACE semantics) a component from an object; null/undefined
      * means "all defaults". Returns true on success.
+     *
+     * Plain objects route through `raw_component_set_from` — the packed
+     * binary fast path on v1.3+ hosts, with the JSON encoder as its
+     * internal fallback (non-scalar values, host refusals, pre-v1.3
+     * engines), so the observable semantics are IDENTICAL either way
+     * (including the canonical non-finite TypeError). Arrays and
+     * primitives keep the explicit JSON leg (an array payload must reach
+     * the host as a JSON array, never as a field record).
      */
     set(name, obj) {
+      const nm = componentName(name);
+      if (obj !== null && typeof obj === "object" && !Array.isArray(obj)) {
+        return labelle.raw_component_set_from(this.id, nm, obj) === 0;
+      }
       const payload = obj == null ? "" : labelle.json_encode(obj);
-      return labelle.raw_component_set(this.id, componentName(name), payload) === 0;
+      return labelle.raw_component_set(this.id, nm, payload) === 0;
     }
 
     has(name) {
@@ -268,6 +280,200 @@
 
   /** Switch scenes; returns true when the host accepted the name. */
   labelle.scene_change = (name) => labelle.raw_scene_change(name) === 0;
+
+  // ── batched query (the whole-query fast path, contract v1.3) ───────────
+  // `batch_get(names, arr)` fills `arr` with every matching entity's scalar
+  // component data as a flat f32 array — [c0_f0, c0_f1, ..., c1_f0, ...]
+  // per entity, components in `names` order, fields in declaration order —
+  // and returns the entity COUNT (`arr` is trimmed to exactly
+  // count*stride). ONE FFI crossing for the whole query instead of a get
+  // per entity; reuse the SAME `arr` across ticks. `batch_set(names, arr,
+  // n)` writes the mutated `arr` back in ONE crossing (the host re-queries
+  // the same entities, same order). The caller owns the positional layout.
+  //
+  // Refusals are LOUD (contract v1.3):
+  //   - a named component with an INT-typed field throws TypeError —
+  //     i64/u64 cannot ride the f32 stream without silent corruption; keep
+  //     such components on per-entity get/set (their packed codec is
+  //     lossless);
+  //   - do NOT spawn or destroy entities between a paired batch_get and
+  //     batch_set: batch_set throws Error when the entity set no longer
+  //     matches the buffer (re-run batch_get and recompute);
+  //   - on a game built against a pre-v1.3 engine (labelle-engine < 2.6.0)
+  //     BOTH calls throw Error ("host engine lacks batch support") — there
+  //     is no batch fallback; use per-entity get/set there. The per-entity
+  //     get-into/set fast paths degrade to JSON silently instead.
+
+  const resolveNames = (names) => {
+    const resolved = new Array(names.length);
+    for (let i = 0; i < names.length; i++) resolved[i] = componentName(names[i]);
+    return resolved;
+  };
+
+  labelle.batch_get = (names, arr) =>
+    labelle.raw_batch_get(labelle.json_encode(resolveNames(names)), arr);
+
+  labelle.batch_set = (names, arr, n) =>
+    labelle.raw_batch_set(labelle.json_encode(resolveNames(names)), arr, n);
+
+  // ── batch callback iterator (the ergonomic layer over batch_get/set) ───
+  // `labelle.batch(names, (e) => { ... })` — ONE batch_get, the callback
+  // runs once per matching entity against a single REUSED view object,
+  // then ONE batch_set writes everything back. No per-entity FFI and no
+  // per-entity allocation: the view is one object whose backing offset
+  // moves between calls (stash values, never `e` itself — the object you
+  // saved points at whatever entity was visited last).
+  //
+  //   labelle.batch(["Position", "Velocity"], (e) => {
+  //     e.x += e.vx; e.y += e.vy;
+  //     if (e.x < 0.0 || e.x > 800.0) e.vx = -e.vx;
+  //   });
+  //
+  // Accessors are the components' FIELD NAMES in stream order (components
+  // in `names` order, fields in declaration order — the same walk
+  // batch_get lays the stream out with). Reads return Numbers (bools ride
+  // as 0/1, like the raw stream); writes take numbers. `names` may be a
+  // single name instead of an array; an empty names array is a TypeError.
+  // Returns the entity count. An empty query returns 0 without touching
+  // the callback. No field names are reserved: the view's base offset
+  // lives in a closure, not on the object, so every field name is fair
+  // game (`size`, `constructor`, whatever — accessors shadow the
+  // prototype within the view).
+  //
+  // Exit semantics — EARLY-RETURN COMMITS, THROW ABORTS (the JS mapping
+  // of ruby's break-commits/raise-aborts):
+  //   - a THROWING callback unwinds straight out of labelle.batch BEFORE
+  //     the write — batch_set never runs, no entity is touched
+  //     (all-or-nothing, safe to catch and retry);
+  //   - the callback returning `false` (strictly — any other return value
+  //     including undefined continues) is the iterator early-exit and
+  //     COMMITS: every write made up to that point flushes through the
+  //     one batch_set ("stop iterating, keep my edits"); entities not yet
+  //     visited round-trip unchanged.
+  //
+  // The raw pairing rules apply to the callback form too: no
+  // spawn/destroy inside the callback, and no nested labelle.batch over
+  // the same names (it would refill the shared buffer mid-iteration).
+  //
+  // Layout discovery (the ruby stage-2 pattern): on first use per
+  // names-set the field list derives from a JSON `raw_component_get` of
+  // each named component on the first matched entity — the host
+  // serializes struct fields in DECLARATION order (JS objects preserve
+  // insertion order for identifier keys), the exact order the batch
+  // stream walks, and non-scalar values are filtered out just as the
+  // stream skips non-scalar fields. Any way the probe could disagree with
+  // the stream is caught by a hard stride cross-check before the first
+  // call — a mismatch throws, never mis-maps. The derived view is cached
+  // per names-set: steady state is batch_get + N calls + batch_set.
+  //
+  // Refusals on top of batch_get/batch_set's own (which pass through
+  // unchanged — int-typed fields, entity-set drift, pre-v1.3 hosts):
+  //   - a field name duplicated across the named components throws
+  //     TypeError (the accessors could not disambiguate);
+  //   - a derived layout that does not match the stream's stride throws
+  //     Error (use the raw batch_get/batch_set flat loop there);
+  //   - the entity set vanishing between batch_get and first-use layout
+  //     discovery (a mid-tick destroy race) throws Error — nothing was
+  //     written; re-running next tick is fine.
+  const batchIters = new Map(); // names key → { buf, view, stride, setBase }
+
+  const buildBatchView = (st, resolved, namesJson, buf, count) => {
+    const ids = labelle.raw_query(namesJson);
+    if (ids.length === 0) {
+      // batch_get saw entities but the discovery re-query sees none: an
+      // entity was destroyed between the paired calls. Nothing was
+      // written; calling again next tick is fine.
+      throw new Error(
+        `labelle: labelle.batch(${namesJson}): the entity set vanished between ` +
+          "batch_get and layout discovery (an entity was destroyed mid-tick) — " +
+          "nothing was written; re-run next tick",
+      );
+    }
+    const first = ids[0];
+    const fields = [];
+    for (const nm of resolved) {
+      const s = labelle.raw_component_get(first, nm);
+      if (s === null) continue; // stride cross-check below catches any inconsistency
+      const obj = labelle.json_decode(s);
+      for (const k of Object.keys(obj)) {
+        const v = obj[k];
+        if (typeof v !== "number" && typeof v !== "boolean") continue;
+        if (fields.includes(k)) {
+          throw new TypeError(
+            `labelle: labelle.batch(${namesJson}): field name '${k}' appears in ` +
+              "more than one named component — the view cannot disambiguate; " +
+              "use batch_get/batch_set with explicit offsets",
+          );
+        }
+        fields.push(k);
+      }
+    }
+    const stride = fields.length;
+    if (buf.length !== count * stride) {
+      throw new Error(
+        `labelle: labelle.batch(${namesJson}): derived layout (${stride} fields ` +
+          `per entity) does not match the host stream (${buf.length} floats / ` +
+          `${count} entities) — a field the stream skips (non-scalar) confused ` +
+          "the layout probe; use batch_get/batch_set with explicit offsets for " +
+          "these components",
+      );
+    }
+    let base = 0;
+    const view = {};
+    fields.forEach((f, off) => {
+      Object.defineProperty(view, f, {
+        get: () => buf[base + off],
+        set: (v) => {
+          buf[base + off] = v;
+        },
+        enumerable: true,
+      });
+    });
+    st.view = view;
+    st.stride = stride;
+    st.setBase = (b) => {
+      base = b;
+    };
+  };
+
+  labelle.batch = (names, fn) => {
+    if (typeof fn !== "function") throw new TypeError("labelle.batch requires a callback function");
+    if (!Array.isArray(names)) names = [names];
+    if (names.length === 0)
+      throw new TypeError("labelle.batch: expected at least one component name");
+    const resolved = resolveNames(names);
+    const key = resolved.join(" ");
+    let st = batchIters.get(key);
+    if (st === undefined) {
+      st = { buf: [], view: null, stride: 0, setBase: null };
+      batchIters.set(key, st);
+    }
+    const namesJson = labelle.json_encode(resolved);
+    const buf = st.buf;
+    const count = labelle.raw_batch_get(namesJson, buf);
+    if (count === 0) return 0;
+    if (st.view === null) buildBatchView(st, resolved, namesJson, buf, count);
+    const stride = st.stride;
+    if (buf.length !== count * stride) {
+      throw new Error(
+        `labelle: labelle.batch(${namesJson}): derived layout (${stride} fields ` +
+          `per entity) does not match the host stream (${buf.length} floats / ` +
+          `${count} entities) — a field the stream skips (non-scalar) confused ` +
+          "the layout probe; use batch_get/batch_set with explicit offsets for " +
+          "these components",
+      );
+    }
+    // A throw below unwinds past the batch_set — the all-or-nothing
+    // abort needs no try/catch; only the two commit paths reach it.
+    let base = 0;
+    for (let i = 0; i < count; i++) {
+      st.setBase(base);
+      if (fn(st.view) === false) break; // early-exit → COMMIT below
+      base += stride;
+    }
+    labelle.raw_batch_set(namesJson, buf, count);
+    return count;
+  };
 
   // ── events: subscribe + dispatch ───────────────────────────────────────
   // The contract is subscribe + poll-drain (one FIFO inbox for the whole

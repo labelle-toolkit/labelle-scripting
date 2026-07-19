@@ -61,6 +61,9 @@ pub const c = struct {
     /// lua.h LUA_MULTRET — "return all results" nresults for pcall.
     pub const LUA_MULTRET: c_int = -1;
     pub const LUA_TNIL: c_int = 0;
+    pub const LUA_TBOOLEAN: c_int = 1;
+    pub const LUA_TNUMBER: c_int = 3;
+    pub const LUA_TSTRING: c_int = 4;
     pub const LUA_TTABLE: c_int = 5;
     pub const LUA_TFUNCTION: c_int = 6;
     /// lua_gc option: one incremental collection step (lua.h LUA_GCSTEP).
@@ -112,6 +115,11 @@ pub const c = struct {
     pub extern fn lua_settable(L: ?*State, idx: c_int) void;
     pub extern fn lua_rawget(L: ?*State, idx: c_int) c_int;
     pub extern fn lua_rawgeti(L: ?*State, idx: c_int, n: i64) c_int;
+    pub extern fn lua_rawseti(L: ?*State, idx: c_int, n: i64) void;
+    /// Raw length (no __len metamethod) — the batch shims' float count.
+    pub extern fn lua_rawlen(L: ?*State, idx: c_int) u64;
+    /// Table traversal (the packed shims' field walk / stale-key clear).
+    pub extern fn lua_next(L: ?*State, idx: c_int) c_int;
     pub extern fn lua_setmetatable(L: ?*State, idx: c_int) c_int;
     pub extern fn lua_setupvalue(L: ?*State, funcindex: c_int, n: c_int) ?[*:0]const u8;
 
@@ -119,6 +127,10 @@ pub const c = struct {
     pub extern fn lua_tolstring(L: ?*State, idx: c_int, len: ?*usize) ?[*]const u8;
     pub extern fn lua_tointegerx(L: ?*State, idx: c_int, isnum: ?*c_int) i64;
     pub extern fn lua_tonumberx(L: ?*State, idx: c_int, isnum: ?*c_int) f64;
+    pub extern fn lua_toboolean(L: ?*State, idx: c_int) c_int;
+    /// True when the value is a number AND an integer (math.type == "integer")
+    /// — the packed set's i64-vs-f32 tag decision.
+    pub extern fn lua_isinteger(L: ?*State, idx: c_int) c_int;
     /// lauxlib's REPL-grade renderer: any value → string PUSHED on the
     /// stack (and returned), honoring `__tostring`/`__name` and covering
     /// nil/booleans/tables — everything `lua_tolstring` returns null for.

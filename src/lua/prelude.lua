@@ -423,7 +423,20 @@ end
 --- component is absent the call returns nil and leaves `into` untouched,
 --- mirroring the ruby sub-module's get_into.
 function Entity:get(name, into)
-  local s = labelle.raw_component_get(self.id, component_name(name))
+  local nm = component_name(name)
+  if into ~= nil then
+    -- PACKED fast path (contract v1.3): the host serializes scalar-only
+    -- components as a binary record the shim decodes straight into the
+    -- reused table (stale keys cleared — the decode_into contract), no
+    -- JSON parse. Verdicts: 1 = refilled, 0 = absent (`into` untouched),
+    -- -1 = take the JSON path (non-scalar component, or a pre-v1.3
+    -- engine — where the shim always answers -1 and every get rides
+    -- JSON, silently).
+    local rc = labelle.raw_component_get_packed_into(self.id, nm, into)
+    if rc == 1 then return into end
+    if rc == 0 then return nil end
+  end
+  local s = labelle.raw_component_get(self.id, nm)
   if s == "" then return nil end
   if into == nil then return json.decode(s) end
   return json.decode_into(s, into)
@@ -431,9 +444,26 @@ end
 
 --- Set (REPLACE semantics) a component from a table; nil/{} means "all
 --- defaults". Returns true on success.
+---
+--- Plain (metatable-less) tables try the PACKED fast path first
+--- (contract v1.3): scalar fields cross as a binary record the host
+--- coerces field-by-field, no JSON encode. Any bailout — a non-scalar
+--- or non-finite value, a non-string key, a host refusal, a pre-v1.3
+--- engine — falls back to the JSON encoder, which keeps the exact
+--- pre-v1.3 semantics (including the one canonical "json.encode:
+--- non-finite number" error for NaN/Inf). Tagged tables
+--- (labelle.array) keep the explicit JSON leg: an array payload must
+--- reach the host as a JSON array, never as a field record.
 function Entity:set(name, tbl)
-  local payload = tbl == nil and "" or json.encode(tbl)
-  return labelle.raw_component_set(self.id, component_name(name), payload) == 0
+  local nm = component_name(name)
+  if tbl == nil then
+    return labelle.raw_component_set(self.id, nm, "") == 0
+  end
+  if type(tbl) == "table" and getmetatable(tbl) == nil
+    and labelle.raw_component_set_packed(self.id, nm, tbl) == 0 then
+    return true
+  end
+  return labelle.raw_component_set(self.id, nm, json.encode(tbl)) == 0
 end
 
 function Entity:has(name)
@@ -747,6 +777,276 @@ end
 --- Switch scenes; returns true when the host accepted the name.
 function labelle.scene_change(name)
   return labelle.raw_scene_change(name) == 0
+end
+
+-- ── batched query (the whole-query fast path, contract v1.3) ─────────────
+-- `batch_get(names, arr)` fills `arr` (a plain reused table) with every
+-- matching entity's scalar component data as a flat f32 array — 1-based,
+-- [c0_f0, c0_f1, ..., c1_f0, ...] per entity, components in `names`
+-- order, fields in declaration order — and returns the entity COUNT
+-- (`arr` is trimmed to exactly count*stride). ONE FFI crossing for the
+-- whole query instead of a get per entity; reuse the SAME `arr` across
+-- ticks. `batch_set(names, arr, n)` writes the mutated `arr` back in ONE
+-- crossing (the host re-queries the same entities, same order). The
+-- caller owns the positional layout.
+--
+-- Refusals are LOUD (contract v1.3):
+--   - a named component with an INT-typed field raises — i64/u64 cannot
+--     ride the f32 stream without silent corruption; keep such
+--     components on per-entity get/set (their packed codec is lossless);
+--   - do NOT spawn or destroy entities between a paired batch_get and
+--     batch_set: batch_set raises when the entity set no longer matches
+--     the buffer (nothing was applied — re-run batch_get and recompute);
+--   - on a game built against a pre-v1.3 engine (labelle-engine < 2.6.0)
+--     BOTH calls raise ("host engine lacks batch support") — there is no
+--     batch fallback; use per-entity get/set there. The per-entity
+--     get-into/set fast paths degrade to JSON silently instead.
+
+-- Normalize a names list (strings or labelle.component refs) to a fresh
+-- string array.
+local function resolve_names(names)
+  local resolved = {}
+  for i = 1, #names do
+    resolved[i] = component_name(names[i])
+  end
+  return resolved
+end
+
+function labelle.batch_get(names, arr)
+  return labelle.raw_batch_get(json.encode(resolve_names(names)), arr)
+end
+
+function labelle.batch_set(names, arr, n)
+  return labelle.raw_batch_set(json.encode(resolve_names(names)), arr, n)
+end
+
+-- ── batch for-in iterator (the ergonomic layer over batch_get/set) ───────
+-- `for e in labelle.batch(names) do ... end` — ONE batch_get, the loop
+-- body runs once per matching entity against a single REUSED view whose
+-- accessors are the components' FIELD NAMES in stream order (components
+-- in `names` order, fields in declaration order — the same walk batch_get
+-- lays the stream out with), then ONE batch_set writes everything back.
+-- No per-entity FFI: the view is one table whose backing offset moves
+-- between iterations (stash values, never `e` itself).
+--
+--   for e in labelle.batch({ "Position", "Velocity" }) do
+--     e.x = e.x + e.vx
+--     e.y = e.y + e.vy
+--     if e.x < 0.0 or e.x > 800.0 then e.vx = -e.vx end
+--   end
+--
+-- Reads return numbers (bools ride as 0/1, like the raw stream); writes
+-- take numbers; an unknown field name raises (typo guard). `names` may
+-- be a single name string (or ref) instead of a table; an empty names
+-- table raises. An empty query runs the body zero times. NO field names
+-- are reserved: the view's base offset lives in an upvalue, not on the
+-- table, so every field name is fair game (`size`, `id`, whatever).
+--
+-- Exit semantics — BREAK/RETURN COMMIT, ERROR ABORTS (the lua mapping of
+-- ruby's break-commits/raise-aborts, carried by Lua 5.4's generic-for
+-- CLOSING value — the iterator's 4th return is a to-be-closed object the
+-- loop closes on EVERY exit path):
+--   - a loop body that ERRORS abandons the whole write — the closer sees
+--     the error and batch_set never runs, no entity is touched
+--     (all-or-nothing, safe to pcall around the loop and retry);
+--   - `break` (or `return`/`goto` out of the enclosing function) is the
+--     normal early exit and COMMITS: the closer runs with no error and
+--     flushes every write made so far through the one batch_set ("stop
+--     iterating, keep my edits"); entities not yet visited round-trip
+--     unchanged. Normal loop exhaustion commits the same way.
+-- Consequence of the closing-value design: the commit belongs to the
+-- for-in loop itself — call labelle.batch ONLY as a generic-for
+-- expression (capturing its returns into locals and never looping would
+-- never write back).
+--
+-- The raw pairing rules apply here too: no spawn/destroy inside the
+-- loop, and no nested labelle.batch over the same names (it would refill
+-- the shared buffer mid-iteration).
+--
+-- Layout discovery (the ruby stage-2 pattern): on first use per
+-- names-set the field list derives from a JSON `raw_component_get` of
+-- each named component on the first matched entity — scanned in TEXT
+-- order, because the host serializes struct fields in DECLARATION order,
+-- the exact order the batch stream walks (a pairs() walk over a decoded
+-- table would scramble it) — keeping only scalar (number/boolean)
+-- values, just as the stream skips non-scalar fields. Any way the probe
+-- could disagree with the stream is caught by a hard stride cross-check
+-- before the first iteration — a mismatch raises, never mis-maps. The
+-- derived view is cached per names-set: steady state is batch_get + N
+-- iterations + batch_set.
+--
+-- Refusals on top of batch_get/batch_set's own (which pass through
+-- unchanged — int-typed fields, entity-set drift, pre-v1.3 hosts):
+--   - a field name duplicated across the named components raises (the
+--     accessors could not disambiguate);
+--   - a derived layout that does not match the stream's stride raises
+--     (use the raw batch_get/batch_set flat loop there);
+--   - the entity set vanishing between batch_get and first-use layout
+--     discovery (a mid-tick destroy race) raises — nothing was written;
+--     re-running next tick is fine.
+
+local batch_iters = {} -- names key → { buf, view, stride, set_base }
+
+-- The scalar (number/boolean) field names of a component's JSON `s`, in
+-- TEXT order (= the host's declaration order), appended to `fields`.
+-- Raises on a duplicate across the named components. Host-produced JSON
+-- only, so the parse trusts its shape like the ruby probe trusts
+-- json_decode.
+local function scan_scalar_fields(s, fields, names_json)
+  local i = skip_ws(s, 1)
+  if s:sub(i, i) ~= "{" then return end
+  i = skip_ws(s, i + 1)
+  if s:sub(i, i) == "}" then return end
+  while true do
+    local k
+    k, i = decode_string(s, i)
+    i = skip_ws(s, i)
+    i = i + 1 -- ':'
+    local v
+    v, i = decode_value(s, i)
+    if type(v) == "number" or type(v) == "boolean" then
+      for fi = 1, #fields do
+        if fields[fi] == k then
+          error(string.format("labelle: labelle.batch(%s): field name '%s' appears in " ..
+            "more than one named component — the view cannot disambiguate; " ..
+            "use batch_get/batch_set with explicit offsets", names_json, k), 0)
+        end
+      end
+      fields[#fields + 1] = k
+    end
+    i = skip_ws(s, i)
+    local sep = s:sub(i, i)
+    if sep == "," then
+      i = skip_ws(s, i + 1)
+    else
+      return -- '}' (or malformed — the stride cross-check catches it)
+    end
+  end
+end
+
+local function stride_mismatch_error(names_json, stride, nfloats, count)
+  error(string.format("labelle: labelle.batch(%s): derived layout (%d fields per " ..
+    "entity) does not match the host stream (%d floats / %d entities) — a field " ..
+    "the stream skips (non-scalar) confused the layout probe; use " ..
+    "batch_get/batch_set with explicit offsets for these components",
+    names_json, stride, nfloats, count), 0)
+end
+
+-- Build the reused per-entity view for a names-set: derive the field
+-- walk (first-entity JSON probe), cross-check it against the stream
+-- stride, then wire __index/__newindex accessors over `st.buf` at a
+-- moving base offset. Runs once per names-set.
+local function build_batch_view(st, resolved, names_json, count)
+  local out = labelle.raw_query(names_json)
+  local ids = out ~= "" and decode_id_array(out) or {}
+  local first = ids[1]
+  if first == nil then
+    -- batch_get saw entities but the discovery re-query sees none: an
+    -- entity was destroyed between the paired calls. Nothing was
+    -- written; calling again next tick is fine.
+    error(string.format("labelle: labelle.batch(%s): the entity set vanished " ..
+      "between batch_get and layout discovery (an entity was destroyed " ..
+      "mid-tick) — nothing was written; re-run next tick", names_json), 0)
+  end
+  local fields = {}
+  for i = 1, #resolved do
+    local s = labelle.raw_component_get(first, resolved[i])
+    if s ~= "" then -- absent: the stride cross-check below catches it
+      scan_scalar_fields(s, fields, names_json)
+    end
+  end
+  local stride = #fields
+  if #st.buf ~= count * stride then
+    stride_mismatch_error(names_json, stride, #st.buf, count)
+  end
+  local buf = st.buf
+  local base = 0
+  local offsets = {}
+  for i = 1, stride do
+    offsets[fields[i]] = i - 1
+  end
+  st.view = setmetatable({}, {
+    __index = function(_, k)
+      local off = offsets[k]
+      if off == nil then
+        error("labelle.batch view: unknown field '" .. tostring(k) .. "'", 2)
+      end
+      return buf[base + off + 1]
+    end,
+    __newindex = function(_, k, v)
+      local off = offsets[k]
+      if off == nil then
+        error("labelle.batch view: unknown field '" .. tostring(k) .. "'", 2)
+      end
+      buf[base + off + 1] = v
+    end,
+  })
+  st.set_base = function(b) base = b end
+  st.stride = stride
+end
+
+local CLOSER_MT = {
+  __close = function(closer, err)
+    -- The one write-back seam: no error (normal exhaustion, break,
+    -- return, goto) → COMMIT through the single batch_set; an error
+    -- unwinding through the loop → ABORT (batch_set never runs) and the
+    -- error keeps propagating.
+    if err == nil and not closer.done then
+      closer.done = true
+      labelle.raw_batch_set(closer.names_json, closer.buf, closer.count)
+    end
+  end,
+}
+
+local function batch_noop_iter() return nil end
+
+function labelle.batch(names)
+  -- Accept the same name-or-ref forms every component-name site does
+  -- (the component_name contract shared with Entity get/set and
+  -- game.query): a single name string, a single labelle.component REF —
+  -- a ref is a table, so it must be detected BEFORE the "table = list"
+  -- branch — or a list mixing both (resolve_names normalizes each
+  -- element through component_name).
+  if type(names) ~= "table" or type(names.__labelle_component) == "string" then
+    names = { names }
+  end
+  if #names == 0 then
+    error("labelle.batch: expected at least one component name", 2)
+  end
+  local resolved = resolve_names(names)
+  local key = table.concat(resolved, "\0")
+  local st = batch_iters[key]
+  if st == nil then
+    st = { buf = {} }
+    batch_iters[key] = st
+  end
+  local names_json = json.encode(resolved)
+  local count = labelle.raw_batch_get(names_json, st.buf)
+  if count == 0 then
+    return batch_noop_iter -- zero iterations; nothing to write back
+  end
+  if st.view == nil then
+    build_batch_view(st, resolved, names_json, count)
+  end
+  local stride = st.stride
+  if #st.buf ~= count * stride then
+    stride_mismatch_error(names_json, stride, #st.buf, count)
+  end
+  local view, set_base = st.view, st.set_base
+  local i = 0
+  local function iter()
+    i = i + 1
+    if i > count then return nil end
+    set_base((i - 1) * stride)
+    return view
+  end
+  local closer = setmetatable(
+    { names_json = names_json, buf = st.buf, count = count, done = false },
+    CLOSER_MT
+  )
+  -- Generic-for shape: iterator, state, control, CLOSING value — the
+  -- loop marks `closer` to-be-closed and closes it on every exit path.
+  return iter, nil, nil, closer
 end
 
 -- Receive side. The contract is subscribe + poll-drain (one FIFO inbox for
