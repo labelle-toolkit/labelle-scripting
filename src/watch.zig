@@ -84,7 +84,9 @@ pub const Watcher = struct {
     /// dropped from tracking silently — there is nothing sane to unload
     /// (the VM keeps the last-loaded code; a restored file re-reports).
     /// Filesystem errors degrade to "no changes seen" — dev-mode
-    /// polling must never take the game down.
+    /// polling must never take the game down. Overflow is lossless:
+    /// changes beyond `out.len` are deferred (baseline untouched) and
+    /// reported by subsequent polls.
     pub fn poll(self: *Watcher, out: []Change) usize {
         var reported: usize = 0;
         var seen: [max_watched_files]bool = @splat(false);
@@ -101,13 +103,23 @@ pub const Watcher = struct {
                 seen[idx] = true;
                 const e = &self.entries[idx];
                 if (e.mtime_ns == mtime_ns and e.size == st.size) continue;
+                // The baseline commits ONLY alongside a report (or during
+                // the priming pass): a change that overflowed `out` keeps
+                // its stale baseline and surfaces on the NEXT poll — a
+                // bulk save/checkout drains losslessly over successive
+                // polls instead of silently leaving scripts stale.
+                if (self.primed and reported >= out.len) continue;
                 e.mtime_ns = mtime_ns;
                 e.size = st.size;
-                if (self.primed and reported < out.len) {
+                if (self.primed) {
                     out[reported] = self.changeFor(e);
                     reported += 1;
                 }
             } else {
+                // Same overflow rule for adoption: a new file that can't
+                // be reported this pass stays untracked and re-discovers
+                // next poll.
+                if (self.primed and reported >= out.len) continue;
                 if (self.count >= max_watched_files) continue;
                 const e = &self.entries[self.count];
                 @memcpy(e.file_buf[0..dirent.name.len], dirent.name);
@@ -116,7 +128,7 @@ pub const Watcher = struct {
                 e.size = st.size;
                 seen[self.count] = true;
                 self.count += 1;
-                if (self.primed and reported < out.len) {
+                if (self.primed) {
                     out[reported] = self.changeFor(e);
                     reported += 1;
                 }

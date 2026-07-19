@@ -100,11 +100,6 @@ const Backend = switch (build_options.language) {
 const RegisteredScript = struct {
     name: []const u8,
     source: [:0]const u8,
-    /// Load AND init both succeeded in the CURRENT VM — the reload seam's
-    /// "does init still owe a run?" answer (a script broken at boot gets
-    /// its init when a reload finally fixes it; a running script does NOT
-    /// re-init on reload — its init-time entities would duplicate).
-    initialized: bool = false,
     /// Error-UX throttle state (see `Controller.tick`): how many update()
     /// calls in a row have raised, and how many upcoming ticks to skip.
     consecutive_update_failures: u16 = 0,
@@ -188,31 +183,48 @@ pub const supports_reload = @hasDecl(Backend.vm.Vm, "reloadScript");
 /// call exactly this once the studio side grows the channel (there is no
 /// engine hot-push contract to wire to yet — see the PR notes).
 ///
-/// State semantics (per RFC-LANGUAGE-PLUGINS: "authoritative state lives
-/// in components; ivars are caches — hot reload resets the VM"):
-/// component/ECS data survives by construction (it lives in the host);
-/// script-LOCAL state resets — the changed file's body re-runs in the
-/// existing VM under each language's own semantics:
+/// ## The reload lifecycle (one rule, every VM language)
+///
+/// A successful reload REPLAYS the script's whole load lifecycle in the
+/// running VM: evict the old incarnation (its event handlers, and on
+/// ruby its controllers, are purged) → run the new body → **re-run
+/// `init()`** → (ruby) set up the controllers the new body registered.
+/// Re-running init is the dev-mode contract: init-registered
+/// subscriptions come back (no silent subscription loss — init is a
+/// documented place to call `labelle.on`), and script-local state resets
+/// wholesale (per RFC-LANGUAGE-PLUGINS: "authoritative state lives in
+/// components; ivars are caches — hot reload resets the VM"). The
+/// deliberate, documented caveat: NON-IDEMPOTENT init side effects
+/// re-apply — an init that unconditionally spawns entities spawns them
+/// again on every save. Write idempotent init (probe before spawning)
+/// or accept re-runs under hot reload; component/ECS data itself
+/// survives by construction (it lives in the host, untouched).
+///
+/// Per-language reset shape (same contract, each VM's own semantics):
 ///   - lua: a FRESH private `_ENV` replaces the script's env (top-level
 ///     locals/globals reset); shared globals and the prelude survive;
 ///   - ruby: the previous incarnation is evicted first (harvested hooks,
-///     handlers, controllers, the @ivar receiver), then the new body
-///     runs and is re-harvested; controllers the new body registers are
-///     instantiated + set up immediately;
+///     handlers, controllers, the @ivar receiver), the new body runs and
+///     is re-harvested, and AFTER init its controllers are instantiated
+///     + set up (`finishReload` — init-seeded state exists first, the
+///     boot order);
 ///   - typescript: a fresh ES-module instance replaces the registry
 ///     namespace entry (module-scope state resets).
-/// In every language the script's OLD event handlers are purged before
-/// the new body registers its own — no duplicate-handler pileup.
 ///
-/// `init()` policy: a script that was already running does NOT re-run
-/// init (its init-time entities would duplicate); a script that never
-/// completed load+init (broken at boot, now fixed) gets its init now —
-/// the fix-and-save loop fully starts it. Update-throttle state resets
-/// either way.
+/// ## Failure states
+///
+/// A save whose body fails (syntax or runtime error) leaves the script
+/// SILENT — env/namespace removed, handlers purged, update/deinit skip
+/// it — until the next save fixes it (running half-old code with its
+/// handlers purged would be worse than running none). The next
+/// successful save replays the full lifecycle above, exactly like any
+/// other reload — there is no separate "owed init" state to track. An
+/// init() that raises on reload evicts the same way. Update-throttle
+/// state resets on every reload.
 ///
 /// `name`/`source` lifetimes follow `registerScript` (borrowed, must
-/// outlive the registry); returns false when the re-load or owed init
-/// failed (logged through the host, VM untouched otherwise) or when the
+/// outlive the registry); returns false when the re-load or the re-init
+/// failed (logged through the host, VM otherwise untouched) or when the
 /// backend has no reload story.
 pub fn reloadScript(name: []const u8, source: [:0]const u8) bool {
     if (comptime !supports_reload) {
@@ -231,17 +243,18 @@ pub fn reloadScript(name: []const u8, source: [:0]const u8) bool {
             // it managed to register, so nothing half-new keeps running.
             // The registration keeps the new source — the author's next
             // save retries it.
-            entry.initialized = false;
             return false;
         }
-        if (!entry.initialized) {
-            if (vm.callScriptHook(entry.name, "init", null)) {
-                entry.initialized = true;
-            } else {
-                vm.evictScript(entry.name);
-                return false;
-            }
+        // Replay init — the reload lifecycle above. A missing init hook
+        // is fine (callScriptHook: missing = not a failure).
+        if (!vm.callScriptHook(entry.name, "init", null)) {
+            vm.evictScript(entry.name);
+            return false;
         }
+        // Backend post-init reload step (ruby: instantiate + set up the
+        // controllers the fresh body registered — after init, the boot
+        // order). Absent on backends without one.
+        if (comptime @hasDecl(Backend.vm.Vm, "finishReload")) vm.finishReload(entry.name);
         return true;
     }
 }
@@ -310,20 +323,28 @@ pub const hot_reload = struct {
         const w = if (watcher) |*ptr| ptr else return 0;
         var changes: [16]watch.Change = undefined;
         var reloaded: usize = 0;
-        const n = w.poll(&changes);
-        for (changes[0..n]) |ch| {
-            const source = w.dir.readFileAllocOptions(
-                w.io,
-                ch.file,
-                gpa,
-                .limited(max_script_bytes),
-                .of(u8),
-                0,
-            ) catch {
-                logHost("hot reload: failed to read a changed script file — skipped");
-                continue;
-            };
-            if (reloadOwned(ch.name, source)) reloaded += 1;
+        // Drain: a FULL batch means the watcher may be sitting on more
+        // (its overflow defers unreported changes losslessly) — poll
+        // again until a partial batch. Terminates: every reported change
+        // commits its baseline, so each round strictly shrinks the
+        // backlog.
+        while (true) {
+            const n = w.poll(&changes);
+            for (changes[0..n]) |ch| {
+                const source = w.dir.readFileAllocOptions(
+                    w.io,
+                    ch.file,
+                    gpa,
+                    .limited(max_script_bytes),
+                    .of(u8),
+                    0,
+                ) catch {
+                    logHost("hot reload: failed to read a changed script file — skipped");
+                    continue;
+                };
+                if (reloadOwned(ch.name, source)) reloaded += 1;
+            }
+            if (n < changes.len) break;
         }
         return reloaded;
     }
@@ -489,13 +510,10 @@ pub const Controller = struct {
 
         // Two passes — load everything, then init everything — so an
         // early script's init() can already touch entities/events involving
-        // scripts registered after it. Per-entry `initialized` records
-        // load+init success for the reload seam (a boot-broken script owes
-        // an init when a reload fixes it); throttle state starts clean in
+        // scripts registered after it. Throttle state starts clean in
         // every fresh VM.
         var loaded: [MAX_REGISTERED_SCRIPTS]bool = undefined;
         for (script_registry[0..script_count], 0..) |*s, i| {
-            s.initialized = false;
             s.consecutive_update_failures = 0;
             s.throttle_skip = 0;
             // Load failures self-evict inside loadScript: a chunk body that
@@ -504,9 +522,7 @@ pub const Controller = struct {
         }
         for (script_registry[0..script_count], 0..) |*s, i| {
             if (!loaded[i]) continue;
-            if (vm.callScriptHook(s.name, "init", null)) {
-                s.initialized = true;
-            } else {
+            if (!vm.callScriptHook(s.name, "init", null)) {
                 // init() raised: the script is half-initialized — evict it
                 // so update/deinit never run against broken state (the
                 // init-time counterpart of loadScript's self-eviction).

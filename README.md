@@ -848,10 +848,14 @@ The plugin handles the studio Script Console's
   will call. State semantics: component/ECS data survives by
   construction; script-LOCAL state resets (lua: fresh per-script `_ENV`;
   ruby: fresh receiver — @ivars reset — with the new body's controllers
-  set up immediately; typescript: fresh ES-module instance). Old event
-  handlers are purged before the new body re-registers; a running
-  script's `init()` is NOT re-run, but a boot-broken script gets its
-  owed init once a save fixes it. Native family (rust/crystal/csharp):
+  set up AFTER init, the boot order; typescript: fresh ES-module
+  instance). A successful reload REPLAYS the whole load lifecycle: old
+  handlers purged, new body run, **`init()` re-run** (init-registered
+  subscriptions come back). Caveat, by design: non-idempotent init side
+  effects (an unconditional spawn) re-apply on every save — write
+  idempotent init or accept re-runs under hot reload. A save with an
+  error halts that script until the next good save replays the
+  lifecycle. Native family (rust/crystal/csharp):
   explicitly refused — compiled code cannot re-eval (a dylib-swap dev
   mode is future work).
 - **Error UX** — every script invocation boundary is protected and a
@@ -867,7 +871,8 @@ The plugin handles the studio Script Console's
   project's plugin entry (assembler ≥ 0.83) removes filesystem/OS access
   from scripts; default OFF (games keep today's full stdlib). Lua opens
   a safe-lib subset instead of `luaL_openlibs`: no `io`, no `os`, no
-  `package`/`require`, no `debug`, no `dofile`/`loadfile` — tracebacks
+  `package`/`require`, no `debug`, no `dofile`/`loadfile`, and `load`
+  is text-only (binary chunks refused) — tracebacks
   still work (the C shim needs no debug library). Ruby and typescript
   are sandboxed by construction (no fs gems vendored; no quickjs-libc),
   pinned by their suites. The profile is the base for the future mods

@@ -54,6 +54,31 @@ test "filesystem and OS access are unreachable" {
     try expect(!mock.logsContain("sandbox LEAK"));
 }
 
+test "sandboxed load is text-only: binary chunks refused, text chunks work" {
+    fresh();
+    // "\27" is LUA_SIGNATURE's first byte — every precompiled chunk
+    // starts with it, and text-mode load refuses it up front ("attempt
+    // to load a binary chunk"). The probe covers the default mode, an
+    // explicit "b" request (the wrapper pins mode to "t" regardless),
+    // and that plain text chunks still compile and run.
+    scripting.registerScript("load_probe",
+        \\function init()
+        \\    local f, err = load("\27Lua bytecode")
+        \\    local fb = load("\27Lua bytecode", "bin", "b")
+        \\    local g = load("return 41 + 1")
+        \\    if f == nil and err ~= nil and fb == nil and g ~= nil and g() == 42 then
+        \\        labelle.log("sandbox: binary chunks refused, text load ok")
+        \\    else
+        \\        labelle.log("sandbox load LEAK")
+        \\    end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+    try expect(mock.logsContain("sandbox: binary chunks refused, text load ok"));
+    try expect(!mock.logsContain("sandbox load LEAK"));
+}
+
 test "the safe stdlib subset is intact" {
     fresh();
     scripting.registerScript("stdlib_probe",

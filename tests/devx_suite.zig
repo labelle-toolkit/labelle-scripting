@@ -88,24 +88,56 @@ test "watcher: silent baseline, rewrite reported once, new file reported, deleti
     try expectEqualStrings("helper", changes[0].name);
 }
 
+test "watcher overflow is lossless: a bulk save drains across polls" {
+    if (scripting.language != .lua) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // 20 scripts on disk, a 16-slot report buffer (the pump's own size).
+    var namebuf: [32]u8 = undefined;
+    for (0..20) |i| {
+        const name = try std.fmt.bufPrint(&namebuf, "f{d:0>2}.lua", .{i});
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "-- a" });
+    }
+    var w = watch.Watcher.init(io, tmp.dir, ".lua");
+    var changes: [16]watch.Change = undefined;
+    try expectEqual(@as(usize, 0), w.poll(&changes)); // baseline
+
+    // Bulk save/checkout: all 20 change at once. The surplus keeps its
+    // stale baseline (no silent drop) and surfaces on the next poll.
+    for (0..20) |i| {
+        const name = try std.fmt.bufPrint(&namebuf, "f{d:0>2}.lua", .{i});
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "-- bigger body v2" });
+    }
+    try expectEqual(@as(usize, 16), w.poll(&changes));
+    try expectEqual(@as(usize, 4), w.poll(&changes));
+    try expectEqual(@as(usize, 0), w.poll(&changes));
+}
+
 // ── reload seam (per family) ───────────────────────────────────────────
 
 /// Per-language devx scripts: v1/v2 for the reload tests (same shape —
-/// an init log, an update log, one `devx_ping` handler), a broken-update
-/// script + its fix for the throttle test, and a late-born script for
-/// watch discovery. Log-only on purpose: behavior visibility without
-/// dragging each language's entity API in.
+/// an init log, an update log, one `devx_ping` handler registered FROM
+/// init, the documented pattern the reload lifecycle must preserve), a
+/// broken-update script + its fix for the throttle test, and a
+/// late-born script for watch discovery. Log-only on purpose: behavior
+/// visibility without dragging each language's entity API in.
 const src = switch (scripting.language) {
     .lua => struct {
         const ext = ".lua";
         const v1: [:0]const u8 =
-            \\labelle.on("devx_ping", function(ev) labelle.log("devx v1 ping") end)
-            \\function init() labelle.log("devx init ran") end
+            \\function init()
+            \\    labelle.log("devx init ran")
+            \\    labelle.on("devx_ping", function(ev) labelle.log("devx v1 ping") end)
+            \\end
             \\function update(dt) labelle.log("devx v1 update") end
         ;
         const v2: [:0]const u8 =
-            \\labelle.on("devx_ping", function(ev) labelle.log("devx v2 ping") end)
-            \\function init() labelle.log("devx init ran") end
+            \\function init()
+            \\    labelle.log("devx init ran")
+            \\    labelle.on("devx_ping", function(ev) labelle.log("devx v2 ping") end)
+            \\end
             \\function update(dt) labelle.log("devx v2 update") end
         ;
         const boom: [:0]const u8 =
@@ -123,18 +155,18 @@ const src = switch (scripting.language) {
     .ruby => struct {
         const ext = ".rb";
         const v1: [:0]const u8 =
-            \\Labelle.on("devx_ping") { |ev| Labelle.log("devx v1 ping") }
             \\def init
             \\  Labelle.log("devx init ran")
+            \\  Labelle.on("devx_ping") { |ev| Labelle.log("devx v1 ping") }
             \\end
             \\def update(dt)
             \\  Labelle.log("devx v1 update")
             \\end
         ;
         const v2: [:0]const u8 =
-            \\Labelle.on("devx_ping") { |ev| Labelle.log("devx v2 ping") }
             \\def init
             \\  Labelle.log("devx init ran")
+            \\  Labelle.on("devx_ping") { |ev| Labelle.log("devx v2 ping") }
             \\end
             \\def update(dt)
             \\  Labelle.log("devx v2 update")
@@ -163,13 +195,17 @@ const src = switch (scripting.language) {
     .typescript => struct {
         const ext = ".js";
         const v1: [:0]const u8 =
-            \\labelle.on("devx_ping", (ev) => { labelle.log("devx v1 ping"); });
-            \\export function init() { labelle.log("devx init ran"); }
+            \\export function init() {
+            \\  labelle.log("devx init ran");
+            \\  labelle.on("devx_ping", (ev) => { labelle.log("devx v1 ping"); });
+            \\}
             \\export function update(dt) { labelle.log("devx v1 update"); }
         ;
         const v2: [:0]const u8 =
-            \\labelle.on("devx_ping", (ev) => { labelle.log("devx v2 ping"); });
-            \\export function init() { labelle.log("devx init ran"); }
+            \\export function init() {
+            \\  labelle.log("devx init ran");
+            \\  labelle.on("devx_ping", (ev) => { labelle.log("devx v2 ping"); });
+            \\}
             \\export function update(dt) { labelle.log("devx v2 update"); }
         ;
         const boom: [:0]const u8 =
@@ -198,7 +234,7 @@ test "reloadScript refuses on the native family (compiled code cannot re-eval)" 
     try expectEqual(@as(usize, 0), scripting.registeredScriptCount());
 }
 
-test "reloadScript swaps behavior in the running VM: no restart, no re-init, no handler pileup" {
+test "reloadScript replays the lifecycle: behavior swaps, init re-runs, no handler pileup or loss" {
     if (comptime !is_vm_family) return error.SkipZigTest;
     fresh();
     scripting.registerScript("counter", src.v1);
@@ -214,19 +250,21 @@ test "reloadScript swaps behavior in the running VM: no restart, no re-init, no 
 
     // New behavior, same VM, same tick loop.
     try expect(mock.logsContain("devx v2 update"));
-    // A running script does NOT re-init on reload (init-time work would
-    // double)…
-    try expectEqual(@as(usize, 1), mock.logCount("devx init ran"));
+    // The reload lifecycle REPLAYS init() (the dev-mode contract: init
+    // is a documented place to subscribe, and skipping it would silently
+    // drop those subscriptions) — exactly once per reload.
+    try expectEqual(@as(usize, 2), mock.logCount("devx init ran"));
 
-    // …and the OLD incarnation's handlers were purged before the new
-    // body re-registered: one ping, one v2 reaction, zero v1.
+    // The old incarnation's handlers were purged BEFORE the new init
+    // re-registered: one ping fires exactly one v2 reaction — the
+    // init-registered subscription survives reload without stacking.
     mock.hostEmit("devx_ping", "{}");
     scripting.Controller.tick(.{}, 0.016);
     try expectEqual(@as(usize, 0), mock.logCount("devx v1 ping"));
     try expectEqual(@as(usize, 1), mock.logCount("devx v2 ping"));
 }
 
-test "reloading a boot-broken script runs its owed init once fixed" {
+test "reloading a boot-broken script runs init once fixed" {
     if (comptime !is_vm_family) return error.SkipZigTest;
     fresh();
     scripting.registerScript("counter", src.broken_syntax);
@@ -236,11 +274,41 @@ test "reloading a boot-broken script runs its owed init once fixed" {
     scripting.Controller.tick(.{}, 0.016);
     try expect(!mock.logsContain("devx init ran"));
 
-    // The fix-and-save loop: reload now loads AND runs the owed init.
+    // The fix-and-save loop: the reload replays the full lifecycle.
     try expect(scripting.reloadScript("counter", src.v1));
     try expectEqual(@as(usize, 1), mock.logCount("devx init ran"));
     scripting.Controller.tick(.{}, 0.016);
     try expect(mock.logsContain("devx v1 update"));
+}
+
+test "reload state machine: a bad save halts the script; the next good save replays init ONCE" {
+    if (comptime !is_vm_family) return error.SkipZigTest;
+    fresh();
+    scripting.registerScript("counter", src.v1);
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+    try expectEqual(@as(usize, 1), mock.logCount("devx init ran"));
+    const v1_updates = mock.logCount("devx v1 update");
+
+    // Bad save: reload fails, and the script goes SILENT (running
+    // half-old code with its handlers purged would be worse than none).
+    try expect(!scripting.reloadScript("counter", src.broken_syntax));
+    scripting.Controller.tick(.{}, 0.016);
+    scripting.Controller.tick(.{}, 0.016);
+    try expectEqual(v1_updates, mock.logCount("devx v1 update"));
+    try expectEqual(@as(usize, 1), mock.logCount("devx init ran"));
+
+    // Good save: ONE lifecycle replay (the failed save contributed no
+    // init), new behavior ticks, the init-registered handler answers.
+    try expect(scripting.reloadScript("counter", src.v2));
+    try expectEqual(@as(usize, 2), mock.logCount("devx init ran"));
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.logsContain("devx v2 update"));
+    mock.hostEmit("devx_ping", "{}");
+    scripting.Controller.tick(.{}, 0.016);
+    try expectEqual(@as(usize, 1), mock.logCount("devx v2 ping"));
 }
 
 test "hot reload end to end: edit on disk, pump, behavior changes; a new file self-registers" {
@@ -269,9 +337,10 @@ test "hot reload end to end: edit on disk, pump, behavior changes; a new file se
     try tmp.dir.writeFile(io, .{ .sub_path = file, .data = src.v2 });
     try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
     scripting.Controller.tick(.{}, 0.016);
-    // …and behavior updated without restart, without re-running init.
+    // …and behavior updated without restart (init replayed once, per
+    // the reload lifecycle).
     try expect(mock.logsContain("devx v2 update"));
-    try expectEqual(@as(usize, 1), mock.logCount("devx init ran"));
+    try expectEqual(@as(usize, 2), mock.logCount("devx init ran"));
 
     // A file born after watch start registers, loads and inits.
     const late_file = "99_late" ++ src.ext;
@@ -305,6 +374,37 @@ test "hot reload pumps off the Controller tick cadence (dev builds)" {
         scripting.Controller.tick(.{}, 0.016);
     }
     try expect(mock.logsContain("devx v2 update"));
+}
+
+test "ruby: a script discovered mid-run inits BEFORE its controllers set up" {
+    // The boot order — every init, then controller setup — must hold for
+    // the reload lifecycle too: a controller's setup may depend on
+    // entities/state the script's init seeds (finding: labelle-scripting
+    // PR #47 review). Pinned by log ORDER on the new-file-discovered
+    // path (reloadScript on a never-registered name — what the watcher
+    // does for a file born mid-run).
+    if (scripting.language != .ruby) return error.SkipZigTest;
+    fresh();
+    try scripting.Controller.setup(.{}); // boot sweep runs (no scripts)
+    defer scripting.Controller.deinit();
+
+    try expect(scripting.reloadScript("seeded",
+        \\def init
+        \\  Labelle.log("seed init ran")
+        \\end
+        \\class DevxSeedController < Labelle::Controller
+        \\  def setup
+        \\    log("seed controller setup")
+        \\  end
+        \\
+        \\  def tick(dt)
+        \\  end
+        \\end
+    ));
+    const init_idx = mock.logIndexOf("seed init ran") orelse return error.TestExpectedLog;
+    const setup_idx = mock.logIndexOf("seed controller setup") orelse return error.TestExpectedLog;
+    try expect(init_idx < setup_idx);
+    scripting.Controller.tick(.{}, 0.016); // the fresh controller ticks clean
 }
 
 // ── error-UX throttle ──────────────────────────────────────────────────

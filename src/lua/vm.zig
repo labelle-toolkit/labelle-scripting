@@ -263,9 +263,16 @@ fn rawTraceback(L: ?*c.State) callconv(.c) c_int {
     var len: usize = 0;
     const msg = c.lua_tolstring(L, 1, &len);
     var isnum: c_int = 0;
-    var level = c.lua_tointegerx(L, 2, &isnum);
-    if (isnum == 0) level = 1;
-    c.luaL_traceback(L, L, msg, @intCast(level));
+    const requested = c.lua_tointegerx(L, 2, &isnum);
+    // Checked cast: any lua integer can arrive here, and an out-of-range
+    // @intCast is a safety panic. A level outside c_int (or a
+    // non-integer) falls back to 1 — db_traceback's own default; absurd
+    // levels just mean an empty trace either way.
+    const level: c_int = if (isnum != 0)
+        std.math.cast(c_int, requested) orelse 1
+    else
+        1;
+    c.luaL_traceback(L, L, msg, level);
     return 1;
 }
 
@@ -366,8 +373,10 @@ pub const Vm = struct {
             // scripts get time through labelle.time_dt), package/require
             // (filesystem module search), debug (debug.getregistry would
             // reach package.loaded and beyond). The base library's two
-            // filesystem loaders are removed right after opening; its
-            // `load` stays (string chunks only — no file access).
+            // filesystem loaders are removed right after opening, and
+            // `load` is rebound TEXT-ONLY (a bytecode string through the
+            // default "bt" mode would bypass the text-level sandbox —
+            // crafted binary chunks can corrupt the VM).
             openSandboxedLibs(L);
         } else {
             // Full stdlib: game scripts are first-party content (they ship
@@ -401,6 +410,28 @@ pub const Vm = struct {
         c.lua_setglobal(L, "dofile");
         c.lua_pushnil(L);
         c.lua_setglobal(L, "loadfile");
+        // Rebind `load` text-only: the real load's default mode is "bt",
+        // and a binary chunk (precompiled bytecode, buildable with
+        // string.char alone) is NOT safe to run from untrusted input —
+        // the undump path trusts its bytes. The wrapper pins mode to
+        // "t" whatever the caller asked (a caller-requested "b" then
+        // fails inside rawload with the standard "attempt to load a
+        // binary chunk" error return, load's nil-plus-message protocol).
+        // The env argument forwards only when actually PASSED —
+        // luaB_load treats an explicit nil env as "set _ENV to nil",
+        // which is not the same as omitting it. `rawload` lives in a
+        // local upvalue scripts cannot reach. loadstring needs no
+        // treatment: 5.4 only defines it under LUA_COMPAT_LOADSTRING,
+        // which this build does not set.
+        _ = (Vm{ .L = L.? }).runChunk("@labelle/sandbox",
+            \\local rawload = load
+            \\load = function(chunk, chunkname, mode, ...)
+            \\  if select("#", ...) == 0 then
+            \\    return rawload(chunk, chunkname, "t")
+            \\  end
+            \\  return rawload(chunk, chunkname, "t", (select(1, ...)))
+            \\end
+        );
     }
 
     /// Close the VM. Lua's GC releases every script, env and binding —

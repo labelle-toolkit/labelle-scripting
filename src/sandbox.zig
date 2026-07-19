@@ -14,8 +14,11 @@
 //! What the profile MEANS per language (the mechanism lives with each
 //! VM; this file is only the switch):
 //!   - lua  — src/lua/vm.zig opens a SAFE-LIB subset instead of
-//!     luaL_openlibs: no io, no os, no package/require, no debug, and
-//!     the base library's dofile/loadfile are removed. Build-level
+//!     luaL_openlibs: no io, no os, no package/require, no debug, the
+//!     base library's dofile/loadfile are removed, and `load` is
+//!     rebound TEXT-ONLY (precompiled binary chunks would bypass the
+//!     text-level sandbox — the undump path trusts its bytes).
+//!     Build-level
 //!     exclusion was considered and rejected: the lua stdlib compiles as
 //!     one vendored set either way, and never *opening* a library is
 //!     exactly as unreachable as never compiling it (the C entry points
