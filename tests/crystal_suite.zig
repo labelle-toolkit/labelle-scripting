@@ -360,3 +360,126 @@ test "registered sources are refused loudly — crystal code arrives compiled, n
     try expectEqual(@as(usize, 1), scripting.registeredScriptCount());
     scripting.Controller.tick(.{}, 0.016);
 }
+
+test "bulk v1.3: packed codec round-trips typed views, JSON stays the fallback" {
+    fresh();
+    selectScenario("bulk_packed");
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Every field kind survived the binary round-trip (f32/i64/bool/u64).
+    try expect(mock.logsContain("crystal: packed:1.5:-42:true:123"));
+    // The stored JSON is in the mock's SCHEMA order (power,score,alive,
+    // seed) — the packed set wrote it. The JSON fallback sorts keys
+    // (alive,power,score,seed), so key order proves the path taken.
+    try expectComponent(1, "Stats", "{\"power\":1.5,\"score\":-42,\"alive\":true,\"seed\":123}");
+    // The schema-less component round-trips through JSON.
+    try expect(mock.logsContain("crystal: plain:2.5"));
+    try expectComponent(1, "Plain", "{\"a\":2.5}");
+    // A bit-63 u64 rides tag 3 bit-exact (crystal has a real UInt64);
+    // the host stored the unsigned value via the packed path.
+    try expect(mock.logsContain("crystal: u64rt:true"));
+    try expectComponent(2, "Stats", "{\"power\":0,\"score\":0,\"alive\":false,\"seed\":9223372036854775809}");
+    // Non-finite policy: NaN refused up front — nothing stored.
+    try expect(mock.logsContain("crystal: nan_refused:true"));
+    try expect(mock.componentJson(3, "Stats") == null);
+    // Absent components answer false through both routes.
+    try expect(mock.logsContain("crystal: absent:true"));
+}
+
+test "bulk v1.3: batch_get/batch_set round-trip the whole query as one f32 stream" {
+    fresh();
+    selectScenario("bulk_batch");
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Int-carrying components refused LOUDLY on both directions
+    // (ArgumentError raises, rescued in-script).
+    try expect(!mock.logsContain("crystal: get refusal missed"));
+    try expect(!mock.logsContain("crystal: set refusal missed"));
+    try expect(mock.logsContain("crystal: get int refused:true"));
+    try expect(mock.logsContain("crystal: set int refused:true"));
+
+    scripting.Controller.tick(.{}, 0.016);
+    // 3 matching entities (the lone BatchPos-only one filtered out),
+    // stride 4 → exactly 12 floats crossed.
+    try expect(mock.logsContain("crystal: batch count:3 floats:12"));
+    try expectComponent(1, "BatchPos", "{\"x\":11,\"y\":-10}");
+    try expectComponent(2, "BatchPos", "{\"x\":12,\"y\":-10}");
+    try expectComponent(3, "BatchPos", "{\"x\":13,\"y\":-10}");
+    // Second tick reuses the same buffers and advances again.
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "BatchPos", "{\"x\":21,\"y\":-20}");
+    try expectComponent(3, "BatchPos", "{\"x\":23,\"y\":-20}");
+    // The filtered-out entity was never rewritten.
+    try expectComponent(4, "BatchPos", "{\"x\":7,\"y\":8}");
+}
+
+test "bulk v1.3: batch_set raises when the entity set changed since batch_get" {
+    fresh();
+    selectScenario("bulk_stale");
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+    // The exact-size positional-coupling guard fired and surfaced as a
+    // catchable BatchError telling the script to re-get.
+    try expect(!mock.logsContain("crystal: stale write accepted"));
+    try expect(mock.logsContain("crystal: stale refused:"));
+    try expect(mock.logsContain("entity set changed"));
+    // NOTHING was applied: the survivor keeps its batch_get-era value.
+    try expectComponent(1, "BatchPos", "{\"x\":0,\"y\":0}");
+}
+
+test "bulk stage 3: the typed block tier round-trips through Labelle.batch" {
+    fresh();
+    selectScenario("bulk_iter");
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.logsContain("crystal: iter n:3"));
+    // The block's writes landed through the one batch_set — typed
+    // write-through views mapped [x, y | vx, vy] as the stream lays out.
+    try expectComponent(1, "BatchPos", "{\"x\":11,\"y\":-10}");
+    try expectComponent(2, "BatchPos", "{\"x\":12,\"y\":-10}");
+    try expectComponent(3, "BatchPos", "{\"x\":13,\"y\":-10}");
+    try expectComponent(3, "BatchVel", "{\"vx\":-10,\"vy\":-10}");
+    try expectComponent(1, "BatchVel", "{\"vx\":10,\"vy\":-10}");
+    // Second tick is steady state (entity 3 moves backward, bounced).
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "BatchPos", "{\"x\":21,\"y\":-20}");
+    try expectComponent(3, "BatchPos", "{\"x\":3,\"y\":-20}");
+}
+
+test "bulk stage 3: block-tier exit semantics — break commits, raise aborts, nested/mismatch refuse" {
+    fresh();
+    selectScenario("bulk_iter_edge");
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Empty query: 0, the block never ran.
+    try expect(mock.logsContain("crystal: empty n:0"));
+    try expect(!mock.logsContain("crystal: empty ran"));
+    // break after mutating entity 1 only: its write COMMITTED (the
+    // views write through to the buffer), not-yet-yielded entities
+    // round-tripped unchanged; `break value` came back as the call's
+    // value.
+    try expect(mock.logsContain("crystal: break r::halted"));
+    try expectComponent(1, "BatchPos", "{\"x\":11,\"y\":0}");
+    try expectComponent(2, "BatchPos", "{\"x\":2,\"y\":0}");
+    try expectComponent(3, "BatchPos", "{\"x\":3,\"y\":0}");
+    // The raising block aborted the whole write (x stays 11, the 999
+    // never landed) — and the raise stayed catchable in-script.
+    try expect(!mock.logsContain("crystal: raise swallowed"));
+    try expect(mock.logsContain("crystal: block raised: boom"));
+    // Nested batch calls refused loudly.
+    try expect(!mock.logsContain("crystal: nested accepted"));
+    try expect(mock.logsContain("crystal: nested refused:"));
+    // Layout mismatch (a zero-stream-float component vs a one-field
+    // view) refused before any yield.
+    try expect(!mock.logsContain("crystal: mismatch accepted"));
+    try expect(!mock.logsContain("crystal: mismatch ran"));
+    try expect(mock.logsContain("crystal: mismatch refused:"));
+    try expectComponent(4, "BatchPos", "{\"x\":50,\"y\":0}");
+}

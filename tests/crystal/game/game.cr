@@ -27,6 +27,7 @@ require "./big_query"
 require "./events"
 require "./lifecycle"
 require "./gc_churn"
+require "./bulk"
 
 # Test-only host symbols (exported by tests/crystal_suite.zig): the
 # scenario name pull, and the boot-failure stage flag.
@@ -80,6 +81,18 @@ module Game
       scripts.add "lifecycle", Lifecycle.new
     when "gc_churn"
       scripts.add "gc_churn", GcChurn.new
+    when "bulk_packed"
+      # Bulk component access (contract v1.3, #44): packed codec,
+      # raw batch tier, coupling guard, typed block tier.
+      scripts.add "bulk_packed", PackedRt.new
+    when "bulk_batch"
+      scripts.add "bulk_batch", BatchFlat.new
+    when "bulk_stale"
+      scripts.add "bulk_stale", BatchStale.new
+    when "bulk_iter"
+      scripts.add "bulk_iter", BatchIter.new
+    when "bulk_iter_edge"
+      scripts.add "bulk_iter_edge", BatchIterEdge.new
     end
   end
 end

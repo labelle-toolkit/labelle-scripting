@@ -91,6 +91,26 @@ lib LibLabelle
   fun labelle_time_dt_stamp(dt : Float32)
 end
 
+# Bulk component access (contract v1.3, labelle-scripting#41/#44) —
+# these bind the scripting plugin's ALWAYS-PRESENT Zig-side shims
+# (labelle-scripting src/bulk_shims.zig), NOT the contract's own
+# `labelle_component_*_packed`/`_batch_*` exports: those four symbols
+# exist only on engine hosts >= 2.6.0, and a direct reference would make
+# every crystal game UNLINKABLE against an older engine. The shims are
+# comptime-gated plugin-side — on a v1.3+ host they forward 1:1, on an
+# older host they answer the ordinary absent/refused sentinels (packed
+# paths degrade to JSON silently) and `labelle_scripting_bulk_capability`
+# answers 0, which the batch wrappers check FIRST and surface as the
+# loud "needs labelle-engine >= 2.6.0" raise (no batch fallback —
+# silently degrading a whole-query read would be data loss).
+lib LibLabelleBulk
+  fun labelle_scripting_bulk_capability : UInt32
+  fun labelle_scripting_bulk_get_packed(id : UInt64, name : UInt8*, name_len : LibC::SizeT, out_buf : UInt8*, out_cap : LibC::SizeT) : LibC::SizeT
+  fun labelle_scripting_bulk_set_packed(id : UInt64, name : UInt8*, name_len : LibC::SizeT, buf : UInt8*, buf_len : LibC::SizeT) : Int32
+  fun labelle_scripting_bulk_batch_get(names_json : UInt8*, names_json_len : LibC::SizeT, out_buf : UInt8*, out_cap : LibC::SizeT) : LibC::SizeT
+  fun labelle_scripting_bulk_batch_set(names_json : UInt8*, names_json_len : LibC::SizeT, buf : UInt8*, buf_len : LibC::SizeT) : Int32
+end
+
 module Labelle
   # Entity id, exactly as the contract carries it. 0 is never a valid
   # id and doubles as the failure sentinel.
@@ -353,6 +373,656 @@ module Labelle
   # Log through the game's log sink at info level, "[script]"-prefixed.
   def self.log(msg : String) : Nil
     LibLabelle.labelle_log(msg.to_unsafe, msg.bytesize)
+  end
+
+  # ── Bulk component access (contract v1.3, labelle-scripting#41/#44) ──
+  #
+  # The packed per-component codec and the batched whole-query f32
+  # stream, ported from the Ruby reference (src/ruby/bindings.zig +
+  # prelude.rb). Capability gating rides the plugin's Zig-side shims —
+  # see the `lib LibLabelleBulk` doc above.
+  #
+  # 64-BIT POLICY: crystal has real Int64/UInt64, so the packed codec's
+  # two's-complement bitcast pair applies directly — a UInt64 field
+  # rides tag 3 bit-exact, and a record whose 64-bit tag mismatches the
+  # field's signedness lands via `to_u64!`/`to_i64!` bitcast (the
+  # documented lossless pair).
+  #
+  # NON-FINITE POLICY (parity with this family's JSON route): crystal
+  # scripts hand-write JSON, where NaN/Inf have no spelling — a
+  # hand-built `{"power":NaN}` is refused by the host parser (-1 →
+  # false). The packed fast path must not smuggle values the JSON route
+  # cannot carry, so `set_from` refuses a non-finite Float32 field up
+  # front (false, nothing written).
+
+  # `labelle_component_batch_get`'s int-field refusal sentinel — the
+  # header's LABELLE_BATCH_INT_REFUSED, C's `(size_t)-2`. Checked
+  # BEFORE treating the return as a required size.
+  BATCH_INT_REFUSED = LibC::SizeT::MAX - 1
+
+  # One packed-codec scalar — the wire's tag vocabulary as a crystal
+  # union (0=Float32, 1=Int64, 2=Bool, 3=UInt64).
+  alias Scalar = Float32 | Int64 | UInt64 | Bool
+
+  # A batch call refused. Every refusal is LOUD on purpose — there is
+  # no batch fallback (silently degrading a whole-query read would be
+  # data loss). Int-typed-field refusals raise ArgumentError instead,
+  # mirroring the ruby binding's class split.
+  class BatchError < Exception
+  end
+
+  # True when the host engine exports the contract v1.3 bulk-access
+  # symbols (labelle-engine >= 2.6.0) — the runtime spelling of the
+  # Zig-side comptime probe. The batch wrappers check it themselves;
+  # exposed for scripts that want to feature-gate.
+  def self.bulk_access? : Bool
+    LibLabelleBulk.labelle_scripting_bulk_capability == 1
+  end
+
+  private def self.raise_batch_unsupported : NoReturn
+    raise BatchError.new(
+      "labelle: batch — the host engine lacks batch support (script contract v1.3 " \
+      "needs labelle-engine >= 2.6.0); use per-entity get/set on this engine")
+  end
+
+  private def self.raise_batch_int_refused(names_json : String) : NoReturn
+    raise ArgumentError.new(
+      "labelle: batch refused for #{names_json}: a named component has an int-typed " \
+      "field (i64/u64 cannot ride the f32 batch stream) — keep that component on " \
+      "per-entity get/set (the packed codec carries ints losslessly)")
+  end
+
+  # ONE contract crossing fills `arr` with every matching entity's
+  # scalar component data as a flat Float32 stream ([c0_f0, c0_f1, …]
+  # per entity, components in `names_json` order, fields in declaration
+  # order) and returns the entity COUNT; `arr` is trimmed to exactly
+  # count×stride (a shrinking set never leaves stale trailing floats
+  # for batch_set's exact-size guard). `scratch` carries the raw byte
+  # stream; both reuse capacity, growing at most once. 0 = empty query
+  # (also malformed names / not bound — the ruby convention). The raw
+  # tier: the script owns the positional layout. Raises ArgumentError
+  # on an int-carrying named component, BatchError on a pre-v1.3 host.
+  def self.batch_get(names_json : String, arr : Array(Float32), scratch : Buffer) : Int32
+    arr.clear
+    scratch.len = 0
+    raise_batch_unsupported unless bulk_access?
+    n = LibLabelleBulk.labelle_scripting_bulk_batch_get(
+      names_json.to_unsafe, names_json.bytesize, scratch.to_unsafe, scratch.capacity)
+    # The refusal sentinel is (size_t)-2 — check BEFORE reading the
+    # return as a required size.
+    raise_batch_int_refused(names_json) if n == BATCH_INT_REFUSED
+    return 0 if n == 0
+    if n > scratch.capacity
+      scratch.ensure_capacity(n.to_i32)
+      n = LibLabelleBulk.labelle_scripting_bulk_batch_get(
+        names_json.to_unsafe, names_json.bytesize, scratch.to_unsafe, scratch.capacity)
+      return 0 if n == 0 || n > scratch.capacity # belt — mirrors ruby
+    end
+    return 0 if n < 4
+    scratch.len = n.to_i32
+    bytes = scratch.to_slice
+    count = (bytes[0].to_u32 | (bytes[1].to_u32 << 8) | (bytes[2].to_u32 << 16) | (bytes[3].to_u32 << 24)).to_i32
+    nfloats = (bytes.size - 4) // 4
+    i = 0
+    while i < nfloats
+      at = 4 + i * 4
+      bits = bytes[at].to_u32 | (bytes[at + 1].to_u32 << 8) | (bytes[at + 2].to_u32 << 16) | (bytes[at + 3].to_u32 << 24)
+      f = bits.unsafe_as(Float32)
+      if i < arr.size
+        arr[i] = f
+      else
+        arr << f
+      end
+      i += 1
+    end
+    arr.truncate(0, nfloats)
+    count
+  end
+
+  # ONE contract crossing writes the whole stream back: the host
+  # re-queries the same entities in the same order and applies `arr`
+  # positionally, read-modify-write per component. `count` is the
+  # caller's entity count (API symmetry with ruby); the array length is
+  # the authoritative float count. Raises ArgumentError on int-typed
+  # fields, BatchError when the entity set changed since the paired
+  # batch_get (NOTHING was applied — re-run batch_get and recompute)
+  # or on a pre-v1.3 host.
+  def self.batch_set(names_json : String, arr : Array(Float32), count : Int32, scratch : Buffer) : Nil
+    raise_batch_unsupported unless bulk_access?
+    bytes = arr.size * 4
+    scratch.ensure_capacity(Math.max(bytes, 1))
+    p = scratch.to_unsafe
+    arr.each_with_index do |f, i|
+      bits = f.unsafe_as(UInt32)
+      p[i * 4] = (bits & 0xFF).to_u8!
+      p[i * 4 + 1] = ((bits >> 8) & 0xFF).to_u8!
+      p[i * 4 + 2] = ((bits >> 16) & 0xFF).to_u8!
+      p[i * 4 + 3] = ((bits >> 24) & 0xFF).to_u8!
+    end
+    rc = LibLabelleBulk.labelle_scripting_bulk_batch_set(names_json.to_unsafe, names_json.bytesize, p, bytes)
+    raise_batch_int_refused(names_json) if rc == -2
+    if rc != 0
+      raise BatchError.new(
+        "labelle: batch_set refused for #{names_json}: the entity set changed between " \
+        "batch_get and batch_set (spawn/destroy between the paired calls — the buffer " \
+        "was computed against a stale set; re-run batch_get and recompute), or the " \
+        "names were malformed / the host not bound")
+    end
+  end
+
+  # Refill `view` (a `Labelle.packed_view` instance) from its component
+  # on `id` — the per-component FAST PATH. Tries the packed codec first
+  # (scalars land straight in the typed properties, no JSON parse); a
+  # 0xFF first byte (non-scalar component), an absent component, or a
+  # pre-v1.3 host drops to the JSON route transparently. `buf` is the
+  # reused byte Buffer (grow-once). False = absent / unknown / dead.
+  def self.get_into(id : EntityId, view, buf : Buffer) : Bool
+    name = view.class.labelle_component_name
+    buf.len = 0
+    n = LibLabelleBulk.labelle_scripting_bulk_get_packed(
+      id, name.to_unsafe, name.bytesize, buf.to_unsafe, buf.capacity)
+    if n > buf.capacity
+      buf.ensure_capacity(n.to_i32)
+      n = LibLabelleBulk.labelle_scripting_bulk_get_packed(
+        id, name.to_unsafe, name.bytesize, buf.to_unsafe, buf.capacity)
+    end
+    if n >= 1 && n <= buf.capacity
+      buf.len = n.to_i32
+      rec = buf.to_slice
+      if rec[0] != 0xFF
+        decode_packed_into(rec, view)
+        return true
+      end
+    end
+    # n == 0 (absent / pre-v1.3 host) or 0xFF (non-scalar component):
+    # the JSON route decides — absent stays false there too.
+    return false unless get_component_into(id, name, buf)
+    json_scalar_fields(buf.to_slice) do |key, v|
+      view.__labelle_set_field(key, v)
+    end
+    true
+  end
+
+  # Write `view` to its component on `id` — the per-component FAST PATH
+  # (REPLACE semantics). Encodes the packed record (each field tagged by
+  # its crystal type); a host refusal (-1: non-packable component,
+  # out-of-range value, pre-v1.3 host) falls back to a sorted-key JSON
+  # encode of the same fields. A NON-FINITE Float32 field refuses up
+  # front (false, nothing written) — see the section doc. False =
+  # refused / unknown / dead.
+  def self.set_from(id : EntityId, view) : Bool
+    name = view.class.labelle_component_name
+    nonfinite = false
+    view.__labelle_each_field do |_fname, v|
+      nonfinite = true if v.is_a?(Float32) && !v.finite?
+    end
+    return false if nonfinite
+    rec = uninitialized UInt8[2048]
+    if len = encode_packed(view, rec.to_slice)
+      rc = LibLabelleBulk.labelle_scripting_bulk_set_packed(
+        id, name.to_unsafe, name.bytesize, rec.to_unsafe, len)
+      return true if rc == 0
+      # Refused — fall through to JSON, which represents the value
+      # faithfully (or refuses loudly host-side).
+    end
+    # JSON fallback: deterministic sorted-key encode (the ruby
+    # binding's convention). Cold path — allocates.
+    fields = [] of Tuple(String, Scalar)
+    view.__labelle_each_field { |fname, v| fields << {fname, v} }
+    json = String.build do |io|
+      io << '{'
+      fields.sort_by(&.[0]).each_with_index do |(fname, v), i|
+        io << ',' if i > 0
+        io << '"' << fname << "\":"
+        io << v
+      end
+      io << '}'
+    end
+    set_component(id, name, json)
+  end
+
+  # Decode a packed component record (the host's `_get_packed` wire
+  # format) into the view: for each field record, assign by name. A
+  # malformed record stops early (fields decoded so far stay applied) —
+  # the host builds it, so this is belt-and-suspenders, like ruby's.
+  private def self.decode_packed_into(rec : Bytes, view) : Nil
+    return if rec.empty?
+    field_count = rec[0].to_i
+    pos = 1
+    field_count.times do
+      return if pos >= rec.size
+      name_len = rec[pos].to_i
+      pos += 1
+      return if pos + name_len > rec.size
+      fname = rec[pos, name_len]
+      pos += name_len
+      return if pos >= rec.size
+      tag = rec[pos]
+      pos += 1
+      v : Scalar = case tag
+      when 0_u8
+        return if pos + 4 > rec.size
+        bits = rec[pos].to_u32 | (rec[pos + 1].to_u32 << 8) | (rec[pos + 2].to_u32 << 16) | (rec[pos + 3].to_u32 << 24)
+        pos += 4
+        bits.unsafe_as(Float32)
+      when 1_u8
+        return if pos + 8 > rec.size
+        x = read_u64_le(rec, pos)
+        pos += 8
+        x.to_i64!
+      when 2_u8
+        return if pos >= rec.size
+        b = rec[pos] != 0
+        pos += 1
+        b
+      when 3_u8
+        return if pos + 8 > rec.size
+        x = read_u64_le(rec, pos)
+        pos += 8
+        x
+      else
+        return
+      end
+      view.__labelle_set_field(fname, v)
+    end
+  end
+
+  private def self.read_u64_le(rec : Bytes, pos : Int32) : UInt64
+    x = 0_u64
+    8.times { |i| x |= rec[pos + i].to_u64 << (8 * i) }
+    x
+  end
+
+  # Encode the view as a packed record (the `_set_packed` wire format:
+  # each field tagged by its crystal type). Nil = doesn't fit `rec`
+  # (the caller takes the JSON path).
+  private def self.encode_packed(view, rec : Bytes) : Int32?
+    w = 1 # first byte patched after the walk (field count)
+    count = 0
+    overflow = false
+    view.__labelle_each_field do |fname, v|
+      next if overflow
+      payload =
+        case v
+        in Float32 then 4
+        in Bool    then 1
+        in Int64   then 8
+        in UInt64  then 8
+        end
+      if fname.bytesize > 255 || w + 1 + fname.bytesize + 1 + payload > rec.size
+        overflow = true
+        next
+      end
+      rec[w] = fname.bytesize.to_u8!
+      w += 1
+      fname.to_slice.copy_to(rec[w, fname.bytesize])
+      w += fname.bytesize
+      case v
+      in Float32
+        rec[w] = 0_u8
+        write_u32_le(rec, w + 1, v.unsafe_as(UInt32))
+        w += 5
+      in Int64
+        rec[w] = 1_u8
+        write_u64_le(rec, w + 1, v.to_u64!)
+        w += 9
+      in Bool
+        rec[w] = 2_u8
+        rec[w + 1] = v ? 1_u8 : 0_u8
+        w += 2
+      in UInt64
+        rec[w] = 3_u8
+        write_u64_le(rec, w + 1, v)
+        w += 9
+      end
+      count += 1
+    end
+    return nil if overflow || count > 255
+    rec[0] = count.to_u8!
+    w
+  end
+
+  private def self.write_u32_le(rec : Bytes, pos : Int32, bits : UInt32) : Nil
+    4.times { |i| rec[pos + i] = ((bits >> (8 * i)) & 0xFF).to_u8! }
+  end
+
+  private def self.write_u64_le(rec : Bytes, pos : Int32, bits : UInt64) : Nil
+    8.times { |i| rec[pos + i] = ((bits >> (8 * i)) & 0xFF).to_u8! }
+  end
+
+  # Walk a FLAT JSON object's scalar members: for each top-level key
+  # whose value is a number or bool, yield (key_bytes, scalar). Numbers
+  # type by token shape (fraction/exponent → Float32; else Int64 when
+  # negative, UInt64 otherwise — the mock/engine convention). Nested
+  # values, strings and null are skipped, exactly as the packed stream
+  # skips non-scalar fields. The JSON-fallback decode half of
+  # `get_into`.
+  private def self.json_scalar_fields(json : Bytes, & : Bytes, Scalar -> Nil) : Nil
+    i = skip_ws(json, 0)
+    return if i >= json.size || json[i] != 0x7B # '{'
+    i += 1
+    loop do
+      i = skip_ws(json, i)
+      return if i >= json.size || json[i] == 0x7D # '}'
+      return if json[i] != 0x22                   # '"'
+      i += 1
+      key_start = i
+      while i < json.size && json[i] != 0x22
+        i += 1 # field names are identifiers — no escapes
+      end
+      return if i >= json.size
+      key = json[key_start, i - key_start]
+      i += 1
+      i = skip_ws(json, i)
+      return if i >= json.size || json[i] != 0x3A # ':'
+      i += 1
+      i = skip_ws(json, i)
+      case json[i]?
+      when 0x7B, 0x5B # '{' '[' — skip balanced
+        depth = 0
+        in_str = false
+        while i < json.size
+          b = json[i]
+          if in_str
+            if b == 0x5C # '\'
+              i += 1
+            elsif b == 0x22
+              in_str = false
+            end
+          else
+            case b
+            when 0x22       then in_str = true
+            when 0x7B, 0x5B then depth += 1
+            when 0x7D, 0x5D
+              depth -= 1
+              if depth == 0
+                i += 1
+                break
+              end
+            end
+          end
+          i += 1
+        end
+      when 0x22 # string — skip
+        i += 1
+        while i < json.size
+          if json[i] == 0x5C
+            i += 1
+          elsif json[i] == 0x22
+            i += 1
+            break
+          end
+          i += 1
+        end
+      else
+        start = i
+        while i < json.size && json[i] != 0x2C && json[i] != 0x7D # ',' '}'
+          i += 1
+        end
+        tok = String.new(json[start, i - start]).strip
+        if v = classify_token(tok)
+          yield key, v
+        end
+      end
+      i = skip_ws(json, i)
+      case json[i]?
+      when 0x2C then i += 1
+      else           return
+      end
+    end
+  end
+
+  private def self.skip_ws(json : Bytes, i : Int32) : Int32
+    while i < json.size && (json[i] == 0x20 || json[i] == 0x09 || json[i] == 0x0A || json[i] == 0x0D)
+      i += 1
+    end
+    i
+  end
+
+  private def self.classify_token(tok : String) : Scalar?
+    return nil if tok.empty?
+    return true if tok == "true"
+    return false if tok == "false"
+    fractional = tok.includes?('.') || tok.includes?('e') || tok.includes?('E')
+    unless fractional
+      if tok.starts_with?('-')
+        if v = tok.to_i64?
+          return v
+        end
+      elsif v = tok.to_u64?
+        return v
+      end
+    end
+    tok.to_f32?
+  end
+
+  # ── the typed batch iterator (the ergonomic tier, #44) ───────────────
+  #
+  # `Labelle.batch(PosView, VelView) do |p, v| … end` — ONE batch_get,
+  # the block runs once per matching entity against WRITE-THROUGH typed
+  # views (accessors read/write the shared stream at a moving base
+  # offset — ruby's view mechanics with crystal types), then ONE
+  # batch_set commits everything. Returns the entity count; an empty
+  # query returns 0 without touching the block.
+  #
+  # EXIT SEMANTICS (the ruby contract, verbatim — the block is inlined
+  # `yield`, so crystal's `break`/`next` behave exactly like ruby's):
+  #   - a RAISING block abandons the whole write — batch_set never
+  #     runs, no entity is touched (all-or-nothing, safe to rescue and
+  #     retry);
+  #   - `break` is the normal iterator early-exit and COMMITS every
+  #     write made up to that point (write-through views: the current
+  #     entity's pre-break writes included); entities not yet yielded
+  #     round-trip unchanged. `break value` becomes the call's value.
+  #
+  # The raw pairing rules apply: no spawn/destroy inside the block, and
+  # no NESTED Labelle.batch (it would alias the shared stream buffer —
+  # enforced with a raise). Views are minted per call (two small
+  # allocations — the FFI batching is the win); stash values, never the
+  # view itself.
+  #
+  # The views' declared fields ARE the layout authority (declaration
+  # order, one stream float each), cross-checked against the host
+  # stream's real stride before the first yield — a mismatch raises
+  # BatchError, never mis-maps (use the raw batch_get/batch_set flat
+  # loop for such components).
+  @@batch_floats = [] of Float32
+  @@batch_scratch = Buffer.new
+  @@batch_active = false
+
+  def self.batch(a : T.class, & : T -> _) forall T
+    batch_impl(%(["#{T.labelle_component_name}"]), T.labelle_stride) do |base|
+      view = T.new(@@batch_floats)
+      view.__labelle_base = base
+      yield view
+    end
+  end
+
+  def self.batch(a : T.class, b : U.class, & : T, U -> _) forall T, U
+    batch_impl(
+      %(["#{T.labelle_component_name}","#{U.labelle_component_name}"]),
+      T.labelle_stride + U.labelle_stride) do |base|
+      va = T.new(@@batch_floats)
+      vb = U.new(@@batch_floats)
+      va.__labelle_base = base
+      vb.__labelle_base = base + T.labelle_stride
+      yield va, vb
+    end
+  end
+
+  private def self.batch_impl(names_json : String, stride : Int32, & : Int32 -> _) : Int32
+    raise BatchError.new(
+      "labelle: nested Labelle.batch calls are not supported (the shared stream " \
+      "buffer would alias mid-iteration) — restructure into sequential batches") if @@batch_active
+    @@batch_active = true
+    begin
+      count = batch_get(names_json, @@batch_floats, @@batch_scratch)
+      return 0 if count == 0
+      unless @@batch_floats.size == count * stride
+        raise BatchError.new(
+          "labelle: Labelle.batch(#{names_json}): the typed views' stride (#{stride} " \
+          "fields per entity) does not match the host stream (#{@@batch_floats.size} " \
+          "floats / #{count} entities) — a field the stream skips (non-scalar) " \
+          "disagrees with the view layout; use batch_get/batch_set with explicit " \
+          "offsets for these components")
+      end
+      aborted = false
+      begin
+        base = 0
+        i = 0
+        while i < count
+          yield base
+          base += stride
+          i += 1
+        end
+      rescue ex
+        aborted = true
+        raise ex
+      ensure
+        # break/next bypass rescue but run ensure — early exit COMMITS,
+        # a raise keeps the all-or-nothing abort (the ruby pattern).
+        batch_set(names_json, @@batch_floats, count, @@batch_scratch) unless aborted
+      end
+      count
+    ensure
+      @@batch_active = false
+    end
+  end
+
+  # `Labelle.packed_view StatsView, "Stats", {power: f32, score: i64,
+  # alive: bool, seed: u64}` — mint the typed per-component view class
+  # `Labelle.get_into`/`Labelle.set_from` refill/write over the packed
+  # codec (JSON fallback included). Field types are the codec's scalar
+  # vocabulary: f32 / i64 / u64 / i32 / bool (i32 rides the i64 tag with
+  # host-side range checks). Field names must match the component's;
+  # order is free (the record is self-describing by name). Instantiate
+  # once, hold in an instance var, refill per use — the reuse idiom.
+  macro packed_view(name, component, fields)
+    class {{name.id}}
+      def self.labelle_component_name : String
+        {{component}}
+      end
+
+      {% for fname, ftype in fields %}
+        {% t = ftype.stringify %}
+        {% if t == "f32" %}
+          property {{fname.id}} : Float32 = 0.0_f32
+        {% elsif t == "i64" %}
+          property {{fname.id}} : Int64 = 0_i64
+        {% elsif t == "u64" %}
+          property {{fname.id}} : UInt64 = 0_u64
+        {% elsif t == "i32" %}
+          property {{fname.id}} : Int32 = 0_i32
+        {% elsif t == "bool" %}
+          property {{fname.id}} : Bool = false
+        {% else %}
+          {% raise "Labelle.packed_view: unknown field type #{t} (expected f32/i64/u64/i32/bool)" %}
+        {% end %}
+      {% end %}
+
+      # :nodoc: assign one decoded field by wire name (type-directed;
+      # the 64-bit arms accept the OTHER 64-bit tag via bitcast — the
+      # documented lossless pair). False = not a view field (skipped).
+      def __labelle_set_field(fname : Bytes, v : ::Labelle::Scalar) : Bool
+        {% for fname2, ftype in fields %}
+          {% t = ftype.stringify %}
+          if fname == {{fname2.id.stringify}}.to_slice
+            {% if t == "f32" %}
+              @{{fname2.id}} = v if v.is_a?(Float32)
+            {% elsif t == "i64" %}
+              case v
+              when Int64  then @{{fname2.id}} = v
+              when UInt64 then @{{fname2.id}} = v.to_i64! # the bitcast pair
+              end
+            {% elsif t == "u64" %}
+              case v
+              when UInt64 then @{{fname2.id}} = v
+              when Int64  then @{{fname2.id}} = v.to_u64! # the bitcast pair
+              end
+            {% elsif t == "i32" %}
+              @{{fname2.id}} = v.to_i32! if v.is_a?(Int64)
+            {% elsif t == "bool" %}
+              @{{fname2.id}} = v if v.is_a?(Bool)
+            {% end %}
+            return true
+          end
+        {% end %}
+        false
+      end
+
+      # :nodoc: visit every field in DECLARATION order.
+      def __labelle_each_field(& : String, ::Labelle::Scalar -> Nil) : Nil
+        {% for fname2, ftype in fields %}
+          {% t = ftype.stringify %}
+          {% if t == "i32" %}
+            # The explicit union upcast (.as(Scalar)) sidesteps a crystal
+            # 1.17 codegen bug: yielding a CONCRETE value where the block
+            # restriction is the union ("BUG: trying to downcast … <-
+            # Float32") — upcasting first hands codegen a real union value.
+            yield {{fname2.id.stringify}}, @{{fname2.id}}.to_i64.as(::Labelle::Scalar)
+          {% else %}
+            yield {{fname2.id.stringify}}, @{{fname2.id}}.as(::Labelle::Scalar)
+          {% end %}
+        {% end %}
+      end
+    end
+  end
+
+  # `Labelle.batch_view PosView, "BatchPos", {x: f32, y: f32}` — mint
+  # the typed per-entity view class `Labelle.batch` yields. Views are
+  # WRITE-THROUGH: accessors read/write the shared stream at a moving
+  # base offset (ruby's view mechanics with crystal types), so a write
+  # made before a `break` is already committed to the buffer. Fields
+  # must mirror the component's declaration (same names, DECLARATION
+  # order — the order the host stream walks), which the stride
+  # cross-check enforces before the first yield. Field types: f32
+  # rides raw, bool as 0/1 — an int-typed field fails to COMPILE, the
+  # macro spelling of the host's batch int-refusal.
+  macro batch_view(name, component, fields)
+    class {{name.id}}
+      def self.labelle_component_name : String
+        {{component}}
+      end
+
+      def self.labelle_stride : Int32
+        {{fields.size}}
+      end
+
+      # :nodoc:
+      def initialize(@__labelle_buf : Array(Float32))
+        @__labelle_base = 0
+      end
+
+      # :nodoc:
+      def __labelle_base=(b : Int32)
+        @__labelle_base = b
+      end
+
+      {% i = 0 %}
+      {% for fname, ftype in fields %}
+        {% t = ftype.stringify %}
+        {% if t == "f32" %}
+          def {{fname.id}} : Float32
+            @__labelle_buf[@__labelle_base + {{i}}]
+          end
+
+          def {{fname.id}}=(v : Float32)
+            @__labelle_buf[@__labelle_base + {{i}}] = v
+          end
+        {% elsif t == "bool" %}
+          def {{fname.id}} : Bool
+            @__labelle_buf[@__labelle_base + {{i}}] != 0.0_f32
+          end
+
+          def {{fname.id}}=(v : Bool)
+            @__labelle_buf[@__labelle_base + {{i}}] = v ? 1.0_f32 : 0.0_f32
+          end
+        {% else %}
+          {% raise "Labelle.batch_view: field type #{t} cannot ride the f32 batch stream (only f32/bool; int-carrying components are refused host-side — keep them on the packed per-entity paths)" %}
+        {% end %}
+        {% i = i + 1 %}
+      {% end %}
+    end
   end
 
   # ── Declarations: Labelle.component / Labelle.event (labelle-engine#775) ──
