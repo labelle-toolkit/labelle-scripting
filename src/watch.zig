@@ -45,6 +45,15 @@ pub const Change = struct {
     file: []const u8,
 };
 
+/// Monotonic count of aborted scan passes (iteration errors) — a test/
+/// introspection seam in the house counter style; never reset.
+pub var scan_error_count: usize = 0;
+
+/// Test seam: make the next poll's scan fail before visiting any entry,
+/// exercising the abort path (state kept, sweep skipped) without needing
+/// a fault-injecting filesystem.
+pub var debug_fail_scan: bool = false;
+
 /// The mtime+size poller for one directory. Plain value struct; the
 /// caller owns `dir` (opened with `.iterate = true`) and closes it after
 /// the watcher's last poll.
@@ -84,15 +93,29 @@ pub const Watcher = struct {
     /// dropped from tracking silently — there is nothing sane to unload
     /// (the VM keeps the last-loaded code; a restored file re-reports).
     /// Filesystem errors degrade to "no changes seen" — dev-mode
-    /// polling must never take the game down. Overflow is lossless:
-    /// changes beyond `out.len` are deferred (baseline untouched) and
-    /// reported by subsequent polls.
+    /// polling must never take the game down; an ITERATION error aborts
+    /// the whole pass conservatively (state kept, sweep skipped — a
+    /// transient dir-read failure must not read as "every file was
+    /// deleted", which would re-adopt them next poll and spuriously
+    /// re-run their reloads). Overflow is lossless: changes beyond
+    /// `out.len` are deferred (baseline untouched) and reported by
+    /// subsequent polls.
     pub fn poll(self: *Watcher, out: []Change) usize {
         var reported: usize = 0;
         var seen: [max_watched_files]bool = @splat(false);
+        var scan_ok = true;
 
         var it = self.dir.iterate();
-        while (it.next(self.io) catch null) |dirent| {
+        while (true) {
+            if (debug_fail_scan) {
+                debug_fail_scan = false;
+                scan_ok = false;
+                break;
+            }
+            const dirent = (it.next(self.io) catch {
+                scan_ok = false;
+                break;
+            }) orelse break;
             if (dirent.kind != .file) continue;
             if (!std.mem.endsWith(u8, dirent.name, self.extension)) continue;
             if (dirent.name.len > filename_cap) continue;
@@ -135,6 +158,16 @@ pub const Watcher = struct {
             }
         }
 
+        // A failed scan means `seen` is a LIE for every unvisited entry
+        // — running the deletion sweep on it would drop live tracking
+        // (and priming on it would freeze a half-baseline). Changes
+        // already reported above were real; hand those back and leave
+        // everything else exactly as it was.
+        if (!scan_ok) {
+            scan_error_count += 1;
+            return reported;
+        }
+
         // Drop entries whose file vanished (swap-remove; order is not
         // meaningful here). Backwards so the swapped-in tail entry —
         // already visited by the scan above — keeps its `seen` slot
@@ -150,6 +183,18 @@ pub const Watcher = struct {
 
         self.primed = true;
         return reported;
+    }
+
+    /// Force `file` to re-report on the next poll: the caller was handed
+    /// this change but failed to process it (the atomic-save race — the
+    /// editor was still writing when the read happened). Resets the
+    /// entry's baseline to an impossible stat, so the very next poll
+    /// sees a difference and re-reports; the same lossless principle as
+    /// the overflow deferral. Unknown files are a no-op.
+    pub fn markDirty(self: *Watcher, file: []const u8) void {
+        const idx = self.find(file) orelse return;
+        self.entries[idx].mtime_ns = -1;
+        self.entries[idx].size = std.math.maxInt(u64);
     }
 
     fn find(self: *Watcher, file: []const u8) ?usize {

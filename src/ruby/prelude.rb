@@ -537,8 +537,41 @@ module Labelle
       i += 1
     end
     __purge_handlers(name_sym)
+    # Remove the evictee's controller class CONSTANTS before dropping the
+    # registrations: the constant outlives eviction otherwise, so a
+    # reloaded body's `class Foo < Labelle::Controller` would merely
+    # REOPEN the old class object — the `inherited` hook would not fire
+    # again, nothing would re-register, and the controller would silently
+    # stop ticking after the first reload. Removing the constant makes
+    # the re-evaluated definition mint a FRESH class (fresh methods,
+    # inherited fires, registration rides it) — the ruby spelling of
+    # lua's fresh-_ENV / typescript's fresh-module reload semantics.
+    __remove_owned_controller_consts(name_sym)
     @controller_classes = __reject_owned(@controller_classes, name_sym)
     @controllers = __reject_owned(@controllers, name_sym)
+    nil
+  end
+
+  # Drop the top-level constant of every controller class `name_sym`
+  # registered, iff it still points at that exact class object (a
+  # constant someone re-assigned is not ours to remove). Anonymous and
+  # namespaced classes (a `module X; class Y < Labelle::Controller`
+  # nesting) are left alone — top-level classes are the script
+  # convention, and a kept nested constant only costs that script the
+  # fresh-class reload semantics, never correctness of others.
+  def self.__remove_owned_controller_consts(name_sym)
+    cs = @controller_classes
+    return if cs.nil?
+    i = 0
+    while i < cs.size
+      klass, owner = cs[i]
+      i += 1
+      next unless owner == name_sym
+      n = klass.name
+      next if n.nil? || n.include?("::")
+      next unless Object.const_defined?(n) && Object.const_get(n).equal?(klass)
+      Object.send(:remove_const, n)
+    end
     nil
   end
 

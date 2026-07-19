@@ -115,6 +115,36 @@ test "watcher overflow is lossless: a bulk save drains across polls" {
     try expectEqual(@as(usize, 0), w.poll(&changes));
 }
 
+test "watcher: an iteration error aborts the pass — no sweep, no spurious rebirth" {
+    if (scripting.language != .lua) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.lua", .data = "-- a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.lua", .data = "-- b" });
+    var w = watch.Watcher.init(io, tmp.dir, ".lua");
+    var changes: [8]watch.Change = undefined;
+    try expectEqual(@as(usize, 0), w.poll(&changes)); // baseline
+
+    // A transient dir-read error must NOT read as "everything was
+    // deleted": the pass aborts wholesale — no sweep, state kept.
+    const errors_before = watch.scan_error_count;
+    watch.debug_fail_scan = true;
+    try expectEqual(@as(usize, 0), w.poll(&changes));
+    try expectEqual(errors_before + 1, watch.scan_error_count);
+
+    // Had the sweep run on the lying `seen`, both entries would have
+    // been dropped and this clean poll would re-report them as new —
+    // spuriously re-running their reloads (and init hooks).
+    try expectEqual(@as(usize, 0), w.poll(&changes));
+
+    // Tracking is fully alive: a real edit still reports.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.lua", .data = "-- a, but longer now" });
+    try expectEqual(@as(usize, 1), w.poll(&changes));
+    try expectEqualStrings("a", changes[0].name);
+}
+
 // ── reload seam (per family) ───────────────────────────────────────────
 
 /// Per-language devx scripts: v1/v2 for the reload tests (same shape —
@@ -376,6 +406,36 @@ test "hot reload pumps off the Controller tick cadence (dev builds)" {
     try expect(mock.logsContain("devx v2 update"));
 }
 
+test "hot reload retries a failed read on the next poll (atomic-save race)" {
+    if (comptime !is_vm_family) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const file = "10_counter" ++ src.ext;
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = src.v1 });
+    scripting.registerScript("counter", src.v1);
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, tmp.dir);
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump()); // baseline
+
+    // The edit lands while the editor is "still writing": the first
+    // read fails AFTER the watcher committed the new baseline. Without
+    // the dirty-mark the edit would be lost (next poll sees no diff).
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = src.v2 });
+    scripting.hot_reload.debug_fail_next_read = true;
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump());
+
+    // The file has NOT changed again — the retry must come from the
+    // watcher entry having been marked dirty.
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
+    scripting.Controller.tick(.{}, 0.016);
+    try expect(mock.logsContain("devx v2 update"));
+}
+
 test "ruby: a script discovered mid-run inits BEFORE its controllers set up" {
     // The boot order — every init, then controller setup — must hold for
     // the reload lifecycle too: a controller's setup may depend on
@@ -405,6 +465,48 @@ test "ruby: a script discovered mid-run inits BEFORE its controllers set up" {
     const setup_idx = mock.logIndexOf("seed controller setup") orelse return error.TestExpectedLog;
     try expect(init_idx < setup_idx);
     scripting.Controller.tick(.{}, 0.016); // the fresh controller ticks clean
+}
+
+test "ruby: reloading a controller class swaps its tick behavior (fresh class, no ghost)" {
+    // The constant-survival trap: without eviction removing the owned
+    // top-level constant, a reloaded `class Foo < Labelle::Controller`
+    // merely REOPENS the old class — `inherited` never re-fires, nothing
+    // re-registers, and the controller silently stops ticking (finding:
+    // PR #47 round 3). The method-body swap below only works with a
+    // genuinely fresh class.
+    if (scripting.language != .ruby) return error.SkipZigTest;
+    fresh();
+    scripting.registerScript("ctl",
+        \\class DevxSwapController < Labelle::Controller
+        \\  def setup
+        \\  end
+        \\
+        \\  def tick(dt)
+        \\    Labelle.log("ctl v1 tick")
+        \\  end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+    scripting.Controller.tick(.{}, 0.016);
+    try expectEqual(@as(usize, 1), mock.logCount("ctl v1 tick"));
+
+    try expect(scripting.reloadScript("ctl",
+        \\class DevxSwapController < Labelle::Controller
+        \\  def setup
+        \\  end
+        \\
+        \\  def tick(dt)
+        \\    Labelle.log("ctl v2 tick")
+        \\  end
+        \\end
+    ));
+    scripting.Controller.tick(.{}, 0.016);
+    // The NEW method body ticks — exactly one instance (no ghost of the
+    // old class, no double registration)…
+    try expectEqual(@as(usize, 1), mock.logCount("ctl v2 tick"));
+    // …and the old incarnation is gone for good.
+    try expectEqual(@as(usize, 1), mock.logCount("ctl v1 tick"));
 }
 
 // ── error-UX throttle ──────────────────────────────────────────────────

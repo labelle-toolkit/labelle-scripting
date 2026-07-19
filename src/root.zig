@@ -327,26 +327,55 @@ pub const hot_reload = struct {
         // (its overflow defers unreported changes losslessly) — poll
         // again until a partial batch. Terminates: every reported change
         // commits its baseline, so each round strictly shrinks the
-        // backlog.
+        // backlog (and a read failure ends the drain — see below).
         while (true) {
             const n = w.poll(&changes);
+            var read_failed = false;
             for (changes[0..n]) |ch| {
-                const source = w.dir.readFileAllocOptions(
-                    w.io,
-                    ch.file,
-                    gpa,
-                    .limited(max_script_bytes),
-                    .of(u8),
-                    0,
-                ) catch {
-                    logHost("hot reload: failed to read a changed script file — skipped");
+                const source = readChanged(w, ch.file) orelse {
+                    // The atomic-save race: the editor may still be
+                    // writing the file this very moment. The watcher
+                    // already committed the new baseline when it
+                    // reported, so without intervention the edit would
+                    // be LOST (next poll sees no diff) — mark the entry
+                    // dirty so the next poll re-reports and the read
+                    // retries. Same lossless principle as the overflow
+                    // deferral.
+                    w.markDirty(ch.file);
+                    read_failed = true;
+                    logHost("hot reload: failed to read a changed script file — will retry next poll");
                     continue;
                 };
                 if (reloadOwned(ch.name, source)) reloaded += 1;
             }
-            if (n < changes.len) break;
+            // A dirty-marked file would re-report IMMEDIATELY on the
+            // next drain round — retry on the next cadence poll instead
+            // (the write needs time to finish anyway) so a persistently
+            // unreadable file can never spin this loop.
+            if (read_failed or n < changes.len) break;
         }
         return reloaded;
+    }
+
+    /// Test seam: make `pump`'s next file read fail (exercises the
+    /// retry-after-read-failure path without a fault-injecting fs).
+    pub var debug_fail_next_read: bool = false;
+
+    /// One changed file's bytes (sentinel-terminated), or null on any
+    /// read failure — the injectable read behind `pump`.
+    fn readChanged(w: *watch.Watcher, file: []const u8) ?[:0]u8 {
+        if (debug_fail_next_read) {
+            debug_fail_next_read = false;
+            return null;
+        }
+        return w.dir.readFileAllocOptions(
+            w.io,
+            file,
+            gpa,
+            .limited(max_script_bytes),
+            .of(u8),
+            0,
+        ) catch null;
     }
 
     /// Called from Controller.tick (comptime-gated there).
