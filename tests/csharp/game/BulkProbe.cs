@@ -182,6 +182,14 @@ public sealed class BulkProbe : Script
         try { Labelle.BatchSet("[\"BatchPos\"]", new[] { 1.0f, float.MaxValue * 2.0f }, 2); }
         catch (System.ArgumentException) { Labelle.Log("CS_BULK_SET_OVERFLOW_REFUSED"); }
 
+        // floatCount is bounds-checked against the array BEFORE any read
+        // (gemini #53): an oversized or negative count throws
+        // ArgumentOutOfRangeException instead of indexing past the buffer.
+        try { Labelle.BatchSet("[\"BatchPos\"]", new float[2], 5); }
+        catch (System.ArgumentOutOfRangeException) { Labelle.Log("CS_BULK_SET_COUNT_OVER_REFUSED"); }
+        try { Labelle.BatchSet("[\"BatchPos\"]", new float[2], -1); }
+        catch (System.ArgumentOutOfRangeException) { Labelle.Log("CS_BULK_SET_COUNT_NEG_REFUSED"); }
+
         // ── exit-semantics matrix on THROWAWAY entities ────────────────
         var t1 = Labelle.CreateEntity();
         var t2 = Labelle.CreateEntity();

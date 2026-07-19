@@ -432,9 +432,9 @@
         enumerable: true,
       });
     });
-    // Unknown-field WRITES throw (#50, the lua view's __newindex parity):
-    // the bare object would happily grow a plain `xx` property on a
-    // typo'd `e.xx = …` — the backing buffer untouched, the commit
+    // Unknown STRING-field WRITES throw (#50, the lua view's __newindex
+    // parity): the bare object would happily grow a plain `xx` property
+    // on a typo'd `e.xx = …` — the backing buffer untouched, the commit
     // silently missing the write. A Proxy set trap throws REGARDLESS of
     // the caller's strictness (Object.seal only throws under strict mode
     // — module scripts are strict by spec, but the console evals global
@@ -442,11 +442,17 @@
     // fields. Known-field writes forward to the accessors unchanged;
     // reads take the ordinary [[Get]] on the target (no get trap — the
     // hot path stays accessor-direct).
+    //
+    // SYMBOL keys pass straight through to the target: runtimes, test
+    // frameworks and debuggers legitimately stamp Symbol-keyed internal
+    // props on any object (Symbol.iterator, inspector markers, …), and
+    // those are never a field typo. Only an unknown STRING key is a
+    // mis-spelled field write worth trapping.
     st.view = new Proxy(view, {
       set: (target, prop, value) => {
-        if (!Object.prototype.hasOwnProperty.call(target, prop)) {
+        if (typeof prop === "string" && !Object.prototype.hasOwnProperty.call(target, prop)) {
           throw new TypeError(
-            `labelle.batch view: unknown field '${String(prop)}' — known fields: ${fields.join(", ")}`,
+            `labelle.batch view: unknown field '${prop}' — known fields: ${fields.join(", ")}`,
           );
         }
         target[prop] = value;

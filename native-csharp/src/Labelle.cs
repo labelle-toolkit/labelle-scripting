@@ -1061,6 +1061,17 @@ public static unsafe class Labelle
     {
         ArgumentNullException.ThrowIfNull(namesJson);
         ArgumentNullException.ThrowIfNull(buf);
+        // floatCount is the authoritative element count and indexes buf
+        // below — bound it against the array BEFORE any read, so a caller
+        // passing a stale/oversized count fails loudly here instead of
+        // reading past the buffer (or corrupting the stream). Negative is
+        // never valid. (Manual check, not ArgumentOutOfRangeException.
+        // ThrowIf* — those are .NET 8 APIs; this project targets net7.0.)
+        if (floatCount < 0 || floatCount > buf.Length)
+            throw new ArgumentOutOfRangeException(
+                nameof(floatCount),
+                $"labelle: batch_set: floatCount {floatCount} is out of range for a " +
+                $"buffer of length {buf.Length}");
         if (!BulkAccess) ThrowBatchUnsupported();
         // Non-finite refusal at the BINDING (#45) — one branch-predictable
         // pass, cheap next to the FFI crossing: NaN/Inf must never ride

@@ -1369,39 +1369,38 @@ test "bulk stage 3: batch_set refuses numeric strings and non-finite elements be
     try expectComponent(1, "BatchVel", "{\"vx\":3,\"vy\":4}");
 }
 
-test "bulk v1.3 (#45): a finite float beyond ±f32 max refuses loudly on the packed path" {
+test "bulk v1.3 (#45 review): overflow floats ride the f64 tag (no throw); non-packable sets keep the JSON fallback" {
     fresh();
-    // 1e100 is FINITE at f64 — it passes the f64-level isFinite guard —
-    // but the f32 narrow turns it into inf: the exact smuggle the
-    // documented non-finite rejection exists to stop. The JSON fallback
-    // would smuggle it identically (the host narrows the parsed f64
-    // into its f32 field), so the refusal is LOUD and binding-level,
-    // naming the field.
-    scripting.registerScript("packed_overflow",
+    // A finite float beyond ±f32 range is NOT refused at the binding
+    // (codex #53): the binding cannot know the target field width, and
+    // such a value is legitimate for an f64 field. It rides the SET-side
+    // f64 tag, and the host coerces per field type. Two legs:
+    //   1. Overflow on a PACKABLE component — the set SUCCEEDS (host
+    //      narrows, parity with JSON); the OLD binding raised here.
+    //   2. A NON-PACKABLE component (not in the packed schema) — the
+    //      lossy 0.1 rides tag 4, set_packed refuses (-1), and the
+    //      prelude's JSON leg stores it (the fallback the #50/precision
+    //      work must not break).
+    scripting.registerScript("packed_fallback",
         \\function init()
         \\  local e = Entity.new()
-        \\  local ok, err = pcall(function()
-        \\    e:set("Stats", { power = 1e100, score = 0, alive = false, seed = 0 })
-        \\  end)
-        \\  if ok then labelle.log("huge accepted") else labelle.log("huge refused: " .. err) end
-        \\  local ok2, err2 = pcall(function()
-        \\    e:set("BatchPos", { x = -1e300, y = 0 })
-        \\  end)
-        \\  if ok2 then labelle.log("neg accepted") else labelle.log("neg refused: " .. err2) end
-        \\  labelle.log("overflow done")
+        \\  local ok1 = e:set("BatchPos", { x = 1e39, y = 0 })
+        \\  labelle.log("overflow set:" .. tostring(ok1))
+        \\  local e2 = Entity.new()
+        \\  local ok2 = e2:set("Widget", { a = 0.1, n = 7 })
+        \\  labelle.log("widget set:" .. tostring(ok2))
         \\end
     );
     try scripting.Controller.setup(.{});
     defer scripting.Controller.deinit();
 
-    try expect(!mock.logsContain("huge accepted"));
-    try expect(mock.logsContain("huge refused: labelle: set: field 'power' overflows f32 range"));
-    try expect(!mock.logsContain("neg accepted"));
-    try expect(mock.logsContain("neg refused: labelle: set: field 'x' overflows f32 range"));
-    try expect(mock.logsContain("overflow done"));
-    // Nothing was stored by either refusal.
-    try expect(mock.componentJson(1, "Stats") == null);
-    try expect(mock.componentJson(1, "BatchPos") == null);
+    // No throw on either — the overflow set committed, and the
+    // non-packable set fell through to the JSON encoder.
+    try expect(mock.logsContain("overflow set:true"));
+    try expect(mock.logsContain("widget set:true"));
+    const j = mock.componentJson(2, "Widget") orelse return error.TestExpectedComponent;
+    try expect(std.mem.indexOf(u8, j, "\"a\":0.1") != null);
+    try expect(std.mem.indexOf(u8, j, "\"n\":7") != null);
 }
 
 test "bulk stage 3 (#45): batch_set refuses finite elements beyond ±f32 max before any write" {

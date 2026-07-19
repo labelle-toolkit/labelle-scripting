@@ -438,10 +438,11 @@ fn rawComponentSetFrom(ctx: ?*c.Context, this: c.Value, argc: c_int, argv: ?[*]c
 /// over-wide record, a host refusal (rc != 0: non-scalar/f64 target,
 /// out-of-range value, a pre-tag-4 host handed tag 4) — falls back to the
 /// JSON encoder, which keeps the exact pre-v1.3 semantics (including the
-/// one canonical TypeError for NaN/Inf). One LOUD exception (#45): a
-/// FINITE float beyond ±f32 max throws here instead of bailing — both the
-/// f32 slot and the JSON fallback would narrow it to inf host-side, so no
-/// silent path exists. Returns the contract rc (0 = ok).
+/// one canonical TypeError for NaN/Inf). A finite float beyond ±f32 max
+/// is NOT special-cased here (#45 review): it rides tag 4 like any
+/// non-f32-exact float, so a non-packable component or an f64 target
+/// still reaches the JSON fallback rather than a spurious throw. Returns
+/// the contract rc (0 = ok).
 fn componentSetFromImpl(ctx: ?*c.Context, argv: ?[*]const c.Value, argc: c_int) JsError!c.Value {
     const id = try getId(ctx, arg(argv, argc, 0));
     const name = try getStr(ctx, arg(argv, argc, 1), "component name");
@@ -514,39 +515,30 @@ fn componentSetFromImpl(ctx: ?*c.Context, argv: ?[*]const c.Value, argc: c_int) 
                         w += 8;
                     } else {
                         const f32v: f32 = @floatCast(f);
-                        // FINITE-BUT-OVERFLOWING (#45): a finite f64
-                        // beyond ±f32 max narrows to inf in the cast
-                        // above, smuggling a non-finite value past the
-                        // documented rejection — and the JSON fallback
-                        // would smuggle it just the same (the host narrows
-                        // the parsed f64 into its f32 field). So the guard
-                        // asserts finiteness AFTER the narrow and refuses
-                        // LOUDLY, at the binding.
-                        if (!std.math.isFinite(f32v)) {
-                            var msg_buf: [384]u8 = undefined;
-                            const msg: [:0]const u8 = std.fmt.bufPrintZ(
-                                &msg_buf,
-                                "labelle: set: field '{s}' overflows f32 range (a finite " ++
-                                    "value narrowed to inf) — component floats are f32 " ++
-                                    "(nothing was written)",
-                                .{np[0..nlen]},
-                            ) catch "labelle: set: field overflows f32 range (nothing was written)";
-                            _ = c.JS_ThrowTypeError(ctx, "%s", msg.ptr);
-                            return error.JsError;
-                        }
                         if (@as(f64, f32v) == f) {
+                            // Exact in f32 → the compact f32 tag.
                             rec[w] = 0;
                             w += 1;
                             std.mem.writeInt(u32, rec[w..][0..4], @bitCast(f32v), .little);
                             w += 4;
                         } else {
-                            // PRECISION (#45): the double does not survive
-                            // the f32 narrow — ride the SET-side f64 tag
-                            // (4, since v1.3): the host coerces with full
-                            // precision. A host without tag 4 refuses (-1)
-                            // and the JSON fallback below carries the f64
-                            // faithfully — same result, one FFI round-trip
-                            // slower.
+                            // NOT f32-exact — a lossy value (0.1) OR a
+                            // finite one beyond ±f32 range (1e100). BOTH
+                            // ride the SET-side f64 tag (4, since v1.3):
+                            // full precision to the host, which coerces
+                            // per the REAL field type — exact into a wide
+                            // target, range-refusal into a narrow int, and
+                            // f32-narrowing (parity with the JSON route)
+                            // into an f32 field. Deliberately NOT a binding
+                            // throw (#45 review): the binding cannot know
+                            // the target width, and a value beyond f32
+                            // range is legitimate for an f64 field, so it
+                            // must defer to the host — a host refusal (-1),
+                            // incl. every non-packable component, then
+                            // falls through to the JSON encoder below,
+                            // which carries the f64 faithfully. (The batch
+                            // stream, having no f64 tag and no JSON
+                            // fallback, keeps its after-narrow refusal.)
                             rec[w] = 4;
                             w += 1;
                             std.mem.writeInt(u64, rec[w..][0..8], @bitCast(f), .little);

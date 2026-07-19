@@ -512,38 +512,29 @@ fn rawComponentSetFrom(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
                     // one canonical error for both routes.
                     if (!std.math.isFinite(v.value.f)) break :pk;
                     const f: f32 = @floatCast(v.value.f);
-                    // FINITE-BUT-OVERFLOWING (#45): a finite f64 beyond
-                    // ±f32 max narrows to inf in the cast above, smuggling
-                    // a non-finite value past the documented rejection —
-                    // and the JSON fallback would smuggle it just the same
-                    // (the host narrows the parsed f64 into its f32
-                    // field). So the guard asserts finiteness AFTER the
-                    // narrow and refuses LOUDLY, at the binding. The field
-                    // name was just copied into the record — np may
-                    // already be stale (mrb_sym_name_len's shared buffer).
-                    if (!std.math.isFinite(f)) raiseFmt(
-                        mrb,
-                        "ArgumentError",
-                        "labelle: set: field '{s}' overflows f32 range (a finite " ++
-                            "value narrowed to inf) — component floats are f32 " ++
-                            "(nothing was written)",
-                        .{rec[w - nlen ..][0..nlen]},
-                    );
                     if (@as(f64, f) == v.value.f) {
+                        // Exact in f32 → the compact f32 tag.
                         rec[w] = 0;
                         w += 1;
                         std.mem.writeInt(u32, rec[w..][0..4], @bitCast(f), .little);
                         w += 4;
                     } else {
-                        // PRECISION (#45): the ruby Float does not survive
-                        // the f32 narrow (e.g. 16777217.0 destined for an
-                        // int field would silently round through f32's
-                        // 24-bit mantissa) — ride the SET-side f64 tag (4,
-                        // since v1.3): the host coerces with full precision
-                        // (exact float→int under its range refusal). A
-                        // host without tag 4 refuses (-1) and the JSON
-                        // fallback below carries the f64 faithfully — same
-                        // result, one FFI round-trip slower.
+                        // NOT f32-exact — a lossy value (e.g. 16777217.0
+                        // destined for an int field would round through
+                        // f32's 24-bit mantissa) OR a finite one beyond
+                        // ±f32 range (1e100). BOTH ride the SET-side f64
+                        // tag (4, since v1.3): full precision to the host,
+                        // which coerces per the REAL field type — exact
+                        // float→int under its range refusal, and
+                        // f32-narrowing (parity with the JSON route) into
+                        // an f32 field. Deliberately NOT a binding raise
+                        // (#45 review): the binding cannot know the target
+                        // width, so an overflow value must defer to the
+                        // host — a host refusal (-1), incl. every
+                        // non-packable component, falls through to the JSON
+                        // encoder below, which carries the f64 faithfully.
+                        // (The batch stream, having no f64 tag and no JSON
+                        // fallback, keeps its after-narrow refusal.)
                         rec[w] = 4;
                         w += 1;
                         std.mem.writeInt(u64, rec[w..][0..8], @bitCast(v.value.f), .little);

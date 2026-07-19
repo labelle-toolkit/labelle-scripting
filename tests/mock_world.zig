@@ -437,17 +437,12 @@ fn defaultScalar(kind: PackedKind) ScalarVal {
 /// (host-owned data).
 fn coerceForKind(kind: PackedKind, v: ScalarVal) ?ScalarVal {
     switch (kind) {
-        .f32 => switch (v) {
-            // Engine parity (#45): a FINITE f64 (the SET-side tag 4)
-            // whose f32 narrow is non-finite refuses — never smuggle an
-            // inf the wire's documented non-finite rejection would stop.
-            // (Bindings guard this before emitting; belt on script-
-            // supplied bytes.)
-            .f => |x| return if (std.math.isFinite(x) and
-                !std.math.isFinite(@as(f32, @floatCast(x)))) null else v,
-            else => return v,
-        },
-        .boolean => return v, // total: bool compares against zero
+        // Engine parity: an f32 field accepts any float tag (0 or the
+        // SET-side f64 tag 4) — @floatCast is total and narrows a finite
+        // out-of-range f64 to inf exactly as the host's JSON parse would
+        // (the packed path defers to the field type, never refuses a
+        // finite value the JSON route also narrows). bool compares.
+        .f32, .boolean => return v,
         .i64 => switch (v) {
             // Engine parity: the 64-BIT BITCAST PAIR — the other 64-bit
             // tag lands via two's-complement bitcast (lossless round trip

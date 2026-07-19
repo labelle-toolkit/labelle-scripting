@@ -1705,40 +1705,47 @@ test "bulk stage 2 (#45): ruby batch_set retrofits the non-finite refusal (parit
     try expectComponent(1, "BatchVel", "{\"vx\":3,\"vy\":4}");
 }
 
-test "bulk v1.3 (#45): a finite float beyond ±f32 max refuses loudly on the packed path" {
+test "bulk v1.3 (#45 review): overflow floats ride the f64 tag (no throw); non-packable sets keep the JSON fallback" {
     fresh();
-    // 1e100 is FINITE at f64 — it passes the f64-level isFinite guard —
-    // but the f32 narrow turns it into inf: the exact smuggle the
-    // documented non-finite rejection exists to stop. The packed
-    // fast path (a Component.ref instance's set_from) refuses LOUDLY at
-    // the binding, naming the field, instead of tagging inf. (The Hash
-    // route is the JSON reference path and out of scope; the fast path
-    // must not diverge from it BY SMUGGLING a non-finite value.)
-    scripting.registerScript("packed_overflow",
-        \\Stats = Labelle::Component.ref("Stats", :power, :score, :alive, :seed)
+    // A finite float beyond ±f32 range is NOT refused at the binding
+    // (codex #53): the binding cannot know the target field width, and
+    // such a value is legitimate for an f64 field. It rides the SET-side
+    // f64 tag, and the host coerces per field type. Component.ref
+    // instances drive the PACKED set_from leg (the Hash route is pure
+    // JSON). Two legs:
+    //   1. Overflow on a PACKABLE component — the set SUCCEEDS (host
+    //      narrows, parity with JSON); the OLD binding raised here.
+    //   2. A NON-PACKABLE component — the lossy 0.1 rides tag 4,
+    //      set_from refuses (-1), and the JSON encoder stores it (the
+    //      fallback the #50/precision work must not break).
+    scripting.registerScript("packed_fallback",
+        \\Pos = Labelle::Component.ref("BatchPos", :x, :y)
+        \\Widget = Labelle::Component.ref("Widget", :a, :n)
         \\def init
         \\  e = Labelle::Entity.create
-        \\  s = Stats.new
-        \\  s.power = 1e100
-        \\  s.score = 0
-        \\  s.alive = false
-        \\  s.seed = 0
-        \\  begin
-        \\    e.set(s)
-        \\    Labelle.log("huge accepted")
-        \\  rescue ArgumentError => ex
-        \\    Labelle.log("huge refused: #{ex.message}")
-        \\  end
-        \\  Labelle.log("overflow done")
+        \\  bp = Pos.new
+        \\  bp.x = 1e39
+        \\  bp.y = 0
+        \\  ok1 = e.set(bp)
+        \\  Labelle.log("overflow set:#{ok1}")
+        \\  e2 = Labelle::Entity.create
+        \\  w = Widget.new
+        \\  w.a = 0.1
+        \\  w.n = 7
+        \\  ok2 = e2.set(w)
+        \\  Labelle.log("widget set:#{ok2}")
         \\end
     );
     try scripting.Controller.setup(.{});
     defer scripting.Controller.deinit();
 
-    try expect(!mock.logsContain("huge accepted"));
-    try expect(mock.logsContain("huge refused: labelle: set: field 'power' overflows f32 range"));
-    try expect(mock.logsContain("overflow done"));
-    try expect(mock.componentJson(1, "Stats") == null);
+    // No raise on either — the overflow set committed, and the
+    // non-packable set fell through to the JSON encoder.
+    try expect(mock.logsContain("overflow set:true"));
+    try expect(mock.logsContain("widget set:true"));
+    const j = mock.componentJson(2, "Widget") orelse return error.TestExpectedComponent;
+    try expect(std.mem.indexOf(u8, j, "\"a\":0.1") != null);
+    try expect(std.mem.indexOf(u8, j, "\"n\":7") != null);
 }
 
 test "bulk stage 2 (#45): batch_set refuses finite elements beyond ±f32 max before any write" {
