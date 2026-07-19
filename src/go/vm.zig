@@ -33,6 +33,25 @@
 //! the detectable misuse (a goroutine calling the labelle API between
 //! frames).
 //!
+//! ## Build mode: ReleaseSafe+ (the go family's one hard constraint)
+//!
+//! A go game must be built **ReleaseSafe, ReleaseFast or ReleaseSmall —
+//! NOT Debug**. Go's cgo calls the host on a SWITCHED stack (the
+//! runtime's `asmcgocall` system-stack transition), and the engine's
+//! Debug allocator captures a stack trace on every allocation by walking
+//! the frame-pointer chain — that walk derails across the go cgo frame
+//! and SEGFAULTS the instant a go script makes its first host-allocating
+//! contract call (empirically: `Subscribe` → the engine's `alloc.dupe`
+//! of the event name). rust/crystal never hit this: they call the host
+//! on the SAME stack, so the frame-pointer walk stays valid even in
+//! Debug. ReleaseSafe keeps runtime safety AND info-level logging while
+//! using a non-stack-capturing allocator, so it is the go family's
+//! recommended dev build. The plugin cannot fix this from the Zig side
+//! (the crashing capture is the host engine's allocator); the example's
+//! CI job builds `-Doptimize=ReleaseSafe`, and this is the documented
+//! go-family caveat #746 anticipated ("go is the awkward middle — it
+//! brings its own runtime as a guest").
+//!
 //! `registerScript` sources are refused loudly, and console eval gets
 //! the documented native-compiled refusal — same policy, same wording
 //! shape as rust/crystal.

@@ -1436,10 +1436,26 @@ jobs:
 
           cd .labelle/null_desktop
 
+          # BUILD RELEASESAFE, NOT DEBUG (the go family's one hard build
+          # constraint — unlike rust/crystal, which build Debug here). Go's
+          # cgo calls the host on a SWITCHED stack (the runtime's
+          # asmcgocall system-stack transition), and the engine's Debug
+          # allocator captures a stack trace on every alloc by walking the
+          # frame-pointer chain — that walk derails across the go cgo frame
+          # and SEGFAULTS the moment a go script makes its first
+          # host-allocating contract call (e.g. Subscribe → the engine's
+          # `alloc.dupe`). ReleaseSafe keeps runtime safety AND info-level
+          # logging (so the GO_* transcript below prints — GameLog gates
+          # info at Debug/ReleaseSafe, warn+ at ReleaseFast) while using a
+          # non-stack-capturing allocator, sidestepping the crash. rust and
+          # crystal never hit this: they call the host on the SAME stack, so
+          # the frame-pointer walk stays valid in Debug. Documented in
+          # src/go/vm.zig and native-go/labelle.go's coexistence matrix.
+          #
           # labelle-cli-equivalent fixFingerprint dance — the assembler
           # emits a placeholder fingerprint.
           set +e
-          ERR=$(zig build 2>&1)
+          ERR=$(zig build -Doptimize=ReleaseSafe 2>&1)
           set -e
           BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
           GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
@@ -1447,7 +1463,7 @@ jobs:
             echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
             sed -i "s/${BAD}/${GOOD}/" build.zig.zon
           fi
-          zig build
+          zig build -Doptimize=ReleaseSafe
 
           # Headless bounded run: no window, no GL — the binary runs to
           # completion (rc=0) or crashes.

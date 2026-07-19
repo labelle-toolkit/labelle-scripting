@@ -66,4 +66,16 @@
     // floor keeps the four native examples on one engine).
     .engine_version = "2.6.0",
     .gfx_version = "1.28.1",
+    // Pin the assembler SOURCE package explicitly (the rust/crystal/csharp
+    // examples don't need to — they ride v0.88.0, whose scaffold default
+    // for the assembler package resolves to itself). v0.94.0's baked-in
+    // scaffold default for the assembler package is a STALE tag (1.57.0 —
+    // the cli/labelle version, not an assembler tag; it 404s on fetch), so
+    // this example — the only one on v0.94.0, to test the latest generic
+    // native path — pins it to the real 0.94.0 tag. Without this the
+    // `labelle install` step fails before generate ever runs.
+    .assembler_version = "0.94.0",
+    // The cli/labelle version (the 1.x train — distinct from the
+    // assembler's 0.x train above), pinned for reproducibility.
+    .labelle_version = "1.58.0",
 }

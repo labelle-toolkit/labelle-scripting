@@ -72,6 +72,18 @@
 //     rules; the host never retains a Go pointer past a call, which is
 //     the contract's borrowed-pointer rule anyway). The suite forces
 //     runtime.GC() every tick to pin exactly this coexistence.
+//   - STACK SWITCH vs the host's Debug allocator: cgo runs the C call
+//     (this package's contract calls) on a SWITCHED stack (the runtime's
+//     asmcgocall system-stack transition). A host built in DEBUG whose
+//     allocator captures a stack trace on every allocation (the engine's
+//     default Debug allocator) walks the frame-pointer chain — and that
+//     walk derails across the go cgo frame and SEGFAULTS the moment a
+//     script makes its first host-ALLOCATING contract call (Subscribe,
+//     which the host dupes the name for, is the usual first one). So a
+//     go game must be built **ReleaseSafe+, not Debug** (ReleaseSafe
+//     keeps safety + info logs while using a non-stack-capturing
+//     allocator). rust/crystal call the host on the same stack and never
+//     hit this. See src/go/vm.zig's "Build mode" section.
 //
 // # Scripts
 //
