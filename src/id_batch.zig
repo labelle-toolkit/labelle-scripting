@@ -24,26 +24,43 @@
 //! GET: the host's `_batch_get_ids` writes `[u32 count]` then per entity
 //! `[u64 id][f32 stream]`. `stripIds` COMPACTS that in place to the
 //! positional `[u32 count][f32 stream]` the binding already decodes, and
-//! STASHES the u64 ids in a module-level store. The binding is otherwise
-//! unchanged (same count-header read, same float decode).
+//! STASHES the pending batch: `(names, entity_count, per-row stride, ids)`.
+//! The binding is otherwise unchanged (same count-header read, same float
+//! decode).
 //!
 //! SET: the binding hands back the pure positional f32 stream (no header).
-//! `setWithIds` re-attaches the stashed ids — one per row, in get order —
-//! to rebuild `[u64 id][f32 stream]` rows and calls `_batch_set_ids`,
-//! which applies BY ID (skipping vanished / recycled / departed entities).
-//! So a destroy+spawn between the paired get and set can no longer land a
-//! stale row on a new occupant.
+//! `setWithIds` uses the id path ONLY when the incoming stream matches the
+//! stash EXACTLY — same names, same count, and `stream.len == count *
+//! stashed_stride` (the stride the GET recorded, never one re-inferred from
+//! a possibly-mutated stream). Then it re-attaches the stashed ids, applies
+//! via `_batch_set_ids` (BY ID, skipping vanished/recycled), and CONSUMES
+//! the stash. So a destroy+spawn between the paired get and set can no
+//! longer land a stale row on a new occupant.
 //!
-//! ## Single active language per build
+//! ## Stash lifecycle (scripting#58 review — the one-stash hazard)
 //!
-//! Only one `-Dlanguage=…` backend is compiled into any game, so the two
-//! module-level grow-only buffers below are a process singleton with no
-//! cross-language contention — the same model the per-VM scratch buffers
-//! already use. The get→set pairing must not interleave a DIFFERENT
-//! batch query between the paired calls (it would clobber the id store) —
-//! the identical constraint the shared transfer scratch already imposes,
-//! and one the block iterators (get→yield→set, no intervening batch FFI)
-//! never trip.
+//! The stash is a single process-wide record, so strict get→set pairing is
+//! the ONLY case that may take the id path; every deviation degrades to the
+//! POSITIONAL `_batch_set` (which re-queries and applies with its own
+//! exact-size guard, or surfaces the host's name-based refusals):
+//!
+//!   - INTERLEAVED gets — a second `batch_get` (raw API or a nested block
+//!     iterator) overwrites the stash; the first buffer's set then no
+//!     longer matches (names/count/len) and falls to positional, so it can
+//!     never reattach the inner query's ids to the outer stream.
+//!   - UNPAIRED nonempty set — no valid stash → positional (NEVER feed a
+//!     raw f32 stream to `_batch_set_ids`, whose first 8 bytes per row are
+//!     an entity id).
+//!   - RESIZED stream — `stream.len != count * stashed_stride` → positional
+//!     (the stashed stride is authoritative; a divisible-but-wrong length
+//!     can't be re-interpreted as a different row shape).
+//!   - CONSUMED / stale — the stash is cleared on every id-path set AND at
+//!     the start of every get (a malformed / count-0 get leaves none), so a
+//!     later unpaired set can never reuse spent ids.
+//!
+//! Only one `-Dlanguage=…` backend is compiled into any game, so the
+//! module-level state below is a process singleton with no cross-language
+//! contention.
 
 const std = @import("std");
 const contract = @import("contract.zig");
@@ -53,6 +70,11 @@ pub const host_has_id_batch = contract.host_has_id_batch;
 
 const PREFIX = contract.BATCH_ID_ROW_PREFIX; // 8 (u64 id per row)
 
+/// Cap on the stashed names-key length. Component-name JSON arrays are
+/// short; a longer one simply can't be keyed, so its batch declines the id
+/// path and uses the positional setter (a safe, correct degradation).
+const NAMES_CAP = 256;
+
 /// Process-lifetime grow-only buffers. `page_allocator` keeps this
 /// libc-independent (unlike the per-VM libc-realloc scratch, this module
 /// is shared by native backends that may not link libc). Grows rarely —
@@ -60,13 +82,40 @@ const PREFIX = contract.BATCH_ID_ROW_PREFIX; // 8 (u64 id per row)
 /// reuses it, matching the per-VM scratch's amortized-zero behavior.
 const gpa = std.heap.page_allocator;
 
-var id_store: []u64 = &.{};
-var id_len: usize = 0; // ids stashed by the last stripIds
+// ── The single pending id-backed batch (see the stash-lifecycle note) ──
+var stash_valid: bool = false;
+var stash_names: [NAMES_CAP]u8 = undefined;
+var stash_names_len: usize = 0;
+var stash_count: usize = 0; // entities the get resolved
+var stash_stride: usize = 0; // f32-stream BYTES per row, from the get
+var id_store: []u64 = &.{}; // ids[0..stash_count] valid while stash_valid
 
 var row_scratch: []u8 = &.{};
 
-/// Test seam: reallocations across both buffers (proves they settle).
+/// Test seam: reallocations across the buffers (proves they settle).
 pub var growth_count: usize = 0;
+
+fn clearStash() void {
+    stash_valid = false;
+    stash_names_len = 0;
+    stash_count = 0;
+    stash_stride = 0;
+}
+
+/// Record the names key for the current stash; false when it can't be held
+/// (too long), in which case the caller leaves the stash INVALID so the
+/// paired set degrades to the positional path.
+fn recordNames(names: []const u8) bool {
+    if (names.len > NAMES_CAP) return false;
+    @memcpy(stash_names[0..names.len], names);
+    stash_names_len = names.len;
+    return true;
+}
+
+fn namesMatch(names: []const u8) bool {
+    return stash_names_len == names.len and
+        std.mem.eql(u8, stash_names[0..stash_names_len], names);
+}
 
 fn ensureIds(n: usize) []u64 {
     if (id_store.len >= n) return id_store;
@@ -86,30 +135,35 @@ fn ensureRows(n: usize) []u8 {
 
 /// Compact the host's `_batch_get_ids` output IN PLACE from
 /// `[u32 count][ (u64 id)(f32 stream) ]*` to the positional
-/// `[u32 count][f32 stream]*` the binding decodes, stashing the ids.
+/// `[u32 count][f32 stream]*` the binding decodes, and stash the pending
+/// batch (`names`, count, per-row stride, ids) so the paired `setWithIds`
+/// can reattach the ids.
 ///
-/// `raw` is the binding's transfer scratch (len ≥ `n`); `n` is the byte
-/// length `_batch_get_ids` returned (already known ≤ cap by the caller's
-/// grow-retry, and NOT one of the sentinels — the caller checks
-/// `BATCH_INT_REFUSED`/0 first). Returns the compacted, floats-only byte
+/// `raw` is the binding's transfer scratch bounded to the written length;
+/// `n` is the byte length `_batch_get_ids` returned (already ≤ cap by the
+/// caller's grow-retry and NOT a sentinel — the caller checks
+/// `BATCH_INT_REFUSED`/0 first). Returns the compacted floats-only byte
 /// length (`4 + count*stride`) for the binding to decode exactly as it
-/// decodes the positional variant.
-pub fn stripIds(raw: []u8, n: usize) usize {
-    if (n < 4) return n; // malformed — nothing to compact (caller-guarded)
+/// decodes the positional variant. Every call FIRST invalidates any prior
+/// stash (a new get supersedes the old pending batch).
+pub fn stripIds(names: []const u8, raw: []u8, n: usize) usize {
+    // A new get always supersedes the previous pending batch — interleaved
+    // gets can never leave two live stashes.
+    clearStash();
+    if (n < 4 or raw.len < n) return n; // malformed — nothing to compact
     const count = std.mem.readInt(u32, raw[0..4], .little);
     if (count == 0) {
-        id_len = 0;
+        // Empty result: record an empty pairing so the paired empty set is
+        // recognized (and any nonempty later set is treated as unpaired).
+        if (recordNames(names)) stash_valid = true;
         return 4; // count header only, no rows
     }
     const body = n - 4;
     const row_size = body / count; // 8 + stride, per row
-    // Defensive: a row must carry at least its id prefix, and the body
-    // must divide evenly. A malformed shape leaves the buffer untouched
-    // and reports it whole (the binding's own belt catches oddities).
-    if (row_size < PREFIX or row_size * count != body) {
-        id_len = 0;
-        return n;
-    }
+    // A row must carry at least its id prefix, and the body must divide
+    // evenly. A malformed shape leaves the buffer untouched, reports it
+    // whole, and holds NO stash (the set will go positional).
+    if (row_size < PREFIX or row_size * count != body) return n;
     const stride = row_size - PREFIX; // f32-stream bytes per row
     const ids = ensureIds(count);
     var dst: usize = 4;
@@ -122,50 +176,63 @@ pub fn stripIds(raw: []u8, n: usize) usize {
         std.mem.copyForwards(u8, raw[dst..][0..stride], row[PREFIX..][0..stride]);
         dst += stride;
     }
-    id_len = count;
+    if (recordNames(names)) {
+        stash_valid = true;
+        stash_count = count;
+        stash_stride = stride;
+    }
     return dst;
 }
 
-/// Re-attach the stashed ids to the binding's pure positional f32 `stream`
-/// (no header — exactly what the binding packs today) and apply via
-/// `_batch_set_ids`. Rebuilds `[u64 id][f32 stream]` rows, one id per row
-/// in get order. Returns the contract rc (0 ok, -1 shape/name/apply,
-/// -2 int-field refusal). A `stream` whose length is not a whole number of
-/// rows against the stashed count is layout drift — refused -1, nothing
-/// sent.
+/// Apply the binding's pure positional f32 `stream` (no header — exactly
+/// what the binding packs today).
+///
+/// Takes the id path ONLY for the exact buffer the paired `stripIds`
+/// recorded — same `names`, same count, and `stream.len == count *
+/// stashed_stride` — then reattaches the stashed ids, applies via
+/// `_batch_set_ids`, and CONSUMES the stash. Any deviation (no stash,
+/// interleaved different query, resized stream, standalone/unpaired set)
+/// falls to the POSITIONAL `_batch_set`, which re-queries and applies with
+/// its own exact-size guard (and surfaces the host's name-based refusals —
+/// int -2, unknown -1). Returns the contract rc.
 pub fn setWithIds(names: []const u8, stream: []const u8) i32 {
-    const count = id_len;
-    // No stashed rows (empty query, or a standalone set not paired with a
-    // get — e.g. the int-refusal probe): hand the stream straight to the
-    // host so its NAME-based refusals still fire (int fields -2, unknown
-    // names -1) — an empty stream is the legit 0-row case, a non-empty one
-    // surfaces as the host's shape -1. Never swallow a refusal here.
-    if (count == 0) {
-        const p: ?[*]const u8 = if (stream.len == 0) null else stream.ptr;
-        return contract.labelle_component_batch_set_ids(names.ptr, names.len, p, stream.len);
+    if (stash_valid and namesMatch(names) and stream.len == stash_count * stash_stride) {
+        // Paired id-path set — consumed whatever the outcome, so spent ids
+        // can never be reused by a later unpaired set.
+        defer clearStash();
+        if (stash_count == 0) {
+            // Empty paired set: zero rows.
+            return contract.labelle_component_batch_set_ids(names.ptr, names.len, null, 0);
+        }
+        const stride = stash_stride;
+        const row_size = PREFIX + stride;
+        const total = stash_count * row_size;
+        const buf = ensureRows(total);
+        var i: usize = 0;
+        while (i < stash_count) : (i += 1) {
+            const row = buf[i * row_size ..];
+            std.mem.writeInt(u64, row[0..8], id_store[i], .little);
+            @memcpy(row[PREFIX..][0..stride], stream[i * stride ..][0..stride]);
+        }
+        return contract.labelle_component_batch_set_ids(names.ptr, names.len, buf.ptr, total);
     }
-    const stride = stream.len / count;
-    // Layout drift (the script resized the array between get and set):
-    // delegate to the host so its name refusals still fire and a genuine
-    // shape mismatch surfaces as -1, rather than silently reshaping.
-    if (stride * count != stream.len) {
-        return contract.labelle_component_batch_set_ids(names.ptr, names.len, stream.ptr, stream.len);
-    }
-    const row_size = PREFIX + stride;
-    const total = count * row_size;
-    const buf = ensureRows(total);
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        const row = buf[i * row_size ..];
-        std.mem.writeInt(u64, row[0..8], id_store[i], .little);
-        @memcpy(row[PREFIX..][0..stride], stream[i * stride ..][0..stride]);
-    }
-    return contract.labelle_component_batch_set_ids(names.ptr, names.len, buf.ptr, total);
+    // Unpaired / interleaved-mismatch / resized: the POSITIONAL setter. It
+    // re-queries the current set and applies the flat stream with its own
+    // exact-size preflight — never the id-tagged reader, whose first 8
+    // bytes per row are an entity id (a raw f32 stream there is corruption).
+    const p: ?[*]const u8 = if (stream.len == 0) null else stream.ptr;
+    return contract.labelle_component_batch_set(names.ptr, names.len, p, stream.len);
 }
 
-/// The number of ids stashed by the most recent `stripIds` — the id-path
-/// analogue of the positional variant's entity count. Test/introspection
-/// seam.
+/// The entity count of the currently-stashed pending batch (0 when none) —
+/// test/introspection seam.
 pub fn stashedCount() usize {
-    return id_len;
+    return if (stash_valid) stash_count else 0;
+}
+
+/// Test seam: drop any pending stash so a suite can assert the
+/// no-stash/standalone path from a known-clean state. Never needed in a
+/// game (the lifecycle clears itself), but tests share this process-global.
+pub fn resetStash() void {
+    clearStash();
 }

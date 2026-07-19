@@ -578,7 +578,7 @@ fn rawBatchGet(L: ?*c.State) callconv(.c) c_int {
         // Strip the id column in place (id path only): compact to the
         // positional layout and stash the ids for `raw_batch_set`.
         if (comptime contract.host_has_id_batch) {
-            n = id_batch.stripIds(buf[0..scratch.cap], n);
+            n = id_batch.stripIds(names, buf[0..n], n);
         }
         if (n < 4) {
             c.lua_pushinteger(L, 0);

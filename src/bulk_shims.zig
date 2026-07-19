@@ -123,7 +123,7 @@ export fn labelle_scripting_bulk_batch_get(
         if (n == contract.BATCH_INT_REFUSED or n == 0) return n;
         const buf = out orelse return n; // sizing probe: report raw required
         if (n > out_cap) return n; // grow-retry against the raw required size
-        return id_batch.stripIds(buf[0..out_cap], n);
+        return id_batch.stripIds(names_json[0..names_json_len], buf[0..n], n);
     } else if (comptime contract.host_has_bulk_access) {
         return contract.labelle_component_batch_get(names_json, names_json_len, out, out_cap);
     }

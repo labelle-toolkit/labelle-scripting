@@ -741,7 +741,7 @@ fn rawBatchGet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
         // Strip the id column in place (id path only): compacts the buffer
         // to the positional layout and stashes the ids for `raw_batch_set`.
         if (comptime contract.host_has_id_batch) {
-            n = id_batch.stripIds(buf[0..io_scratch.cap], n);
+            n = id_batch.stripIds(names, buf[0..n], n);
         }
         if (n < 4) return c.Value.int(0);
         const count = std.mem.readInt(u32, buf[0..4], .little);
