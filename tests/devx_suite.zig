@@ -439,11 +439,18 @@ test "hot reload retries a failed read on the next poll (atomic-save race)" {
 // ── multi-root watching (labelle-scripting#51) ─────────────────────────
 
 test "multi-root: a second root ADDS — no clobber, both roots reload, per-root stems" {
-    // Watcher-mechanics test — language-agnostic, so scoped to the lua
-    // binary (one mirror is coverage; keeps ruby-VM churn out of the
-    // declare-tool binary — PR #52 CI). The language reload lifecycle
-    // itself stays covered by the vm-family reload tests above.
-    if (scripting.language != .lua) return error.SkipZigTest;
+    // Watcher-mechanics test — language-agnostic. It also RE-RUNS on the
+    // ruby binary on purpose: booting the Backend VM here adds ruby
+    // mrb_open/close cycles ahead of the declare-tool tests, which is
+    // exactly the multi-VM-per-process churn that used to trip the latent
+    // mruby stack_init bug (labelle-scripting#56, fixed in
+    // vendor/mruby/src/vm.c). The other multi-root mechanics stay on the
+    // lua binary alone (one mirror is coverage). The language reload
+    // lifecycle itself stays covered by the vm-family reload tests above.
+    switch (scripting.language) {
+        .lua, .ruby => {},
+        else => return error.SkipZigTest,
+    }
     fresh();
     defer scripting.hot_reload.reset();
     const io = std.testing.io;
