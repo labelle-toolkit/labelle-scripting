@@ -33,6 +33,7 @@ test {
         .rust => @import("rust_suite.zig"),
         .crystal => @import("crystal_suite.zig"),
         .csharp => @import("csharp_suite.zig"),
+        .go => @import("go_suite.zig"),
     };
 }
 

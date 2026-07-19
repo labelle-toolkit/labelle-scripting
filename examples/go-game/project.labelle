@@ -1,0 +1,69 @@
+// Go example game (labelle-engine#746) — the third NATIVE-COMPILED
+// scripting example (rust's / crystal's c-archive twin): scripts/*.go
+// drive the REAL engine through the Script Runtime Contract from the
+// assembler's generated main, headless over the null backend. The
+// sources live in the shared `scripts/` dir (labelle-engine#237 —
+// `scripts/game.go` is the go package's Register entry, the module
+// root). No VM and nothing embeds — the assembler's native-language
+// splice LINKS the game's scripts/ dir over the staged plugin module's
+// native-go/game/ and the plugin's declared `.language_builds` step
+// (`go build -buildmode=c-archive`) compiles it into
+// liblabelle_go_scripts.a, linked into this binary.
+//
+// THE point of living in this repo: the scripting plugin is pinned
+// `local:../..` — THIS checkout — so every CI run exercises the CURRENT
+// tree (native-go/, the glue, src/go/vm.zig), not a release. Go's
+// permanent regression net: generate + go build + build + run bounded
+// frames (`LABELLE_NULL_FRAMES=5`) and assert the ordered `GO_*`
+// milestone tokens — see `.github/workflows/ci.yml` → `go-example`.
+//
+// v1 SCOPE (demand-driven — proves the wiring, not exhaustive parity):
+// go ships NO declare tool yet, so the `Hunger`/`Worker` components and
+// the `hunger__feed` event are authored in ZIG (components/*.zig,
+// events/*.zig — the pre-declare convention), NOT declared in .go. The
+// go scripts address them by name over the contract, which is the whole
+// wiring proof. A `tools/declare-go` (so a go game can go 100% go like
+// ruby/rust) is the documented follow-up.
+.{
+    .name = "go_game",
+    .title = "LaBelle — Go Example Game (null backend)",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    // Headless: no window, no GPU, no input. The built binary runs a
+    // fixed-dt tick loop bounded by LABELLE_NULL_FRAMES and exits
+    // cleanly. Pinned as an EXPLICIT external `backend_package` to a
+    // SIBLING checkout rather than the registry `.backend = .null`
+    // shorthand: the generated main's `script_contract.bind` touchpoint
+    // lives in labelle-null's `templates/headless.txt` (unreleased). CI
+    // clones labelle-null beside this repo — the same pattern as the
+    // rust/crystal examples. Switch to a registry pin once labelle-null
+    // cuts a release carrying the touchpoint.
+    .backend_package = .{ .name = "null", .repo = "local:../../../labelle-null" },
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    // The scripting plugin resolved from the repo root two levels up —
+    // the working tree under test — with the one-language-per-project
+    // param selecting go (labelle-engine#746, the c-archive native
+    // family).
+    .plugins = .{
+        .{
+            .name = "scripting",
+            .repo = "local:../..",
+            .params = .{ .language = "go" },
+        },
+    },
+    // Registry-resolved toolkit releases (this repo has no toolkit
+    // siblings to pin — the one `local:` dep is the plugin itself, plus
+    // the labelle-null sibling above).
+    .core_version = "1.26.0",
+    // >= 2.6.0: keeps this example on the same engine floor as the
+    // rust/crystal examples (the contract v1.3 bulk-access exports the
+    // plugin's go batch tier binds — labelle-scripting#44 — resolve
+    // through the always-present shims regardless, but pinning the same
+    // floor keeps the four native examples on one engine).
+    .engine_version = "2.6.0",
+    .gfx_version = "1.28.1",
+}

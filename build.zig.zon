@@ -57,6 +57,13 @@
         // — the step runs against the consumer's staged copy (the
         // eval_shared_suite {package}/ scan pins it too).
         "native-csharp",
+        // The go c-archive module (labelle-engine#746): the labelle package
+        // (labelle.go/batch.go) + glue + glue/main.go + game placeholder the
+        // declared `go build -buildmode=c-archive` step compiles the GAME's
+        // scripts/ into. Must ship — the step's go build runs against the
+        // consumer's staged copy (the eval_shared_suite {package}/ scan pins
+        // it too).
+        "native-go",
         // Bundled packs plugin.labelle's `.packs` references (the studio
         // console's eval-handler hook rides packs/scripting_console/) —
         // the assembler resolves them from the consuming game's FETCHED

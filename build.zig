@@ -2,7 +2,7 @@
 //! language sub-module, selected at build time.
 //!
 //! Language selection is a build option (`-Dlanguage=lua|ruby|typescript|
-//! rust|crystal|csharp`) rather than N sibling packages because every
+//! rust|crystal|csharp|go`) rather than N sibling packages because every
 //! language binds the same
 //! Script Runtime Contract and exposes the same Controller — one module
 //! name (`labelle_scripting`), one plugin entry in project.labelle, N
@@ -46,6 +46,20 @@ const crystal_lib_paths = @import("tools/crystal_lib_paths.zig");
 /// on linux) demotes every symbol but the labelle_cr_* entries before
 /// the object links in (the labelle-engine#734 POC's recipe).
 ///
+/// `go` is the third c-archive-shaped native entry (labelle-engine#746,
+/// demand-driven): no vendored runtime — game scripts compile via
+/// `go build -buildmode=c-archive` into `liblabelle_go_scripts.a`
+/// (native-go/ is the module; the assembler's declared build step runs
+/// go in consumer games, this build.zig's test wiring runs it for the
+/// repo's own suite) and the selected sub-module is a thin dispatcher
+/// onto the archive's exported entry points. The one family delta: the
+/// archive carries the GO RUNTIME as a guest (scheduler, GC, signal
+/// handlers — self-initializing from a boot constructor; see
+/// native-go/labelle.go's coexistence matrix), so unlike crystal there
+/// is no localization pass and no boot leg — go build emits a clean
+/// archive whose only global entries are the cgo exports plus the
+/// runtime's own prefixed symbols.
+///
 /// `csharp` is the epic's FINAL entry (labelle-engine#743): a CoreCLR
 /// HOST. Nothing is vendored or compiled into the Zig module — game
 /// scripts compile to a managed assembly (`labelle_csharp_scripts.dll`,
@@ -53,7 +67,7 @@ const crystal_lib_paths = @import("tools/crystal_lib_paths.zig");
 /// .NET hosting API (hostfxr). Desktop-first: mobile AOT is out of v1
 /// (labelle-engine#743). The declared build step is a `dotnet` publish,
 /// not a link — the assembly rides beside the game binary, not inside it.
-const Language = enum { lua, ruby, typescript, rust, crystal, csharp };
+const Language = enum { lua, ruby, typescript, rust, crystal, csharp, go };
 
 /// Lua 5.4.8 sources, minus the `lua.c`/`luac.c` executable mains
 /// (interpreter core + auxlib + all standard libraries).
@@ -479,6 +493,19 @@ pub fn build(b: *std.Build) void {
                 // with dotnet installed keep csharp covered.
                 break :wire;
             }
+            if (lang == .go and ((b.findProgram(&.{"go"}, &.{}) catch null) == null or
+                target.result.os.tag == .windows))
+            {
+                // Go scripting is a cgo c-archive (labelle-engine#746):
+                // its suite needs the go toolchain to compile the test
+                // archive. Windows is additionally skipped — c-archive
+                // there wants a mingw cc and the plugin's desktop lanes
+                // are macOS/linux (the crystal precedent); the windows
+                // lane opens with the .language_builds allowlist. Skip
+                // rather than abort — every other language still wires;
+                // CI's ubuntu lane with go installed keeps go covered.
+                break :wire;
+            }
             const lang_mod = b.createModule(.{
                 .root_source_file = b.path("src/root.zig"),
                 .target = target,
@@ -762,6 +789,48 @@ pub fn build(b: *std.Build) void {
                 tests_root_mod.addAnonymousImport("declare_cr_events_src", .{
                     .root_source_file = b.path("tools/declare-crystal/testdata/events.cr"),
                 });
+            }
+
+            // The go binary's script archive (labelle-engine#746, third
+            // native language): the SHIPPED glue + labelle package
+            // (native-go/, reached through the test module's `replace
+            // labelle => ../../native-go` directive — go's spelling of
+            // the rust suite's #[path] recomposition) rebuilt around
+            // tests/go/game/'s scenario scripts, with tests/go/main.go
+            // as the eight-line stub the shipped glue/main.go models.
+            // ONE step, the family's simplest: `go build
+            // -buildmode=c-archive` emits a clean archive (no crystal
+            // localization pass — cgo exports are the only labelle-
+            // namespace globals; the go runtime rides along under its
+            // own prefixed symbols and self-initializes from a boot
+            // constructor). The archive lands under the zig cache; go's
+            // own build cache plays cargo's staleness-check role (the
+            // Run step declares no outputs, so zig re-runs it every
+            // build and a clean `go build` is milliseconds). Local dev
+            // needs a go toolchain (go >= 1.21, cgo-enabled), same as CI.
+            if (lang == .go) {
+                const go_cache = b.cache_root.join(
+                    b.allocator,
+                    &.{"go-suite-target"},
+                ) catch @panic("OOM");
+                // go build -o will NOT create intermediate dirs (unlike
+                // cargo's --target-dir) — make the output dir first, the
+                // crystal wiring's createDirPath precedent.
+                b.cache_root.handle.createDirPath(b.graph.io, "go-suite-target") catch @panic("mkdir go-suite-target");
+                // `-C tests/go` re-roots go's relative-path resolution at
+                // the module dir, so `-o` MUST be absolute or the archive
+                // lands under tests/go/ — pathFromRoot pins it to the real
+                // cache dir. The link-time reference stays the same
+                // (cwd_relative resolves against the build root, whose cwd
+                // is where the compile runs).
+                const archive_rel = b.fmt("{s}/liblabelle_go_scripts_test.a", .{go_cache});
+                const archive_abs = b.pathFromRoot(archive_rel);
+                const gobuild = b.addSystemCommand(&.{ "go", "build", "-C" });
+                // -C must be the first flag on the go command line.
+                gobuild.addDirectoryArg(b.path("tests/go"));
+                gobuild.addArgs(&.{ "-buildmode=c-archive", "-o", archive_abs, "." });
+                tests.step.dependOn(&gobuild.step);
+                tests_root_mod.addObjectFile(.{ .cwd_relative = archive_rel });
             }
 
             // The csharp binary's managed test assembly (labelle-engine
@@ -1085,6 +1154,19 @@ fn configureLanguage(
             // and linked onto the final binary the same two ways (the
             // assembler's `.language_builds` steps in consumer games,
             // the test-loop wiring in this repo's suite).
+        },
+        .go => {
+            // Native-compiled, rust's twin (labelle-engine#746):
+            // src/go/vm.zig declares the glue's labelle_go_* externs;
+            // the c-archive that defines them (native-go/'s module
+            // carrying the GAME's scripts/ dir as its `labelle/game`
+            // package) is built by the declared `go build
+            // -buildmode=c-archive` step OUTSIDE this module and linked
+            // onto the final binary the same two ways (the assembler's
+            // `.language_builds` step in consumer games, the test-loop
+            // wiring in this repo's suite). Keeping go out of the
+            // module means a consumer's `b.dependency` never shells
+            // out — external builds stay declared, auditable steps.
         },
         .csharp => {
             // CoreCLR host (labelle-engine#743): NOTHING is vendored,
