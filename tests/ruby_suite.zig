@@ -1651,3 +1651,160 @@ test "bulk v1.3: mock engine-parity — packed trailing bytes refuse, batch_set 
     try expect(std.mem.indexOf(u8, bp, "\"x\":1") != null);
     try expect(std.mem.indexOf(u8, bp, "\"y\":2") != null);
 }
+
+test "bulk stage 2 (#45): ruby batch_set retrofits the non-finite refusal (parity with lua/ts)" {
+    fresh();
+    // Ruby's batch write copy loop shipped WITHOUT the binding-level
+    // non-finite guard lua/ts had from day one — #45(a) retrofits it:
+    // per-element isFinite in the copy loop, the canonical non-finite
+    // refusal, nothing handed to the host. A NaN AND an Inf element
+    // both raise ArgumentError naming the (0-based) element.
+    scripting.registerScript("batch_nonfinite",
+        \\NAMES = ["BatchPos", "BatchVel"].freeze
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  e.set("BatchPos", x: 1, y: 2)
+        \\  e.set("BatchVel", vx: 3, vy: 4)
+        \\  @buf = []
+        \\  count = Labelle.batch_get(NAMES, @buf)
+        \\  @buf[1] = Float::NAN
+        \\  begin
+        \\    Labelle.batch_set(NAMES, @buf, count)
+        \\    Labelle.log("nan accepted")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("nan refused: #{ex.message}")
+        \\  end
+        \\  @buf[1] = Float::INFINITY
+        \\  begin
+        \\    Labelle.batch_set(NAMES, @buf, count)
+        \\    Labelle.log("inf accepted")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("inf refused: #{ex.message}")
+        \\  end
+        \\  # The block-iterator path hits the same guard at commit time:
+        \\  # the trailing batch_set raises out of Labelle.batch.
+        \\  begin
+        \\    Labelle.batch(NAMES) { |d| d.y = Float::NAN }
+        \\    Labelle.log("view nan accepted")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("view nan refused: #{ex.message}")
+        \\  end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("nan accepted"));
+    try expect(mock.logsContain("nan refused: labelle: batch_set: non-finite number at element 1"));
+    try expect(!mock.logsContain("inf accepted"));
+    try expect(mock.logsContain("inf refused: labelle: batch_set: non-finite number at element 1"));
+    try expect(!mock.logsContain("view nan accepted"));
+    try expect(mock.logsContain("view nan refused:"));
+    // Every refusal fired BEFORE any host write.
+    try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
+    try expectComponent(1, "BatchVel", "{\"vx\":3,\"vy\":4}");
+}
+
+test "bulk v1.3 (#45 review): overflow floats ride the f64 tag (no throw); non-packable sets keep the JSON fallback" {
+    fresh();
+    // A finite float beyond ±f32 range is NOT refused at the binding
+    // (codex #53): the binding cannot know the target field width, and
+    // such a value is legitimate for an f64 field. It rides the SET-side
+    // f64 tag, and the host coerces per field type. Component.ref
+    // instances drive the PACKED set_from leg (the Hash route is pure
+    // JSON). Two legs:
+    //   1. Overflow on a PACKABLE component — the set SUCCEEDS (host
+    //      narrows, parity with JSON); the OLD binding raised here.
+    //   2. A NON-PACKABLE component — the lossy 0.1 rides tag 4,
+    //      set_from refuses (-1), and the JSON encoder stores it (the
+    //      fallback the #50/precision work must not break).
+    scripting.registerScript("packed_fallback",
+        \\Pos = Labelle::Component.ref("BatchPos", :x, :y)
+        \\Widget = Labelle::Component.ref("Widget", :a, :n)
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  bp = Pos.new
+        \\  bp.x = 1e39
+        \\  bp.y = 0
+        \\  ok1 = e.set(bp)
+        \\  Labelle.log("overflow set:#{ok1}")
+        \\  e2 = Labelle::Entity.create
+        \\  w = Widget.new
+        \\  w.a = 0.1
+        \\  w.n = 7
+        \\  ok2 = e2.set(w)
+        \\  Labelle.log("widget set:#{ok2}")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // No raise on either — the overflow set committed, and the
+    // non-packable set fell through to the JSON encoder.
+    try expect(mock.logsContain("overflow set:true"));
+    try expect(mock.logsContain("widget set:true"));
+    const j = mock.componentJson(2, "Widget") orelse return error.TestExpectedComponent;
+    try expect(std.mem.indexOf(u8, j, "\"a\":0.1") != null);
+    try expect(std.mem.indexOf(u8, j, "\"n\":7") != null);
+}
+
+test "bulk stage 2 (#45): batch_set refuses finite elements beyond ±f32 max before any write" {
+    fresh();
+    // The batch twin of the packed-path guard above: finiteness is
+    // asserted AFTER the f32 narrow, so 1e100 refuses with the same
+    // loudness as NaN/Inf — nothing handed to the host.
+    scripting.registerScript("batch_overflow",
+        \\NAMES = ["BatchPos", "BatchVel"].freeze
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  e.set("BatchPos", x: 1, y: 2)
+        \\  e.set("BatchVel", vx: 3, vy: 4)
+        \\  @buf = []
+        \\  count = Labelle.batch_get(NAMES, @buf)
+        \\  @buf[1] = 1e100 # finite at f64, inf after the f32 narrow
+        \\  begin
+        \\    Labelle.batch_set(NAMES, @buf, count)
+        \\    Labelle.log("huge accepted")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("huge refused: #{ex.message}")
+        \\  end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("huge accepted"));
+    try expect(mock.logsContain("huge refused: labelle: batch_set: element 1 overflows f32 range"));
+    try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
+    try expectComponent(1, "BatchVel", "{\"vx\":3,\"vy\":4}");
+}
+
+test "bulk v1.3 (#45): a float past f32 precision reaches int fields exactly (SET tag 4)" {
+    fresh();
+    // 16777217.0 (2^24 + 1) is the first integer f32 cannot hold: the
+    // old f32 tagging rounded it to 16777216 BEFORE the host saw it — a
+    // silent off-by-one into the i64 field where the JSON path is exact.
+    // A ruby Float destined for an int field now rides the SET-side f64
+    // tag (4): the host coerces float→int with full precision under its
+    // range refusal. Uses a Component.ref instance to exercise the
+    // PACKED path (the Hash route is JSON, exact already).
+    scripting.registerScript("packed_precision",
+        \\Stats = Labelle::Component.ref("Stats", :power, :score, :alive, :seed)
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  s = Stats.new
+        \\  s.power = 0.1
+        \\  s.score = 16777217.0
+        \\  s.alive = true
+        \\  s.seed = 1
+        \\  e.set(s)
+        \\  Labelle.log("precision done")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("precision done"));
+    // SCHEMA order proves the packed path carried it; the score is EXACT.
+    try expectComponent(1, "Stats", "{\"power\":0.1,\"score\":16777217,\"alive\":true,\"seed\":1}");
+}

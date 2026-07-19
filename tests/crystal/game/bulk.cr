@@ -128,6 +128,23 @@ class BatchFlat < Labelle::Script
     rescue ArgumentError
       Labelle.log("crystal: set int refused:true")
     end
+
+    # Non-finite refusal at the BINDING (#45): a NaN/Inf stream element
+    # refuses BEFORE any host write. A finite Float32 overflow (MAX
+    # doubled → INFINITY) is the "1e100 narrows to inf" smuggle in an
+    # f32-native binding, and lands on the same refusal.
+    begin
+      Labelle.batch_set(NAMES, [1.0_f32, Float32::NAN, 2.0_f32, 3.0_f32], 1, @scratch)
+      Labelle.log("crystal: set nan missed")
+    rescue ArgumentError
+      Labelle.log("crystal: set nan refused:true")
+    end
+    begin
+      Labelle.batch_set(NAMES, [1.0_f32, 2.0_f32, Float32::MAX * 2.0_f32, 3.0_f32], 1, @scratch)
+      Labelle.log("crystal: set overflow missed")
+    rescue ArgumentError
+      Labelle.log("crystal: set overflow refused:true")
+    end
   end
 
   def update(dt : Float32) : Nil

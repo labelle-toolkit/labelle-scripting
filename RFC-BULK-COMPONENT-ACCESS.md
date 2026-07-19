@@ -48,11 +48,11 @@ Wire format (little-endian, self-describing so the binding needs no type table):
 [u8 field_count]                       ; 0xFF = SENTINEL "not packable"
 repeat field_count times:
   [u8 name_len][name bytes][u8 tag][value bytes]
-tag: 0=f32(4)  1=i64(8)  2=bool(1)  3=u64(8)
+tag: 0=f32(4)  1=i64(8)  2=bool(1)  3=u64(8)  4=f64(8, SET-side only — #45)
 ```
 
-- **GET**: the host reflects the component's fields; if *every* field is a packable scalar it writes the record, else it writes a single `0xFF` byte. The binding checks `buf[0]`: on `0xFF` it **falls back to the existing JSON path** (correctness preserved for any component — enums, nested structs, slices — the codec can't pack). Otherwise it decodes each value straight into the view instance (`f32→Float`, `i64→Integer`, `bool`), no text parsing.
-- **SET**: the binding tags each field by the *script value's* runtime type (Ruby `Float`→f32, `Integer`→i64, `true`/`false`→bool); the host matches the field by name and **coerces** the tagged value into the field's real Zig type. Non-scalar target field → the host refuses (`-1`) and the binding falls back to JSON.
+- **GET**: the host reflects the component's fields; if *every* field is a packable scalar it writes the record, else it writes a single `0xFF` byte. The binding checks `buf[0]`: on `0xFF` it **falls back to the existing JSON path** (correctness preserved for any component — enums, nested structs, slices — the codec can't pack). Otherwise it decodes each value straight into the view instance (`f32→Float`, `i64→Integer`, `bool`), no text parsing. GET never emits tag 4 (f64 *fields* stay on the 0xFF/JSON path).
+- **SET**: the binding tags each field by the *script value's* runtime type (Ruby `Float`→f32 when the value survives the f32 narrow exactly, else the full-precision f64 tag 4 — so a `Float` destined for an int field lands exactly past f32's 24-bit mantissa (#45); `Integer`→i64, `true`/`false`→bool); the host matches the field by name and **coerces** the tagged value into the field's real Zig type. Non-scalar target field, or tag 4 handed to a pre-tag-4 host → the host refuses (`-1`) and the binding falls back to JSON (which carries the f64 faithfully).
 
 This is a strict, safe improvement: same semantics, JSON kept as the fallback, only scalar components take the fast path.
 

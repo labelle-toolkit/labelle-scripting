@@ -210,6 +210,25 @@ impl Script for BatchFlat {
             "rust: set int refused:{}",
             r == Err(BatchError::IntRefused)
         ));
+
+        // Non-finite refusal at the BINDING (#45): a NaN/Inf stream
+        // element refuses BEFORE any host write — the json-route
+        // non-finite policy applied to the batch stream. (A finite
+        // 1e100 into an f32 view field is BORN as inf and lands on the
+        // same refusal, so the one check covers both smuggles.)
+        let r = labelle::batch_set(NAMES, &[1.0, f32::NAN, 2.0, 3.0], &mut self.scratch);
+        labelle::log(&format!(
+            "rust: set nan refused:{}",
+            r == Err(BatchError::NonFinite(1))
+        ));
+        // A finite-origin f32 overflow (f32::MAX doubled) is inf — the
+        // "1e100 narrows to inf" smuggle, in an f32-native binding.
+        let overflow = f32::MAX * 2.0;
+        let r = labelle::batch_set(NAMES, &[1.0, 2.0, overflow, 3.0], &mut self.scratch);
+        labelle::log(&format!(
+            "rust: set overflow refused:{}",
+            r == Err(BatchError::NonFinite(2))
+        ));
     }
 
     fn update(&mut self, _dt: f32) {

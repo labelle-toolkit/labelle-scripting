@@ -420,7 +420,11 @@ pub fn log(msg: &str) {
 // `{"power":NaN}` is refused by the host parser (-1 → false). The packed
 // fast path must not smuggle values the JSON route cannot carry, so
 // `set_from` refuses a non-finite float field up front (false, nothing
-// written) instead of encoding it.
+// written) instead of encoding it, and `batch_set` refuses a non-finite
+// stream element the same way (`Err(NonFinite)`, nothing written — #45).
+// The dynamic families guard "finite f64 that narrows to inf" after the
+// f32 narrow; here the view fields ARE f32, so such a value arrives
+// already as inf and the same refusals catch it.
 
 unsafe extern "C" {
     /// Runtime capability query (plugin shim): 1 iff the host engine
@@ -1015,6 +1019,14 @@ pub enum BatchError {
     /// not bound. NOTHING was applied — re-run `batch_get` and
     /// recompute.
     EntitySetChanged,
+    /// A stream element is NaN/Inf — the binding-level non-finite
+    /// policy every language family applies to the batch write path
+    /// (#45): non-finite floats must never ride into component fields.
+    /// Carries the (0-based) element index. NOTHING was handed to the
+    /// host. (The typed-view families cannot smuggle a finite-but-
+    /// f32-overflowing value: the fields are already `f32`, so an
+    /// overflow is *born* as `inf` and lands here too.)
+    NonFinite(usize),
     /// (Closure tier only.) The typed views' declared stride does not
     /// match the host stream — a field the stream skips (non-scalar)
     /// disagrees with the view layout. Use the raw
@@ -1049,6 +1061,12 @@ impl std::fmt::Display for BatchError {
                  batch_set (spawn/destroy between the paired calls — the buffer was computed \
                  against a stale set; re-run batch_get and recompute), or the names were \
                  malformed / the host not bound"
+            ),
+            BatchError::NonFinite(i) => write!(
+                f,
+                "labelle: batch_set: non-finite number at element {} — the f32 stream \
+                 refuses NaN/Inf, the json-route non-finite policy (nothing was written)",
+                i
             ),
             BatchError::LayoutMismatch => write!(
                 f,
@@ -1138,6 +1156,15 @@ pub fn batch_get(
 pub fn batch_set(names_json: &str, buf: &[f32], scratch: &mut Vec<u8>) -> Result<(), BatchError> {
     if unsafe { labelle_scripting_bulk_capability() } == 0 {
         return Err(BatchError::Unsupported);
+    }
+    // Non-finite refusal at the BINDING (#45) — one branch-predictable
+    // pass, cheap next to the FFI crossing: NaN/Inf must never ride
+    // into component fields, and the refusal happens BEFORE anything
+    // is handed to the host (all-or-nothing).
+    for (i, &v) in buf.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(BatchError::NonFinite(i));
+        }
     }
     scratch.clear();
     scratch.reserve(buf.len() * 4);

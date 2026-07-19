@@ -403,15 +403,22 @@ fn decodePackedIntoTable(L: ?*c.State, idx: c_int, rec: []const u8) void {
 }
 
 /// `raw_component_set_packed(id, name, tbl)` — the packed write twin: tag
-/// each string-keyed field by its LUA runtime type (integer → i64, finite
-/// float → f32, boolean) and hand the host the binary record; the host
-/// coerces each into the target field's real type (64-bit ints ride the
-/// two's-complement bitcast pair). Returns 0 = applied, -1 = "encode JSON
-/// and use raw_component_set instead" — on ANY bailout: a non-string key,
-/// a non-scalar or non-finite value (the JSON encoder then raises the one
+/// each string-keyed field by its LUA runtime type (integer → i64, float
+/// → f32 when the value survives the narrow exactly, else the SET-side
+/// f64 tag 4 — full precision for float→int targets; boolean) and hand
+/// the host the binary record; the host coerces each into the target
+/// field's real type (64-bit ints ride the two's-complement bitcast
+/// pair). Returns 0 = applied, -1 = "encode JSON and use
+/// raw_component_set instead" — on ANY bailout: a non-string key, a
+/// non-scalar or non-finite value (the JSON encoder then raises the one
 /// canonical error for both routes), an over-wide record, a host refusal
-/// (non-scalar/f64 target, unrepresentable value), or a pre-v1.3 engine
-/// (where this comptime-degrades without referencing the extern).
+/// (non-scalar/f64 target, unrepresentable value, a pre-tag-4 host
+/// handed tag 4 — the JSON fallback carries the f64 faithfully), or a
+/// pre-v1.3 engine (where this comptime-degrades without referencing the
+/// extern). A finite float beyond ±f32 max is NOT special-cased (#45
+/// review): it rides tag 4 like any non-f32-exact float, so a
+/// non-packable component or an f64 target still reaches the JSON
+/// fallback rather than a spurious raise.
 fn rawComponentSetPacked(L: ?*c.State) callconv(.c) c_int {
     if (comptime !contract.host_has_bulk_access) {
         c.lua_pushinteger(L, -1);
@@ -466,11 +473,37 @@ fn rawComponentSetPacked(L: ?*c.State) callconv(.c) c_int {
                             c.lua_pushinteger(L, -1);
                             return 1;
                         }
-                        rec[w] = 0;
-                        w += 1;
                         const f32v: f32 = @floatCast(f);
-                        std.mem.writeInt(u32, rec[w..][0..4], @bitCast(f32v), .little);
-                        w += 4;
+                        if (@as(f64, f32v) == f) {
+                            // Exact in f32 → the compact f32 tag.
+                            rec[w] = 0;
+                            w += 1;
+                            std.mem.writeInt(u32, rec[w..][0..4], @bitCast(f32v), .little);
+                            w += 4;
+                        } else {
+                            // NOT f32-exact — a lossy value (e.g.
+                            // 16777217.0 destined for an int field would
+                            // round through f32's 24-bit mantissa) OR a
+                            // finite one beyond ±f32 range (1e100). BOTH
+                            // ride the SET-side f64 tag (4, since v1.3):
+                            // full precision to the host, which coerces
+                            // per the REAL field type — exact float→int
+                            // under its range refusal, and f32-narrowing
+                            // (parity with the JSON route) into an f32
+                            // field. Deliberately NOT a binding raise (#45
+                            // review): the binding cannot know the target
+                            // width, so an overflow value must defer to the
+                            // host — a host refusal (-1), incl. every
+                            // non-packable component, falls through to the
+                            // JSON encoder below, which carries the f64
+                            // faithfully. (The batch stream, having no f64
+                            // tag and no JSON fallback, keeps its
+                            // after-narrow refusal.)
+                            rec[w] = 4;
+                            w += 1;
+                            std.mem.writeInt(u64, rec[w..][0..8], @bitCast(f), .little);
+                            w += 8;
+                        }
                     }
                 },
                 c.LUA_TBOOLEAN => {
@@ -609,6 +642,17 @@ fn rawBatchSet(L: ?*c.State) callconv(.c) c_int {
                 .{i + 1},
             );
             const f32v: f32 = @floatCast(f);
+            // FINITE-BUT-OVERFLOWING (#45): a finite f64 beyond ±f32 max
+            // narrows to inf in the cast above — assert finiteness AFTER
+            // the narrow, or the stream smuggles the very values the
+            // check above documents as refused.
+            if (!std.math.isFinite(f32v)) raiseFmt(
+                L,
+                "labelle: batch_set: element {d} overflows f32 range (a " ++
+                    "finite value narrowed to inf) — the f32 stream refuses " ++
+                    "values beyond ±f32 max (nothing was written)",
+                .{i + 1},
+            );
             std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f32v), .little);
         }
         const rc = contract.labelle_component_batch_set(names.ptr, names.len, buf, bytes);

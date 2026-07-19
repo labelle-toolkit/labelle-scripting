@@ -352,6 +352,10 @@ test "bulk v1.3: batch_get/batch_set round-trip the whole query as one f32 strea
     // Err values, the rust spelling of ruby's ArgumentError raise.
     try expect(mock.logsContain("rust: get int refused:true"));
     try expect(mock.logsContain("rust: set int refused:true"));
+    // Non-finite refusal at the binding (#45): NaN and a finite-origin
+    // f32 overflow (→ inf) both refuse before any host write.
+    try expect(mock.logsContain("rust: set nan refused:true"));
+    try expect(mock.logsContain("rust: set overflow refused:true"));
 
     scripting.Controller.tick(.{}, 0.016);
     // 3 matching entities (the lone BatchPos-only one filtered out),

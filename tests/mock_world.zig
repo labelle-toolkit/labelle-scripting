@@ -437,7 +437,12 @@ fn defaultScalar(kind: PackedKind) ScalarVal {
 /// (host-owned data).
 fn coerceForKind(kind: PackedKind, v: ScalarVal) ?ScalarVal {
     switch (kind) {
-        .f32, .boolean => return v, // total: float accepts all, bool compares
+        // Engine parity: an f32 field accepts any float tag (0 or the
+        // SET-side f64 tag 4) — @floatCast is total and narrows a finite
+        // out-of-range f64 to inf exactly as the host's JSON parse would
+        // (the packed path defers to the field type, never refuses a
+        // finite value the JSON route also narrows). bool compares.
+        .f32, .boolean => return v,
         .i64 => switch (v) {
             // Engine parity: the 64-BIT BITCAST PAIR — the other 64-bit
             // tag lands via two's-complement bitcast (lossless round trip
@@ -565,6 +570,13 @@ export fn labelle_component_set_packed(
             3 => {
                 if (pos + 8 > buf.len) return -1;
                 v = .{ .u = std.mem.readInt(u64, buf[pos..][0..8], .little) };
+                pos += 8;
+            },
+            4 => { // f64 — SET-side only (since v1.3, #45): full-precision
+                // floats so float→int coercion is exact past f32's
+                // 24-bit mantissa. GET stays f32-only.
+                if (pos + 8 > buf.len) return -1;
+                v = .{ .f = @bitCast(std.mem.readInt(u64, buf[pos..][0..8], .little)) };
                 pos += 8;
             },
             else => return -1,

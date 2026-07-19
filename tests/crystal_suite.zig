@@ -404,6 +404,12 @@ test "bulk v1.3: batch_get/batch_set round-trip the whole query as one f32 strea
     try expect(!mock.logsContain("crystal: set refusal missed"));
     try expect(mock.logsContain("crystal: get int refused:true"));
     try expect(mock.logsContain("crystal: set int refused:true"));
+    // Non-finite refusal at the binding (#45): NaN and a finite-origin
+    // f32 overflow (→ INFINITY) both refuse before any host write.
+    try expect(!mock.logsContain("crystal: set nan missed"));
+    try expect(!mock.logsContain("crystal: set overflow missed"));
+    try expect(mock.logsContain("crystal: set nan refused:true"));
+    try expect(mock.logsContain("crystal: set overflow refused:true"));
 
     scripting.Controller.tick(.{}, 0.016);
     // 3 matching entities (the lone BatchPos-only one filtered out),

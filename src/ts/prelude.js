@@ -338,7 +338,10 @@
   // the callback. No field names are reserved: the view's base offset
   // lives in a closure, not on the object, so every field name is fair
   // game (`size`, `constructor`, whatever — accessors shadow the
-  // prototype within the view).
+  // prototype within the view). Writing a field the view does NOT have
+  // (`e.xx = …`, a typo) throws a TypeError naming the field and the
+  // known fields (#50) — a plain object would silently grow an ordinary
+  // property and the commit would miss the write.
   //
   // Exit semantics — EARLY-RETURN COMMITS, THROW ABORTS (the JS mapping
   // of ruby's break-commits/raise-aborts):
@@ -429,7 +432,33 @@
         enumerable: true,
       });
     });
-    st.view = view;
+    // Unknown STRING-field WRITES throw (#50, the lua view's __newindex
+    // parity): the bare object would happily grow a plain `xx` property
+    // on a typo'd `e.xx = …` — the backing buffer untouched, the commit
+    // silently missing the write. A Proxy set trap throws REGARDLESS of
+    // the caller's strictness (Object.seal only throws under strict mode
+    // — module scripts are strict by spec, but the console evals global
+    // sloppy code), and names both the field and the view's known
+    // fields. Known-field writes forward to the accessors unchanged;
+    // reads take the ordinary [[Get]] on the target (no get trap — the
+    // hot path stays accessor-direct).
+    //
+    // SYMBOL keys pass straight through to the target: runtimes, test
+    // frameworks and debuggers legitimately stamp Symbol-keyed internal
+    // props on any object (Symbol.iterator, inspector markers, …), and
+    // those are never a field typo. Only an unknown STRING key is a
+    // mis-spelled field write worth trapping.
+    st.view = new Proxy(view, {
+      set: (target, prop, value) => {
+        if (typeof prop === "string" && !Object.prototype.hasOwnProperty.call(target, prop)) {
+          throw new TypeError(
+            `labelle.batch view: unknown field '${prop}' — known fields: ${fields.join(", ")}`,
+          );
+        }
+        target[prop] = value;
+        return true;
+      },
+    });
     st.stride = stride;
     st.setBase = (b) => {
       base = b;
