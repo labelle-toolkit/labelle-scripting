@@ -439,7 +439,11 @@ test "hot reload retries a failed read on the next poll (atomic-save race)" {
 // ── multi-root watching (labelle-scripting#51) ─────────────────────────
 
 test "multi-root: a second root ADDS — no clobber, both roots reload, per-root stems" {
-    if (comptime !is_vm_family) return error.SkipZigTest;
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
     fresh();
     defer scripting.hot_reload.reset();
     const io = std.testing.io;
@@ -483,7 +487,11 @@ test "multi-root: a second root ADDS — no clobber, both roots reload, per-root
 }
 
 test "multi-root lossless: one root's scan abort defers ITS edit only; the other root drains" {
-    if (comptime !is_vm_family) return error.SkipZigTest;
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
     fresh();
     defer scripting.hot_reload.reset();
     const io = std.testing.io;
@@ -521,7 +529,11 @@ test "multi-root lossless: one root's scan abort defers ITS edit only; the other
 }
 
 test "multi-root: the dirty-mark read retry is scoped to its own root" {
-    if (comptime !is_vm_family) return error.SkipZigTest;
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
     fresh();
     defer scripting.hot_reload.reset();
     const io = std.testing.io;
@@ -551,7 +563,11 @@ test "multi-root: the dirty-mark read retry is scoped to its own root" {
 }
 
 test "watchDir is idempotent per path: re-registering replaces, a new path adds" {
-    if (comptime !is_vm_family) return error.SkipZigTest;
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
     fresh();
     defer scripting.hot_reload.reset();
     const io = std.testing.io;
@@ -595,7 +611,11 @@ test "watchDir is idempotent per path: re-registering replaces, a new path adds"
 }
 
 test "watchDir with an empty path never clobbers an existing (opened) root" {
-    if (comptime !is_vm_family) return error.SkipZigTest;
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
     fresh();
     defer scripting.hot_reload.reset();
     const io = std.testing.io;
@@ -628,7 +648,11 @@ test "watchDir with an empty path never clobbers an existing (opened) root" {
 // ── wall-clock pump (labelle-scripting#51 — reload while paused) ───────
 
 test "pumpFrame reloads with NO Controller.tick at all (paused game) and throttles on wall-clock" {
-    if (comptime !is_vm_family) return error.SkipZigTest;
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
     fresh();
     defer scripting.hot_reload.reset();
     defer scripting.hot_reload.poll_interval_ms = 250;
@@ -665,7 +689,11 @@ test "pumpFrame reloads with NO Controller.tick at all (paused game) and throttl
 }
 
 test "pumpFrame throttle resets when a root is added: a late root polls promptly" {
-    if (comptime !is_vm_family) return error.SkipZigTest;
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
     fresh();
     defer scripting.hot_reload.reset();
     defer scripting.hot_reload.poll_interval_ms = 250;
@@ -704,7 +732,11 @@ test "pumpFrame throttle resets when a root is added: a late root polls promptly
 }
 
 test "multi-root prefix: a namespaced root reloads under <prefix><stem>, never aliasing the game root" {
-    if (comptime !is_vm_family) return error.SkipZigTest;
+    // Watcher-mechanics test — language-agnostic, so scoped to the lua
+    // binary (one mirror is coverage; keeps ruby-VM churn out of the
+    // declare-tool binary — PR #52 CI). The language reload lifecycle
+    // itself stays covered by the vm-family reload tests above.
+    if (scripting.language != .lua) return error.SkipZigTest;
     fresh();
     defer scripting.hot_reload.reset();
     const io = std.testing.io;
