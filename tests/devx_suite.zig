@@ -567,12 +567,21 @@ test "watchDir is idempotent per path: re-registering replaces, a new path adds"
     var pack_buf: [600]u8 = undefined;
     const pack_path = try std.fmt.bufPrint(&pack_buf, "{s}/packs/sky/scripts", .{path_buf[0..base_len]});
 
+    // A trailing-slash + `/.` spelling of the SAME dir — canonicalizes
+    // (realpath) to the same root, so the dedup catches it.
+    var alias_buf: [640]u8 = undefined;
+    const scripts_alias = try std.fmt.bufPrint(&alias_buf, "{s}/./scripts/", .{path_buf[0..base_len]});
+
     try scripting.hot_reload.watchDir(io, std.testing.allocator, scripts_path);
     try expectEqual(@as(usize, 1), scripting.hot_reload.watchedRootCount());
     // Same path again: REPLACED (no duplicate root double-reporting).
     try scripting.hot_reload.watchDir(io, std.testing.allocator, scripts_path);
     try expectEqual(@as(usize, 1), scripting.hot_reload.watchedRootCount());
-    // A different path ADDS.
+    // A DIFFERENT SPELLING of the same dir (`/./scripts/`) canonicalizes
+    // to the same root → still REPLACED, not a second root (#51 round-2).
+    try scripting.hot_reload.watchDir(io, std.testing.allocator, scripts_alias);
+    try expectEqual(@as(usize, 1), scripting.hot_reload.watchedRootCount());
+    // A genuinely different path ADDS.
     try scripting.hot_reload.watchDir(io, std.testing.allocator, pack_path);
     try expectEqual(@as(usize, 2), scripting.hot_reload.watchedRootCount());
 
@@ -653,6 +662,102 @@ test "pumpFrame reloads with NO Controller.tick at all (paused game) and throttl
     // The reloaded behavior ticks once the game unpauses.
     scripting.Controller.tick(.{}, 0.016);
     try expect(mock.logsContain("devx v2 update"));
+}
+
+test "pumpFrame throttle resets when a root is added: a late root polls promptly" {
+    if (comptime !is_vm_family) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    defer scripting.hot_reload.poll_interval_ms = 250;
+    const io = std.testing.io;
+    var dir_a = std.testing.tmpDir(.{ .iterate = true });
+    defer dir_a.cleanup();
+    var dir_b = std.testing.tmpDir(.{ .iterate = true });
+    defer dir_b.cleanup();
+
+    const file_b = "20_late" ++ src.ext;
+    try dir_b.dir.writeFile(io, .{ .sub_path = file_b, .data = src.v1 });
+    try scripting.Controller.setup(.{}); // no scripts registered → no init yet
+    defer scripting.Controller.deinit();
+
+    // Root A watched, pumpFrame primes it and STAMPS the throttle clock.
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, dir_a.dir);
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pumpFrame());
+
+    // WIDEN the interval so a plain pumpFrame would now be throttled OUT
+    // (return early WITHOUT polling). Then add root B. Adding a root
+    // resets the throttle stamp (#51 round-2) — so this pumpFrame runs
+    // and primes B, instead of being stuck an hour behind A's stamp.
+    // Had the stamp NOT reset, B would never prime here, and its edit
+    // below would be swallowed into a first-time baseline (→ 0 reloads).
+    scripting.hot_reload.poll_interval_ms = 3_600_000;
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, dir_b.dir);
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pumpFrame()); // B PRIMED (not throttled)
+
+    // Edit B, force the interval open, pump: because B was primed above,
+    // this is a real CHANGE → one reload (init replays). Without the
+    // reset it would instead be B's first baseline and reload nothing.
+    try dir_b.dir.writeFile(io, .{ .sub_path = file_b, .data = src.v2 });
+    scripting.hot_reload.poll_interval_ms = 0;
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pumpFrame());
+    try expectEqual(@as(usize, 1), mock.logCount("devx init ran"));
+}
+
+test "multi-root prefix: a namespaced root reloads under <prefix><stem>, never aliasing the game root" {
+    if (comptime !is_vm_family) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    const io = std.testing.io;
+    var game_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer game_dir.cleanup();
+    var pack_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer pack_dir.cleanup();
+
+    // Both roots ship a same-stem file `10_counter` → stem "counter".
+    // The game registers "counter"; the pack registers "sky__counter"
+    // (the namespace the assembler will emit once pack scripts are
+    // consumed). Editing the PACK file must reload sky__counter, never
+    // clobber the game's counter.
+    const file = "10_counter" ++ src.ext;
+    try game_dir.dir.writeFile(io, .{ .sub_path = file, .data = src.v1 });
+    try pack_dir.dir.writeFile(io, .{ .sub_path = file, .data = src.late });
+    scripting.registerScript("counter", src.v1);
+    scripting.registerScript("sky__counter", src.v1);
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try scripting.hot_reload.watchOpenedDir(io, std.testing.allocator, game_dir.dir);
+    try scripting.hot_reload.watchOpenedDirNamed(io, std.testing.allocator, pack_dir.dir, "sky__");
+    try expectEqual(@as(usize, 0), scripting.hot_reload.pump()); // baselines
+
+    // Edit ONLY the pack file. It reports stem "counter" from its root,
+    // which reloads under the root's prefix → "sky__counter". The game's
+    // "counter" registration is untouched.
+    try pack_dir.dir.writeFile(io, .{ .sub_path = file, .data = src.v2 });
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
+    scripting.Controller.tick(.{}, 0.016);
+    // The pack's counter now runs v2 behavior; the game's counter never
+    // reloaded (still v1) — no cross-root alias.
+    try expect(mock.logsContain("devx v2 update"));
+    // Prove non-alias: the game file, edited, reloads the GAME counter
+    // under the bare stem — a distinct registration.
+    try game_dir.dir.writeFile(io, .{ .sub_path = file, .data = src.v2 });
+    try expectEqual(@as(usize, 1), scripting.hot_reload.pump());
+}
+
+test "watchDirPrefixTooLong: an over-long namespace is refused, not truncated" {
+    if (scripting.language != .lua) return error.SkipZigTest;
+    fresh();
+    defer scripting.hot_reload.reset();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const long_prefix = "x" ** (scripting.hot_reload.max_name_prefix + 1);
+    try std.testing.expectError(
+        error.WatchDirPrefixTooLong,
+        scripting.hot_reload.watchOpenedDirNamed(io, std.testing.allocator, tmp.dir, long_prefix),
+    );
+    try expectEqual(@as(usize, 0), scripting.hot_reload.watchedRootCount());
 }
 
 test "ruby: a script discovered mid-run inits BEFORE its controllers set up" {

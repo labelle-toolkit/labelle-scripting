@@ -269,14 +269,16 @@ pub fn reloadScript(name: []const u8, source: [:0]const u8) bool {
 /// MULTI-ROOT (labelle-scripting#51): the watch layer is a registry of
 /// watched roots — the game's `scripts/` plus any local pack script dirs
 /// (`packs/<pack>/scripts`) the assembler's dev splice registers.
-/// `watchDir` ADDS a root (idempotent per path — re-registering the same
-/// path restarts that root's watcher instead of duplicating it); each
-/// root keeps its own baseline, its own lossless-loop state, and the
-/// per-root registered-stem rule (`watch.stemOf` against the root's own
-/// entries). Two roots reporting the same stem hit the same registration
-/// (`findOrRegister` is name-keyed) — the assembler namespaces pack
-/// script names when it starts consuming them, so game-dir stems stay
-/// the only unprefixed ones.
+/// `watchDir` ADDS a root (idempotent per CANONICAL path — re-registering
+/// a dir that resolves to the same realpath, however spelled, restarts
+/// that root's watcher instead of duplicating it); each root keeps its own
+/// baseline, its own lossless-loop state, its own allocator, the per-root
+/// registered-stem rule (`watch.stemOf` against the root's own entries),
+/// and a reload-name PREFIX. The reload key is `<prefix><stem>`: the game
+/// root's prefix is empty (stems reload bare, as always), while a pack
+/// root registered via `watchDirNamed(dir, "sky__")` reloads its stems
+/// under `sky__<stem>` — so two roots' same-stem scripts key onto their
+/// own namespaced registrations and never alias.
 pub const hot_reload = struct {
     /// Tick-pump cadence in Controller ticks (~4 Hz at 60 fps) — the
     /// legacy pump path (`Controller.tick`), kept for generated mains
@@ -297,18 +299,33 @@ pub const hot_reload = struct {
     /// keeps running.
     pub const max_watch_roots = 8;
 
-    /// Longest `watchDir` path that keeps its idempotency identity.
+    /// Longest canonical root path that keeps its idempotency identity.
     /// Longer paths still watch fine — they just re-register as new
     /// roots instead of replacing (bounded storage, no allocator).
     pub const max_root_path = 512;
 
-    /// One watched root: the poller plus the identity `watchDir` was
-    /// called with (empty for `watchOpenedDir` roots — an open handle
-    /// carries no path to be idempotent against).
+    /// Longest per-root reload-name prefix (a pack namespace, `sky__`).
+    /// A longer prefix is refused (`error.WatchDirPrefixTooLong`) — dev
+    /// wiring degrades rather than truncate a namespace into a mismatch.
+    pub const max_name_prefix = 64;
+
+    /// Longest reload key (`<prefix><stem>`): the watcher's per-root
+    /// registered-stem plus a root's namespace prefix.
+    pub const max_reload_name = watch.filename_cap + max_name_prefix;
+
+    /// One watched root: the poller, the CANONICAL path identity (realpath
+    /// of the opened dir — empty for `watchOpenedDir` roots, which carry no
+    /// path), the allocator to read/free THIS root's sources with, and the
+    /// reload-name prefix every stem this root reports is registered under
+    /// (empty for the game root — its stems register bare; `<pack>__` for a
+    /// pack root, so two roots' same-stem scripts never alias, #51 round-2).
     const Root = struct {
         watcher: watch.Watcher,
+        allocator: std.mem.Allocator,
         path_buf: [max_root_path]u8 = undefined,
         path_len: usize = 0,
+        prefix_buf: [max_name_prefix]u8 = undefined,
+        prefix_len: usize = 0,
         /// True when `watchDir` opened the handle here (so replacing or
         /// `stopWatching` may close it); `watchOpenedDir` handles are
         /// borrowed and stay the caller's to close.
@@ -317,11 +334,13 @@ pub const hot_reload = struct {
         fn path(self: *const Root) []const u8 {
             return self.path_buf[0..self.path_len];
         }
+        fn prefix(self: *const Root) []const u8 {
+            return self.prefix_buf[0..self.prefix_len];
+        }
     };
 
     var roots: [max_watch_roots]Root = undefined;
     var root_count: usize = 0;
-    var gpa: std.mem.Allocator = undefined;
     var countdown: u32 = 0;
     /// Wall-clock pump state (`pumpFrame`): the last poll's monotonic
     /// stamp, null until the first frame pump.
@@ -330,11 +349,14 @@ pub const hot_reload = struct {
     /// Reload-owned sources + stable name storage: registry `name`
     /// slices must outlive the watcher (watcher entry storage reshuffles
     /// across polls), and re-read sources are heap copies that must be
-    /// freed when the NEXT reload of the same script replaces them.
+    /// freed when the NEXT reload of the same script replaces them —
+    /// with the SAME allocator that read them (roots may use different
+    /// allocators, #51 round-2), so each slot remembers its own.
     const Owned = struct {
-        name_buf: [watch.filename_cap]u8 = undefined,
+        name_buf: [max_reload_name]u8 = undefined,
         name_len: usize = 0,
         source: ?[:0]u8 = null,
+        source_allocator: std.mem.Allocator = undefined,
     };
     var owned: [MAX_REGISTERED_SCRIPTS]Owned = @splat(.{});
     var owned_count: usize = 0;
@@ -350,57 +372,92 @@ pub const hot_reload = struct {
     /// generated dev build's splice, or by hand) — once per root: the
     /// game's script dir, then each local pack script dir.
     ///
-    /// Idempotent per path: re-registering an already-watched `dir_path`
-    /// REPLACES that root's watcher (fresh handle, re-primed baseline —
-    /// the old single-slot `watchDir` semantics, now scoped to the one
-    /// root) instead of adding a duplicate that would double-report every
-    /// edit.
-    pub fn watchDir(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) error{ HotReloadUnsupported, WatchDirOpen, TooManyWatchRoots }!void {
-        const ext = comptime scriptExtension() orelse return error.HotReloadUnsupported;
+    /// Idempotent per CANONICAL path: re-registering a path that resolves
+    /// (realpath) to an already-watched root REPLACES that root's watcher
+    /// (fresh handle, re-primed baseline) instead of adding a duplicate
+    /// that would double-report every edit — even when the two calls spell
+    /// the same dir differently (`scripts` vs `./scripts` vs an absolute
+    /// path, #51 round-2).
+    pub fn watchDir(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) error{ HotReloadUnsupported, WatchDirOpen, TooManyWatchRoots, WatchDirPrefixTooLong }!void {
+        return watchDirNamed(io, allocator, dir_path, "");
+    }
 
-        // Resolve the slot BEFORE opening: same-path → replace in place;
-        // new path → append (capacity-checked so a failed registration
-        // never leaks a fresh handle). The identity match is guarded on a
-        // NON-EMPTY path (and a full `mem.eql`, never a prefix): an empty
-        // `dir_path` carries no identity — it must never match a
-        // `watchOpenedDir` root (whose stored path is empty by
-        // construction, `r.path() == ""`) and silently replace it. A
-        // path past `max_root_path` also carries no stored identity, so
-        // it likewise can't match (it re-registers as a fresh root).
+    /// `watchDir` with a reload-name `prefix` (a pack namespace, `sky__`):
+    /// every stem this root reports reloads under `<prefix><stem>`, so a
+    /// pack whose scripts register namespaced reload against the right
+    /// registration and never alias the game's same-stem scripts (#51
+    /// round-2). Empty prefix = the game-root behavior (`watchDir`).
+    pub fn watchDirNamed(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        dir_path: []const u8,
+        prefix: []const u8,
+    ) error{ HotReloadUnsupported, WatchDirOpen, TooManyWatchRoots, WatchDirPrefixTooLong }!void {
+        const ext = comptime scriptExtension() orelse return error.HotReloadUnsupported;
+        if (prefix.len > max_name_prefix) return error.WatchDirPrefixTooLong;
+
+        // Open FIRST, then take the canonical identity from the live
+        // handle: two different spellings of the same dir resolve to one
+        // realpath, so the dedup below catches them (a raw `mem.eql` on the
+        // caller's string would not). Opening before the capacity check
+        // means the overflow path must close the handle it just opened.
+        const dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch
+            return error.WatchDirOpen;
+
+        var canon_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const canon: []const u8 = if (dir.realPath(io, &canon_buf)) |n|
+            canon_buf[0..n]
+        else |_|
+            dir_path; // realpath failed (rare) — fall back to the raw spelling
+
+        // Same-canonical → replace in place; else append. A non-empty
+        // canonical path AND a non-empty stored path (a `watchOpenedDir`
+        // root stores none) guard the full `mem.eql` — never a prefix,
+        // never an empty-string match.
         var slot: ?*Root = null;
-        if (dir_path.len > 0 and dir_path.len <= max_root_path) {
+        if (canon.len > 0 and canon.len <= max_root_path) {
             for (roots[0..root_count]) |*r| {
-                if (r.path_len > 0 and std.mem.eql(u8, r.path(), dir_path)) {
+                if (r.path_len > 0 and std.mem.eql(u8, r.path(), canon)) {
                     slot = r;
                     break;
                 }
             }
         }
-        if (slot == null and root_count >= max_watch_roots) return error.TooManyWatchRoots;
-
-        const dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch
-            return error.WatchDirOpen;
+        if (slot == null and root_count >= max_watch_roots) {
+            dir.close(io);
+            return error.TooManyWatchRoots;
+        }
 
         if (slot) |r| {
-            // Replacement: the previous handle was opened here, so it is
-            // ours to close — using the io that OPENED it (`r.watcher.io`,
-            // matching `stopWatching`), not necessarily the io passed to
-            // this call. A borrowed watchOpenedDir handle never has a path
-            // and can't match, so `opened_here` is always true here.
+            // Replacement: close the previous handle with the io that
+            // OPENED it (`r.watcher.io`, matching `stopWatching`). A
+            // borrowed watchOpenedDir handle stores no path and can't
+            // match here, so `opened_here` is always true.
             if (r.opened_here) r.watcher.dir.close(r.watcher.io);
             r.watcher = watch.Watcher.init(io, dir, ext);
+            r.allocator = allocator;
             r.opened_here = true;
+            setPrefix(r, prefix);
         } else {
             const r = &roots[root_count];
-            r.* = .{ .watcher = watch.Watcher.init(io, dir, ext), .opened_here = true };
-            if (dir_path.len <= max_root_path) {
-                @memcpy(r.path_buf[0..dir_path.len], dir_path);
-                r.path_len = dir_path.len;
+            r.* = .{ .watcher = watch.Watcher.init(io, dir, ext), .allocator = allocator, .opened_here = true };
+            if (canon.len <= max_root_path) {
+                @memcpy(r.path_buf[0..canon.len], canon);
+                r.path_len = canon.len;
             }
+            setPrefix(r, prefix);
             root_count += 1;
         }
-        gpa = allocator;
         countdown = 0;
+        // A newly-added root must poll PROMPTLY: reset the wall-clock
+        // throttle so it isn't stuck behind the previous root's interval
+        // (#51 round-2).
+        last_wall_poll = null;
+    }
+
+    fn setPrefix(r: *Root, prefix: []const u8) void {
+        @memcpy(r.prefix_buf[0..prefix.len], prefix);
+        r.prefix_len = prefix.len;
     }
 
     /// `watchDir` over an already-open handle (must have `.iterate`
@@ -409,12 +466,28 @@ pub const hot_reload = struct {
     /// an open handle has no path identity, so there is no idempotency
     /// here — don't register the same handle twice.
     pub fn watchOpenedDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) error{ HotReloadUnsupported, TooManyWatchRoots }!void {
+        return watchOpenedDirNamed(io, allocator, dir, "") catch |err| switch (err) {
+            error.WatchDirPrefixTooLong => unreachable, // empty prefix
+            else => |e| return e,
+        };
+    }
+
+    /// `watchOpenedDir` with a reload-name `prefix` (see `watchDirNamed`).
+    pub fn watchOpenedDirNamed(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        dir: std.Io.Dir,
+        prefix: []const u8,
+    ) error{ HotReloadUnsupported, TooManyWatchRoots, WatchDirPrefixTooLong }!void {
         const ext = comptime scriptExtension() orelse return error.HotReloadUnsupported;
+        if (prefix.len > max_name_prefix) return error.WatchDirPrefixTooLong;
         if (root_count >= max_watch_roots) return error.TooManyWatchRoots;
-        roots[root_count] = .{ .watcher = watch.Watcher.init(io, dir, ext) };
+        const r = &roots[root_count];
+        r.* = .{ .watcher = watch.Watcher.init(io, dir, ext), .allocator = allocator };
+        setPrefix(r, prefix);
         root_count += 1;
-        gpa = allocator;
         countdown = 0;
+        last_wall_poll = null;
     }
 
     /// Stop polling every root. Handles `watchDir` opened here are
@@ -436,12 +509,15 @@ pub const hot_reload = struct {
     /// scan abort or read failure never stalls another's drain.
     pub fn pump() usize {
         var reloaded: usize = 0;
-        for (roots[0..root_count]) |*r| reloaded += pumpRoot(&r.watcher);
+        for (roots[0..root_count]) |*r| reloaded += pumpRoot(r);
         return reloaded;
     }
 
-    /// One root's lossless drain (the PR #47 loop, per root now).
-    fn pumpRoot(w: *watch.Watcher) usize {
+    /// One root's lossless drain (the PR #47 loop, per root now). Reads
+    /// and frees with the root's OWN allocator, and reloads each reported
+    /// stem under the root's namespace prefix.
+    fn pumpRoot(r: *Root) usize {
+        const w = &r.watcher;
         var changes: [16]watch.Change = undefined;
         var reloaded: usize = 0;
         // Drain: a FULL batch means the watcher may be sitting on more
@@ -453,7 +529,7 @@ pub const hot_reload = struct {
             const n = w.poll(&changes);
             var read_failed = false;
             for (changes[0..n]) |ch| {
-                const source = readChanged(w, ch.file) orelse {
+                const source = readChanged(w, r.allocator, ch.file) orelse {
                     // The atomic-save race: the editor may still be
                     // writing the file this very moment. The watcher
                     // already committed the new baseline when it
@@ -467,7 +543,18 @@ pub const hot_reload = struct {
                     logHost("hot reload: failed to read a changed script file — will retry next poll");
                     continue;
                 };
-                if (reloadOwned(ch.name, source)) reloaded += 1;
+                // Reload key = the root's namespace prefix + the reported
+                // stem. Empty prefix (game root) → the bare stem, exactly
+                // as before; a pack root's `<pack>__` prefix keys its
+                // reload onto the namespaced registration and never aliases
+                // the game's same-stem scripts (#51 round-2).
+                var name_buf: [max_reload_name]u8 = undefined;
+                const name = if (r.prefix_len + ch.name.len <= name_buf.len) blk: {
+                    @memcpy(name_buf[0..r.prefix_len], r.prefix());
+                    @memcpy(name_buf[r.prefix_len..][0..ch.name.len], ch.name);
+                    break :blk name_buf[0 .. r.prefix_len + ch.name.len];
+                } else ch.name; // pathological: over-long — reload bare (still frees the source)
+                if (reloadOwned(r.allocator, name, source)) reloaded += 1;
             }
             // A dirty-marked file would re-report IMMEDIATELY on the
             // next drain round — retry on the next cadence poll instead
@@ -483,8 +570,9 @@ pub const hot_reload = struct {
     pub var debug_fail_next_read: bool = false;
 
     /// One changed file's bytes (sentinel-terminated), or null on any
-    /// read failure — the injectable read behind `pump`.
-    fn readChanged(w: *watch.Watcher, file: []const u8) ?[:0]u8 {
+    /// read failure — the injectable read behind `pump`. Reads with the
+    /// root's own `allocator`.
+    fn readChanged(w: *watch.Watcher, allocator: std.mem.Allocator, file: []const u8) ?[:0]u8 {
         if (debug_fail_next_read) {
             debug_fail_next_read = false;
             return null;
@@ -492,7 +580,7 @@ pub const hot_reload = struct {
         return w.dir.readFileAllocOptions(
             w.io,
             file,
-            gpa,
+            allocator,
             .limited(max_script_bytes),
             .of(u8),
             0,
@@ -540,17 +628,21 @@ pub const hot_reload = struct {
 
     /// Route one freshly read source through `reloadScript`, managing
     /// ownership: the registry gets slot-stable name storage and the
-    /// slot's previous heap source is freed once replaced.
-    fn reloadOwned(name: []const u8, source: [:0]u8) bool {
+    /// slot's previous heap source is freed once replaced — each with
+    /// the allocator that READ it (`source` was read with `allocator`;
+    /// the previous source remembers its own on the slot, #51 round-2).
+    fn reloadOwned(allocator: std.mem.Allocator, name: []const u8, source: [:0]u8) bool {
         const slot = ownedSlot(name) orelse {
-            gpa.free(source);
+            allocator.free(source);
             logHost("hot reload: too many watched scripts — raise MAX_REGISTERED_SCRIPTS");
             return false;
         };
         const prev = slot.source;
+        const prev_allocator = slot.source_allocator;
         slot.source = source;
+        slot.source_allocator = allocator;
         const ok = reloadScript(slot.name_buf[0..slot.name_len], source);
-        if (prev) |p| gpa.free(p); // registry now points at `source`
+        if (prev) |p| prev_allocator.free(p); // registry now points at `source`
         return ok;
     }
 
@@ -558,7 +650,7 @@ pub const hot_reload = struct {
         for (owned[0..owned_count]) |*slot| {
             if (std.mem.eql(u8, slot.name_buf[0..slot.name_len], name)) return slot;
         }
-        if (owned_count >= owned.len or name.len > watch.filename_cap) return null;
+        if (owned_count >= owned.len or name.len > max_reload_name) return null;
         const slot = &owned[owned_count];
         owned_count += 1;
         @memcpy(slot.name_buf[0..name.len], name);
@@ -568,13 +660,13 @@ pub const hot_reload = struct {
     }
 
     /// Test/tooling seam: stop watching and free every reload-owned
-    /// source. Callers must have cleared the registry (or torn the VM
-    /// down and re-registered) first — registry entries may point at the
-    /// freed sources.
+    /// source (each with the allocator that read it). Callers must have
+    /// cleared the registry (or torn the VM down and re-registered)
+    /// first — registry entries may point at the freed sources.
     pub fn reset() void {
         stopWatching();
         for (owned[0..owned_count]) |*slot| {
-            if (slot.source) |s| gpa.free(s);
+            if (slot.source) |s| slot.source_allocator.free(s);
             slot.source = null;
         }
         owned_count = 0;
