@@ -841,9 +841,17 @@ The plugin handles the studio Script Console's
 
 - **Hot reload (VM family, dev builds)** — build the plugin with
   `-Dhot_reload=true` and point `scripting.hot_reload.watchDir(io,
-  allocator, "scripts")` at the game's script dir: the Controller tick
-  then polls (mtime+size, ~4 Hz, tick-counted) and re-loads changed
-  files into the RUNNING VM. `scripting.reloadScript(name, source)` is
+  allocator, "scripts")` at the game's script dir: the watch layer
+  polls (mtime+size, ~4 Hz) and re-loads changed files into the RUNNING
+  VM. `watchDir` ADDS a watched root (labelle-scripting#51) — call it
+  again for each local pack script dir (`packs/<pack>/scripts`);
+  re-registering the same path replaces that root instead of
+  duplicating it. Two pumps drive the polls: `Controller.tick`'s
+  tick-counted pump (older generated mains), and `pumpFrame()` — a
+  WALL-CLOCK pump generated dev mains call every frame OUTSIDE the
+  `scaled_dt > 0` gate, so editing while the game is paused
+  (`time_scale == 0`) still reloads.
+  `scripting.reloadScript(name, source)` is
   the underlying seam — also the entry point a studio hot-push export
   will call. State semantics: component/ECS data survives by
   construction; script-LOCAL state resets (lua: fresh per-script `_ENV`;

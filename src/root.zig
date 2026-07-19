@@ -260,23 +260,72 @@ pub fn reloadScript(name: []const u8, source: [:0]const u8) bool {
 }
 
 /// Dev-mode disk watching (labelle-engine#740): poll the game's script
-/// dir off the Controller tick and feed changed files through
+/// dirs off the frame loop and feed changed files through
 /// `reloadScript`. COMPILED OUT unless the plugin is built with
 /// `-Dhot_reload=true` (the dev-mode gate — the assembler's dev builds
 /// will pass it; release builds never carry the watcher or its tick
 /// branch). VM family only — `watchDir` refuses on native backends.
+///
+/// MULTI-ROOT (labelle-scripting#51): the watch layer is a registry of
+/// watched roots — the game's `scripts/` plus any local pack script dirs
+/// (`packs/<pack>/scripts`) the assembler's dev splice registers.
+/// `watchDir` ADDS a root (idempotent per path — re-registering the same
+/// path restarts that root's watcher instead of duplicating it); each
+/// root keeps its own baseline, its own lossless-loop state, and the
+/// per-root registered-stem rule (`watch.stemOf` against the root's own
+/// entries). Two roots reporting the same stem hit the same registration
+/// (`findOrRegister` is name-keyed) — the assembler namespaces pack
+/// script names when it starts consuming them, so game-dir stems stay
+/// the only unprefixed ones.
 pub const hot_reload = struct {
-    /// Poll cadence in Controller ticks (~4 Hz at 60 fps). Tick-counted,
-    /// not wall-clocked, on purpose: Zig 0.16 has no std.time.Timer and
-    /// a dev loop doesn't need one.
+    /// Tick-pump cadence in Controller ticks (~4 Hz at 60 fps) — the
+    /// legacy pump path (`Controller.tick`), kept for generated mains
+    /// predating the `pumpFrame` splice.
     pub const poll_interval_ticks: u32 = 15;
+
+    /// Wall-clock pump cadence for `pumpFrame` in milliseconds (~4 Hz).
+    /// A var on purpose — tests shrink it to force immediate polls; the
+    /// dev loop never touches it.
+    pub var poll_interval_ms: i64 = 250;
 
     /// Cap on one reloaded script file (dev-mode read guard).
     pub const max_script_bytes: usize = 1 << 20;
 
-    var watcher: ?watch.Watcher = null;
+    /// Watched-root capacity: the game's script dir + a handful of local
+    /// pack script dirs. Registration past this cap errors loudly
+    /// (`error.TooManyWatchRoots`) — dev-mode wiring degrades, the game
+    /// keeps running.
+    pub const max_watch_roots = 8;
+
+    /// Longest `watchDir` path that keeps its idempotency identity.
+    /// Longer paths still watch fine — they just re-register as new
+    /// roots instead of replacing (bounded storage, no allocator).
+    pub const max_root_path = 512;
+
+    /// One watched root: the poller plus the identity `watchDir` was
+    /// called with (empty for `watchOpenedDir` roots — an open handle
+    /// carries no path to be idempotent against).
+    const Root = struct {
+        watcher: watch.Watcher,
+        path_buf: [max_root_path]u8 = undefined,
+        path_len: usize = 0,
+        /// True when `watchDir` opened the handle here (so replacing or
+        /// `stopWatching` may close it); `watchOpenedDir` handles are
+        /// borrowed and stay the caller's to close.
+        opened_here: bool = false,
+
+        fn path(self: *const Root) []const u8 {
+            return self.path_buf[0..self.path_len];
+        }
+    };
+
+    var roots: [max_watch_roots]Root = undefined;
+    var root_count: usize = 0;
     var gpa: std.mem.Allocator = undefined;
     var countdown: u32 = 0;
+    /// Wall-clock pump state (`pumpFrame`): the last poll's monotonic
+    /// stamp, null until the first frame pump.
+    var last_wall_poll: ?std.Io.Timestamp = null;
 
     /// Reload-owned sources + stable name storage: registry `name`
     /// slices must outlive the watcher (watcher entry storage reshuffles
@@ -290,37 +339,101 @@ pub const hot_reload = struct {
     var owned: [MAX_REGISTERED_SCRIPTS]Owned = @splat(.{});
     var owned_count: usize = 0;
 
-    /// Start watching `dir_path` (resolved against the cwd) for the
-    /// selected language's script files. `io`/`allocator` are stored for
-    /// the polls; call from the game's main after Controller.setup (a
-    /// generated dev build's splice, or by hand).
-    pub fn watchDir(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) error{ HotReloadUnsupported, WatchDirOpen }!void {
-        const dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch
-            return error.WatchDirOpen;
-        return watchOpenedDir(io, allocator, dir);
+    /// Number of currently watched roots (introspection/tests).
+    pub fn watchedRootCount() usize {
+        return root_count;
     }
 
-    /// `watchDir` over an already-open handle (must have `.iterate`
-    /// capability). The watcher borrows it until `stopWatching`.
-    pub fn watchOpenedDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) error{HotReloadUnsupported}!void {
+    /// ADD `dir_path` (resolved against the cwd) to the watched roots for
+    /// the selected language's script files. `io`/`allocator` are stored
+    /// for the polls; call from the game's main after Controller.setup (a
+    /// generated dev build's splice, or by hand) — once per root: the
+    /// game's script dir, then each local pack script dir.
+    ///
+    /// Idempotent per path: re-registering an already-watched `dir_path`
+    /// REPLACES that root's watcher (fresh handle, re-primed baseline —
+    /// the old single-slot `watchDir` semantics, now scoped to the one
+    /// root) instead of adding a duplicate that would double-report every
+    /// edit.
+    pub fn watchDir(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) error{ HotReloadUnsupported, WatchDirOpen, TooManyWatchRoots }!void {
         const ext = comptime scriptExtension() orelse return error.HotReloadUnsupported;
-        watcher = watch.Watcher.init(io, dir, ext);
+
+        // Resolve the slot BEFORE opening: same-path → replace in place;
+        // new path → append (capacity-checked so a failed registration
+        // never leaks a fresh handle).
+        var slot: ?*Root = null;
+        if (dir_path.len <= max_root_path) {
+            for (roots[0..root_count]) |*r| {
+                if (std.mem.eql(u8, r.path(), dir_path)) {
+                    slot = r;
+                    break;
+                }
+            }
+        }
+        if (slot == null and root_count >= max_watch_roots) return error.TooManyWatchRoots;
+
+        const dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch
+            return error.WatchDirOpen;
+
+        if (slot) |r| {
+            // Replacement: the previous handle was opened here, so it is
+            // ours to close (a borrowed watchOpenedDir handle never has a
+            // path and can't match).
+            if (r.opened_here) r.watcher.dir.close(io);
+            r.watcher = watch.Watcher.init(io, dir, ext);
+            r.opened_here = true;
+        } else {
+            const r = &roots[root_count];
+            r.* = .{ .watcher = watch.Watcher.init(io, dir, ext), .opened_here = true };
+            if (dir_path.len <= max_root_path) {
+                @memcpy(r.path_buf[0..dir_path.len], dir_path);
+                r.path_len = dir_path.len;
+            }
+            root_count += 1;
+        }
         gpa = allocator;
         countdown = 0;
     }
 
-    /// Stop polling. The watched dir handle is the caller's to close;
-    /// already-reloaded sources stay live (the registry points at them).
-    pub fn stopWatching() void {
-        watcher = null;
+    /// `watchDir` over an already-open handle (must have `.iterate`
+    /// capability). The watcher borrows it until `stopWatching` — the
+    /// handle stays the caller's to close. ADDS a root like `watchDir`;
+    /// an open handle has no path identity, so there is no idempotency
+    /// here — don't register the same handle twice.
+    pub fn watchOpenedDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) error{ HotReloadUnsupported, TooManyWatchRoots }!void {
+        const ext = comptime scriptExtension() orelse return error.HotReloadUnsupported;
+        if (root_count >= max_watch_roots) return error.TooManyWatchRoots;
+        roots[root_count] = .{ .watcher = watch.Watcher.init(io, dir, ext) };
+        root_count += 1;
+        gpa = allocator;
+        countdown = 0;
     }
 
-    /// Poll now and reload every changed script; returns how many
-    /// reloaded clean. Public so tests (and a future studio push) can
-    /// force a deterministic poll; the tick path calls it on the
-    /// `poll_interval_ticks` cadence.
+    /// Stop polling every root. Handles `watchDir` opened here are
+    /// closed; `watchOpenedDir` handles are the caller's to close.
+    /// Already-reloaded sources stay live (the registry points at them).
+    pub fn stopWatching() void {
+        for (roots[0..root_count]) |*r| {
+            if (r.opened_here) r.watcher.dir.close(r.watcher.io);
+        }
+        root_count = 0;
+        countdown = 0;
+        last_wall_poll = null;
+    }
+
+    /// Poll every root now and reload every changed script; returns how
+    /// many reloaded clean. Public so tests (and a future studio push)
+    /// can force a deterministic poll; the cadence paths (`pumpTick`,
+    /// `pumpFrame`) call it throttled. Roots are independent: one root's
+    /// scan abort or read failure never stalls another's drain.
     pub fn pump() usize {
-        const w = if (watcher) |*ptr| ptr else return 0;
+        var reloaded: usize = 0;
+        for (roots[0..root_count]) |*r| reloaded += pumpRoot(&r.watcher);
+        return reloaded;
+    }
+
+    /// One root's lossless drain (the PR #47 loop, per root now).
+    fn pumpRoot(w: *watch.Watcher) usize {
         var changes: [16]watch.Change = undefined;
         var reloaded: usize = 0;
         // Drain: a FULL batch means the watcher may be sitting on more
@@ -378,15 +491,43 @@ pub const hot_reload = struct {
         ) catch null;
     }
 
-    /// Called from Controller.tick (comptime-gated there).
+    /// Called from Controller.tick (comptime-gated there) — the LEGACY
+    /// pump path, tick-counted. Kept because generated mains splice
+    /// `Controller.tick` inside the frame loop's `scaled_dt > 0` gate:
+    /// on assemblers predating the `pumpFrame` splice this is the only
+    /// pump there is (and it pauses with the game — the #51 gap).
     fn pumpTick() void {
-        if (watcher == null) return;
+        if (root_count == 0) return;
         if (countdown > 0) {
             countdown -= 1;
             return;
         }
         countdown = poll_interval_ticks - 1;
         _ = pump();
+    }
+
+    /// The WALL-CLOCK pump (labelle-scripting#51): poll at most once per
+    /// `poll_interval_ms` of REAL time, however often (or rarely) it is
+    /// called. THE pre-timescale seam: generated dev mains call this
+    /// every frame OUTSIDE the `scaled_dt > 0` gate — the generated
+    /// frame loop skips `Controller.tick` entirely at `time_scale == 0`,
+    /// so the tick-counted pump above freezes exactly when a developer
+    /// pauses to edit. This one keeps reloading while paused. Safe
+    /// beside `pumpTick` (older splices, or both emitted): each is
+    /// throttled on its own cadence and `pump` itself is stat-cheap, so
+    /// double-pumping is a few extra stats per second at worst.
+    /// Returns how many scripts reloaded clean this call.
+    pub fn pumpFrame() usize {
+        if (root_count == 0) return 0;
+        // Any root's io reaches the monotonic clock (`.awake` — macOS
+        // CLOCK_UPTIME_RAW / Linux CLOCK_MONOTONIC via std.Io.Threaded).
+        const io = roots[0].watcher.io;
+        const now = std.Io.Timestamp.now(io, .awake);
+        if (last_wall_poll) |prev| {
+            if (prev.durationTo(now).toMilliseconds() < poll_interval_ms) return 0;
+        }
+        last_wall_poll = now;
+        return pump();
     }
 
     /// Route one freshly read source through `reloadScript`, managing
