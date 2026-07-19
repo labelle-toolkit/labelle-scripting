@@ -207,6 +207,38 @@ module Labelle
     nil
   end
 
+  # ── batched query (the whole-query fast path) ────────────────────────
+  # `batch_get(names, arr)` fills `arr` with every matching entity's scalar
+  # component data as a flat f32 array — [c0_f0, c0_f1, ..., c1_f0, ...] per
+  # entity, components in `names` order, fields in declaration order — and
+  # returns the entity COUNT (`arr` is trimmed to exactly count*stride).
+  # ONE FFI crossing for the whole query instead of a get per entity. Reuse
+  # the SAME `arr` across ticks (it grows once, keeps its capacity).
+  # `batch_set(names, arr, n)` writes the mutated `arr` back in ONE crossing
+  # (the host re-queries the same entities, same order). The caller owns the
+  # positional layout: the stride (fields-per-entity) must match how the
+  # host walks the named components.
+  #
+  # Refusals are LOUD (contract v1.3):
+  #   - a named component with an INT-typed field raises ArgumentError —
+  #     i64/u64 cannot ride the f32 stream without silent corruption; keep
+  #     such components on per-entity get/set (their packed codec is
+  #     lossless).
+  #   - do NOT spawn or destroy entities between a paired batch_get and
+  #     batch_set: batch_set raises RuntimeError when the entity set no
+  #     longer matches the buffer (re-run batch_get and recompute).
+  #   - on a game built against a pre-v1.3 engine (labelle-engine < 2.6.0)
+  #     BOTH calls raise RuntimeError ("host engine lacks batch support")
+  #     — there is no batch fallback; use per-entity get/set there. The
+  #     per-entity into:/set fast paths degrade to JSON silently instead.
+  def self.batch_get(names, arr)
+    raw_batch_get(json_encode(names), arr)
+  end
+
+  def self.batch_set(names, arr, n)
+    raw_batch_set(json_encode(names), arr, n)
+  end
+
   # ── per-script method harvest (called by vm.zig) ─────────────────────
 
   # Baseline of Object's OWN (public + private) instance methods, taken

@@ -254,6 +254,471 @@ export fn labelle_component_remove(id: u64, name: [*]const u8, name_len: usize) 
     return 0; // absent-but-known removes are ok (idempotent)
 }
 
+// ── contract exports: bulk component access (contract v1.3, #41) ─────────
+//
+// The packed per-component codec and the batched whole-query f32 stream.
+// The engine host reflects its COMPTIME component registry for field
+// types; the mock declares the same knowledge as data (the schema table
+// below). A component NOT in the table plays the "non-packable" role —
+// 0xFF sentinel on get, -1 refusal on set, zero stream floats in a batch
+// — exactly like an engine component with non-scalar fields, which is
+// what keeps every JSON-fallback path testable against this mock.
+
+const PackedKind = enum { f32, i64, boolean, u64 };
+const PackedField = struct { name: []const u8, kind: PackedKind };
+const PackedType = struct { name: []const u8, fields: []const PackedField };
+
+const packed_types = [_]PackedType{
+    // One field of each packed scalar kind — the packed round-trip
+    // component, and (through its int fields) the batch-refusal one.
+    .{ .name = "Stats", .fields = &.{
+        .{ .name = "power", .kind = .f32 },
+        .{ .name = "score", .kind = .i64 },
+        .{ .name = "alive", .kind = .boolean },
+        .{ .name = "seed", .kind = .u64 },
+    } },
+    // Float-only pair — the batch round-trip components.
+    .{ .name = "BatchPos", .fields = &.{
+        .{ .name = "x", .kind = .f32 },
+        .{ .name = "y", .kind = .f32 },
+    } },
+    .{ .name = "BatchVel", .fields = &.{
+        .{ .name = "vx", .kind = .f32 },
+        .{ .name = "vy", .kind = .f32 },
+    } },
+};
+
+fn packedTypeOf(name: []const u8) ?*const PackedType {
+    for (&packed_types) |*t| {
+        if (std.mem.eql(u8, t.name, name)) return t;
+    }
+    return null;
+}
+
+fn typeHasIntField(t: *const PackedType) bool {
+    for (t.fields) |f| {
+        if (f.kind == .i64 or f.kind == .u64) return true;
+    }
+    return false;
+}
+
+fn payloadSize(kind: PackedKind) usize {
+    return switch (kind) {
+        .f32 => 4,
+        .i64, .u64 => 8,
+        .boolean => 1,
+    };
+}
+
+/// A scalar pulled out of a stored flat-JSON component (typed by token
+/// shape: the store is text, so int vs float is decided by the token).
+const ScalarVal = union(enum) { f: f64, i: i64, u: u64, b: bool };
+
+/// Scan a FLAT JSON object (the only shape the packable schemas store)
+/// for `"name":` and return the raw value token.
+fn jsonFieldToken(json: []const u8, name: []const u8) ?[]const u8 {
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, json, search, name)) |at| {
+        search = at + 1;
+        // Must be a quoted key followed by ':'.
+        if (at < 1 or json[at - 1] != '"') continue;
+        var p = at + name.len;
+        if (p >= json.len or json[p] != '"') continue;
+        p += 1;
+        while (p < json.len and (json[p] == ' ' or json[p] == '\t')) p += 1;
+        if (p >= json.len or json[p] != ':') continue;
+        p += 1;
+        while (p < json.len and (json[p] == ' ' or json[p] == '\t')) p += 1;
+        const start = p;
+        while (p < json.len and json[p] != ',' and json[p] != '}') p += 1;
+        return std.mem.trim(u8, json[start..p], " \t");
+    }
+    return null;
+}
+
+fn jsonScalar(json: []const u8, name: []const u8) ?ScalarVal {
+    const tok = jsonFieldToken(json, name) orelse return null;
+    if (tok.len == 0) return null;
+    if (std.mem.eql(u8, tok, "true")) return .{ .b = true };
+    if (std.mem.eql(u8, tok, "false")) return .{ .b = false };
+    const fractional = std.mem.indexOfAny(u8, tok, ".eE") != null;
+    if (!fractional) {
+        if (tok[0] == '-') {
+            if (std.fmt.parseInt(i64, tok, 10) catch null) |v| return .{ .i = v };
+        } else {
+            if (std.fmt.parseInt(u64, tok, 10) catch null) |v| return .{ .u = v };
+        }
+    }
+    if (std.fmt.parseFloat(f64, tok) catch null) |v| return .{ .f = v };
+    return null;
+}
+
+fn scalarToF32(v: ScalarVal) f32 {
+    return switch (v) {
+        .f => |x| @floatCast(x),
+        .i => |x| @floatFromInt(x),
+        .u => |x| @floatFromInt(x),
+        .b => |x| if (x) 1 else 0,
+    };
+}
+
+fn scalarToI64(v: ScalarVal) i64 {
+    return switch (v) {
+        // Saturating, never trapping: this is the GET/stream side reading
+        // HOST-owned stored text (whatever the JSON leniency let in).
+        .f => |x| if (!std.math.isFinite(x))
+            0
+        else if (x >= 9223372036854775808.0)
+            std.math.maxInt(i64)
+        else if (x < -9223372036854775808.0)
+            std.math.minInt(i64)
+        else
+            @intFromFloat(x),
+        .i => |x| x,
+        // The documented 64-bit two's-complement pair (see coerceForKind).
+        .u => |x| @bitCast(x),
+        .b => |x| @intFromBool(x),
+    };
+}
+
+fn scalarToU64(v: ScalarVal) u64 {
+    return switch (v) {
+        .f => |x| if (!std.math.isFinite(x) or x < 0)
+            0
+        else if (x >= 18446744073709551616.0)
+            std.math.maxInt(u64)
+        else
+            @intFromFloat(x),
+        // The documented 64-bit two's-complement pair (see coerceForKind).
+        .i => |x| @bitCast(x),
+        .u => |x| x,
+        .b => |x| @intFromBool(x),
+    };
+}
+
+fn scalarToBool(v: ScalarVal) bool {
+    return switch (v) {
+        .f => |x| x != 0,
+        .i => |x| x != 0,
+        .u => |x| x != 0,
+        .b => |x| x,
+    };
+}
+
+/// Append one schema field's JSON ("name":value) from its ScalarVal —
+/// the shared serializer for set_packed and batch_set (schema order,
+/// value coerced into the field's kind).
+fn writeJsonField(w: *std.Io.Writer, f: PackedField, v: ScalarVal, first: bool) !void {
+    if (!first) try w.writeByte(',');
+    switch (f.kind) {
+        .f32 => try w.print("\"{s}\":{d}", .{ f.name, scalarToF32(v) }),
+        .i64 => try w.print("\"{s}\":{d}", .{ f.name, scalarToI64(v) }),
+        .u64 => try w.print("\"{s}\":{d}", .{ f.name, scalarToU64(v) }),
+        .boolean => try w.print("\"{s}\":{}", .{ f.name, scalarToBool(v) }),
+    }
+}
+
+fn defaultScalar(kind: PackedKind) ScalarVal {
+    return switch (kind) {
+        .f32 => .{ .f = 0 },
+        .i64 => .{ .i = 0 },
+        .u64 => .{ .u = 0 },
+        .boolean => .{ .b = false },
+    };
+}
+
+/// The engine host's packed-SET refusal semantics, mirrored (round-1
+/// panic-safety hardening): a tagged value the target field cannot
+/// represent — negative into u64, u64 past maxInt(i64) into i64, a
+/// non-finite or out-of-range float into either int kind — makes the
+/// whole set REFUSE (-1) so the binding falls back to JSON, which
+/// surfaces the value faithfully. Never clamp/zero on the SET path;
+/// the clamping scalarTo* helpers above serve only the GET/stream side
+/// (host-owned data).
+fn coerceForKind(kind: PackedKind, v: ScalarVal) ?ScalarVal {
+    switch (kind) {
+        .f32, .boolean => return v, // total: float accepts all, bool compares
+        .i64 => switch (v) {
+            // Engine parity: the 64-BIT BITCAST PAIR — the other 64-bit
+            // tag lands via two's-complement bitcast (lossless round trip
+            // for signed-only bindings), never a range refusal.
+            .u => |x| return .{ .i = @bitCast(x) },
+            .f => |x| return if (!std.math.isFinite(x) or
+                x < -9223372036854775808.0 or x >= 9223372036854775808.0) null else v,
+            else => return v,
+        },
+        .u64 => switch (v) {
+            .i => |x| return .{ .u = @bitCast(x) },
+            .f => |x| return if (!std.math.isFinite(x) or
+                x < 0 or x >= 18446744073709551616.0) null else v,
+            else => return v,
+        },
+    }
+}
+
+export fn labelle_component_get_packed(
+    id: u64,
+    name: [*]const u8,
+    name_len: usize,
+    out: ?[*]u8,
+    out_cap: usize,
+) usize {
+    const e = world.find(id) orelse return 0;
+    const n = name[0..@min(name_len, NAME_CAP)];
+    const json = blk: {
+        for (e.comps[0..e.comp_count]) |*comp| {
+            if (std.mem.eql(u8, comp.nameSlice(), n)) break :blk comp.jsonSlice();
+        }
+        return 0; // absent keeps the JSON get's 0 sentinel
+    };
+    const buf: []u8 = if (out) |p| p[0..out_cap] else &.{};
+    const t = packedTypeOf(n) orelse {
+        // Not in the schema table = the engine's "non-scalar component":
+        // the single 0xFF sentinel byte → the binding falls back to JSON.
+        if (buf.len >= 1) buf[0] = 0xFF;
+        return 1;
+    };
+    // Required-size / all-or-nothing, like the JSON get.
+    var required: usize = 1;
+    for (t.fields) |f| required += 1 + f.name.len + 1 + payloadSize(f.kind);
+    if (required > buf.len) return required;
+    var w: usize = 0;
+    buf[w] = @intCast(t.fields.len);
+    w += 1;
+    for (t.fields) |f| {
+        buf[w] = @intCast(f.name.len);
+        w += 1;
+        @memcpy(buf[w..][0..f.name.len], f.name);
+        w += f.name.len;
+        const v = jsonScalar(json, f.name) orelse defaultScalar(f.kind);
+        switch (f.kind) {
+            .f32 => {
+                buf[w] = 0;
+                std.mem.writeInt(u32, buf[w + 1 ..][0..4], @bitCast(scalarToF32(v)), .little);
+                w += 5;
+            },
+            .i64 => {
+                buf[w] = 1;
+                std.mem.writeInt(i64, buf[w + 1 ..][0..8], scalarToI64(v), .little);
+                w += 9;
+            },
+            .boolean => {
+                buf[w] = 2;
+                buf[w + 1] = @intFromBool(scalarToBool(v));
+                w += 2;
+            },
+            .u64 => {
+                buf[w] = 3;
+                std.mem.writeInt(u64, buf[w + 1 ..][0..8], scalarToU64(v), .little);
+                w += 9;
+            },
+        }
+    }
+    return required;
+}
+
+export fn labelle_component_set_packed(
+    id: u64,
+    name: [*]const u8,
+    name_len: usize,
+    buf_ptr: ?[*]const u8,
+    buf_len: usize,
+) i32 {
+    if (world.find(id) == null) return -1;
+    const n = name[0..@min(name_len, NAME_CAP)];
+    const t = packedTypeOf(n) orelse return -1; // non-packable → JSON fallback
+    const buf = (buf_ptr orelse return -1)[0..buf_len];
+    if (buf.len < 1 or buf[0] == 0xFF) return -1;
+    // REPLACE semantics: defaults first, then apply matched record fields.
+    var vals: [8]ScalarVal = undefined;
+    for (t.fields, 0..) |f, i| vals[i] = defaultScalar(f.kind);
+    const field_count = buf[0];
+    var pos: usize = 1;
+    var i: usize = 0;
+    while (i < field_count) : (i += 1) {
+        if (pos >= buf.len) return -1;
+        const nlen = buf[pos];
+        pos += 1;
+        if (pos + nlen > buf.len) return -1;
+        const fname = buf[pos..][0..nlen];
+        pos += nlen;
+        if (pos >= buf.len) return -1;
+        const tag = buf[pos];
+        pos += 1;
+        var v: ScalarVal = undefined;
+        switch (tag) {
+            0 => {
+                if (pos + 4 > buf.len) return -1;
+                v = .{ .f = @as(f32, @bitCast(std.mem.readInt(u32, buf[pos..][0..4], .little))) };
+                pos += 4;
+            },
+            1 => {
+                if (pos + 8 > buf.len) return -1;
+                v = .{ .i = std.mem.readInt(i64, buf[pos..][0..8], .little) };
+                pos += 8;
+            },
+            2 => {
+                if (pos + 1 > buf.len) return -1;
+                v = .{ .b = buf[pos] != 0 };
+                pos += 1;
+            },
+            3 => {
+                if (pos + 8 > buf.len) return -1;
+                v = .{ .u = std.mem.readInt(u64, buf[pos..][0..8], .little) };
+                pos += 8;
+            },
+            else => return -1,
+        }
+        for (t.fields, 0..) |f, fi| {
+            if (std.mem.eql(u8, f.name, fname)) {
+                // Engine parity: an unrepresentable value refuses the
+                // WHOLE set — the binding then falls back to JSON.
+                vals[fi] = coerceForKind(f.kind, v) orelse return -1;
+            }
+        }
+    }
+    // Engine parity: bytes past the declared field records are a
+    // malformed buffer — refuse, don't half-accept.
+    if (pos != buf.len) return -1;
+    // Serialize in schema order and store through the shared path.
+    var jbuf: [JSON_CAP]u8 = undefined;
+    var w = std.Io.Writer.fixed(&jbuf);
+    w.writeByte('{') catch return -1;
+    for (t.fields, 0..) |f, fi| {
+        writeJsonField(&w, f, vals[fi], fi == 0) catch return -1;
+    }
+    w.writeByte('}') catch return -1;
+    setComponent(id, n, w.buffered());
+    return 0;
+}
+
+/// `labelle_component_batch_get`'s int-field refusal sentinel — C's
+/// `(size_t)-2`, matching the header's LABELLE_BATCH_INT_REFUSED.
+pub const batch_int_refused: usize = std.math.maxInt(usize) - 1;
+
+/// Tokenize a batch/query names array (the mock's forgiving parse).
+fn parseNames(input: []const u8, storage: *[8][]const u8) ?[]const []const u8 {
+    if (std.mem.indexOfScalar(u8, input, '[') == null) return null;
+    var n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, input, "[]\", \t");
+    while (it.next()) |tok| {
+        if (n >= storage.len) break;
+        storage[n] = tok;
+        n += 1;
+    }
+    if (n == 0) return null;
+    return storage[0..n];
+}
+
+export fn labelle_component_batch_get(
+    names_json: [*]const u8,
+    names_json_len: usize,
+    out: ?[*]u8,
+    out_cap: usize,
+) usize {
+    var storage: [8][]const u8 = undefined;
+    const names = parseNames(names_json[0..names_json_len], &storage) orelse return 0;
+    // Int-field refusal decides before any other outcome (the engine's
+    // order): i64/u64 cannot ride the f32 stream without corruption.
+    for (names) |nm| {
+        if (packedTypeOf(nm)) |t| {
+            if (typeHasIntField(t)) return batch_int_refused;
+        }
+    }
+    const buf: []u8 = if (out) |p| p[0..out_cap] else &.{};
+    var count: u32 = 0;
+    var pos: usize = 4; // the u32 count header
+    outer: for (world.entities[0..world.entity_count]) |*e| {
+        if (!e.alive) continue;
+        for (names) |nm| {
+            if (!entityHas(e, nm)) continue :outer;
+        }
+        count += 1;
+        for (names) |nm| {
+            // Schema-less components contribute zero floats (the engine's
+            // skipped non-scalar fields), keeping get and set aligned.
+            const t = packedTypeOf(nm) orelse continue;
+            const json = blk: {
+                for (e.comps[0..e.comp_count]) |*comp| {
+                    if (std.mem.eql(u8, comp.nameSlice(), nm)) break :blk comp.jsonSlice();
+                }
+                unreachable; // entityHas guaranteed presence
+            };
+            for (t.fields) |f| {
+                const v = jsonScalar(json, f.name) orelse defaultScalar(f.kind);
+                if (pos + 4 <= buf.len) {
+                    std.mem.writeInt(u32, buf[pos..][0..4], @bitCast(scalarToF32(v)), .little);
+                }
+                pos += 4; // advance past the cap: required-size return
+            }
+        }
+    }
+    if (buf.len >= 4) std.mem.writeInt(u32, buf[0..4], count, .little);
+    return pos;
+}
+
+export fn labelle_component_batch_set(
+    names_json: [*]const u8,
+    names_json_len: usize,
+    buf_ptr: ?[*]const u8,
+    buf_len: usize,
+) i32 {
+    var storage: [8][]const u8 = undefined;
+    const names = parseNames(names_json[0..names_json_len], &storage) orelse return -1;
+    for (names) |nm| {
+        if (packedTypeOf(nm)) |t| {
+            if (typeHasIntField(t)) return -2; // the get sentinel's i32 twin
+        }
+    }
+    const buf = if (buf_ptr) |p| p[0..buf_len] else &[_]u8{};
+    // PREFLIGHT (engine parity): size the re-queried set FIRST and refuse
+    // BEFORE any write on mismatch — a refused batch_set performs no
+    // writes, so the documented "re-get and recompute" retry can never
+    // double-apply a prefix.
+    var expected: usize = 0;
+    outer_pre: for (world.entities[0..world.entity_count]) |*e| {
+        if (!e.alive) continue;
+        for (names) |nm| {
+            if (!entityHas(e, nm)) continue :outer_pre;
+        }
+        for (names) |nm| {
+            const t = packedTypeOf(nm) orelse continue;
+            expected += t.fields.len * 4;
+        }
+    }
+    if (expected != buf.len) return -1;
+    var pos: usize = 0; // pure f32 stream, no header
+    outer: for (world.entities[0..world.entity_count]) |*e| {
+        if (!e.alive) continue;
+        for (names) |nm| {
+            if (!entityHas(e, nm)) continue :outer;
+        }
+        for (names) |nm| {
+            const t = packedTypeOf(nm) orelse continue;
+            // Batch-eligible schemas are float/bool only (ints refused
+            // above), so each field consumes exactly one f32.
+            var jbuf: [JSON_CAP]u8 = undefined;
+            var w = std.Io.Writer.fixed(&jbuf);
+            w.writeByte('{') catch return -1;
+            for (t.fields, 0..) |f, fi| {
+                if (pos + 4 > buf.len) return -1; // belt: preflight sized this
+                const fv: f32 = @bitCast(std.mem.readInt(u32, buf[pos..][0..4], .little));
+                pos += 4;
+                const v: ScalarVal = switch (f.kind) {
+                    .boolean => .{ .b = fv != 0 },
+                    else => .{ .f = fv },
+                };
+                writeJsonField(&w, f, v, fi == 0) catch return -1;
+            }
+            w.writeByte('}') catch return -1;
+            setComponent(e.id, nm, w.buffered());
+        }
+    }
+    // Belt on top of the preflight.
+    if (pos != buf.len) return -1;
+    return 0;
+}
+
 // ── contract exports: queries ────────────────────────────────────────────
 
 export fn labelle_query(
@@ -409,6 +874,24 @@ pub fn hostEmit(name: []const u8, json: []const u8) void {
     w.print("{s} {s}", .{ name, json }) catch return;
     ev.len = w.buffered().len;
     world.inbox_count += 1;
+}
+
+/// Direct-call seams for the engine-parity tests — the `export fn`s are
+/// not `pub`, so the suite reaches the same code through these.
+pub fn createEntityDirect() u64 {
+    return labelle_entity_create();
+}
+
+pub fn setComponentDirect(id: u64, name: []const u8, json: []const u8) void {
+    setComponent(id, name, json);
+}
+
+pub fn setPackedDirect(id: u64, name: []const u8, buf: []const u8) i32 {
+    return labelle_component_set_packed(id, name.ptr, name.len, buf.ptr, buf.len);
+}
+
+pub fn batchSetDirect(names_json: []const u8, buf: []const u8) i32 {
+    return labelle_component_batch_set(names_json.ptr, names_json.len, buf.ptr, buf.len);
 }
 
 /// The stored JSON of a component, or null when entity/component is gone.
