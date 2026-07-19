@@ -246,16 +246,22 @@ pub fn build(b: *std.Build) void {
 
     // The engine STUB behind src/contract.zig's `host_has_bulk_access`
     // comptime probe (contract v1.3, #41). Generated games get the REAL
-    // labelle-engine module from the assembler's plugin wiring; this
-    // repo's own builds are engine-free, so a one-decl stand-in carrying
-    // the v1.3 marker answers the probe — TRUE, matching the mock world,
-    // which exports the four bulk-access symbols. See the stub's doc.
+    // labelle-engine module from the assembler's plugin wiring — the
+    // generated build.zig's `overrideImport(plugin_scripting_mod,
+    // "labelle-engine", engine_mod)` unconditionally installs it (getOrPut:
+    // replaces an existing entry, ADDS a missing one) — so the stub is
+    // wired into the in-repo TEST modules ONLY, never the exported
+    // `labelle_scripting` module above: a consumer that somehow bypassed
+    // the assembler wiring fails LOUDLY ("no module named
+    // 'labelle-engine'") instead of silently compiling bulk-capable
+    // against a host that may not export the symbols. In tests the stub's
+    // v1.3 marker answers the probe TRUE, matching the mock world (which
+    // exports the four bulk-access symbols). See the stub's doc.
     const engine_stub_mod = b.createModule(.{
         .root_source_file = b.path("src/engine_stub.zig"),
         .target = target,
         .optimize = optimize,
     });
-    scripting_mod.addImport("labelle-engine", engine_stub_mod);
 
     // The extractor CORE as a named module for the tests below: tests/ is
     // its own module root, so tools/declare/extract.zig can't be reached by

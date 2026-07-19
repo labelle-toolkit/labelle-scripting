@@ -177,9 +177,9 @@ What the numbers prove:
 - **Prototype is f32-only for the batch path.** Fields are coerced to/from `f32` in the flat stream. Production should either (a) key the stream by a per-component field-type descriptor, or (b) restrict `batch_*` to declared-scalar components and document the coercion. The single-component packed codec already handles i64/u64/bool/f32 with tags.
 - **Positional coupling.** `batch_get`/`batch_set` assume the query returns the same entities in the same order within a tick (true when no spawn/destroy happens between the two calls). A safer variant would embed entity ids and match on write; measure the cost of the id column before adopting.
 - **Layout is script-owned.** The script hardcodes the `[px,py,vx,vy]` stride from the `NAMES` order. A typed helper (`Labelle.batch(NAMES) { |view| ... }`) could hide the offsets without reintroducing per-entity dispatch — design TBD.
-- **Type generality of packed SET.** The host requires a component to be fully default-constructible (`var comp: T = .{}`) to apply a partial packed write with REPLACE semantics; components without full field defaults fall back to JSON.
-- **Test surface.** `tests/mock_world.zig` must export the new `labelle_component_*_packed` / `_batch_*` symbols (it already lags the packed/input/plugin_call exports).
-- **Versioning.** These are additive to `SUPPORTED_CONTRACT_VERSION`; bindings must `@hasDecl`-gate the new externs so a game built against an older host degrades to JSON rather than failing to link.
+- **Type generality of packed SET.** The host requires a component to be fully default-constructible (`var comp: T = .{}`) to apply a partial packed write with REPLACE semantics; components without full field defaults fall back to JSON. (The BATCH set has no such requirement — stage 1 made it read-modify-write.)
+- **Test surface.** RESOLVED in stage 1: `tests/mock_world.zig` exports the four symbols behind a field-type schema table mirroring the engine host's semantics (refusals, preflight, bitcast pair included).
+- **Versioning.** RESOLVED in stage 1 — see "Decisions" below for the one shipped mechanism: additive to the major version, detected by the comptime engine-module probe `contract.host_has_bulk_access` (NOT by `@hasDecl` on the externs, which cannot see host exports).
 
 ## Implementation status
 
@@ -197,7 +197,7 @@ Prototyped end-to-end and measured in local worktrees:
 2. Land **`batch_get`/`batch_set`** as the contract primitive, plus the thin per-language `batch_get`/`batch_set` wrappers; keep f32-only + document, or add the field-type descriptor.
 3. Add the **block/closure iterator** ergonomic layer per language (`Labelle.batch(names) { |e| ... }`, C# `world.Batch<..>((ref ..) => ..)`); measure the interpreted-block tax vs the raw flat loop.
 4. Port the binding changes to Lua / TypeScript (the contract is shared; only the per-language decode differs).
-5. Add mock-world exports + a contract-version bump with `@hasDecl` gates.
+5. ~~Add mock-world exports + capability gating~~ — DONE in stage 1: mock exports landed, and capability detection shipped as the comptime engine-module probe (see Decisions; the contract major stays 1, the exports are "since v1.3").
 6. Ship one batched example per language as a permanent perf regression net.
 
 ## Decisions (stage 1)
@@ -216,15 +216,28 @@ this repo's `feat/bulk-component-access`, contract **v1.3**):
   component list** — loud, never a silent JSON fallback. Int-carrying
   components keep the per-entity paths (the packed codec carries ints
   losslessly).
-- **Positional coupling gets a cheap count guard.** `batch_set` re-resolves
-  the query and refuses `-1` unless `buf_len` EXACTLY matches the
-  re-queried set's stream size, catching any spawn/destroy between the
-  paired calls that changes the entity count (a same-count membership/order
-  change remains undetectable — the "no spawn/destroy between get and set"
-  rule stands). The Ruby binding raises RuntimeError on `-1` ("re-run
-  batch_get and recompute") and trims the reused Array to exactly
-  count×stride after each `batch_get` so a shrinking set never ships stale
-  trailing floats.
+- **Positional coupling gets a cheap count guard — now a PREFLIGHT.**
+  `batch_set` sizes the re-resolved query BEFORE writing anything and
+  refuses `-1` with NO writes unless `buf_len` matches exactly, catching
+  any spawn/destroy between the paired calls that changes the entity count
+  (a same-count membership/order change remains undetectable — the "no
+  spawn/destroy between get and set" rule stands; the id-column variant
+  stays a measured follow-up). The Ruby binding raises RuntimeError on
+  `-1` ("re-run batch_get and recompute" — safe to retry, nothing was
+  applied) and trims the reused Array to exactly count×stride after each
+  `batch_get` so a shrinking set never ships stale trailing floats.
+- **Batch set is READ-MODIFY-WRITE (get/set symmetry).** Everything
+  `batch_get` emits is writable: the host fetches each queried component,
+  overwrites only the stream-carried scalar fields, preserves non-scalar
+  fields, and applies through the per-entity channels (scene built-ins
+  included — a batched Camera zoom routes through the scene apply
+  machinery). No default-constructibility is required on the batch path.
+- **Packed codec hardening.** f64 fields are NOT packable (the wire only
+  has an f32 tag; 0xFF/JSON keeps the precision); trailing bytes after
+  the declared fields refuse; and 64-bit int fields accept the OTHER
+  64-bit tag via two's-complement bitcast — the documented lossless pair
+  that lets a signed-only binding (mruby) round-trip bit-63 u64 values
+  exactly (GET tag 3 → signed bitcast → SET tag 1 → host bitcasts back).
 - **Id column deferred pending measurement.** The safer embed-entity-ids
   variant stays out until the cost of the id column is measured against the
   305 ns/entity baseline.

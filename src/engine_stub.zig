@@ -1,5 +1,9 @@
 //! Stand-in for the generated game's real `labelle-engine` module in this
-//! repo's own test binaries (and the exported module skeleton).
+//! repo's own TEST binaries only — deliberately NOT wired into the
+//! exported `labelle_scripting` module (see build.zig: the assembler's
+//! `overrideImport` installs the real engine there, and a consumer that
+//! bypassed that wiring must fail loudly, not compile bulk-capable
+//! against an unknown host).
 //!
 //! Production games get the REAL engine module as a dep of the scripting
 //! module (the assembler's `-Mscripting … --dep labelle-engine` wiring);

@@ -138,9 +138,15 @@ pub extern fn labelle_component_get_packed(
 
 /// PACKED (binary) fast-path twin of `labelle_component_set` (since
 /// v1.3). Applies a packed record (the `_get_packed` format) to the named
-/// component, coercing each field into its real scalar type. REPLACE
-/// semantics. 0 = ok; -1 = unknown/dead/refused (non-scalar target — fall
-/// back to `labelle_component_set`) / malformed / not bound.
+/// component, coercing each field into its real scalar type — including
+/// the 64-BIT BITCAST PAIR (an i64 tag lands in a u64 field, and vice
+/// versa, via two's-complement bitcast), which is what makes GET(tag 3 →
+/// signed Integer bitcast) → SET(tag 1 → host bitcasts back) LOSSLESS
+/// for u64 fields with bit 63 set in a signed-only binding like mruby.
+/// REPLACE semantics. 0 = ok; -1 = unknown/dead/refused (non-scalar or
+/// f64 target, out-of-range value into a narrower int field, trailing
+/// bytes — fall back to `labelle_component_set`) / malformed / not
+/// bound.
 pub extern fn labelle_component_set_packed(
     id: u64,
     name: [*]const u8,
@@ -180,17 +186,20 @@ pub extern fn labelle_component_batch_get(
 ) usize;
 
 /// BATCHED (binary) component write — twin of `labelle_component_batch_get`
-/// (since v1.3). RE-QUERIES the same entity set in the same order and reads
-/// the f32 stream positionally (`buf` is the pure f32 stream — NO count
-/// header; the host's re-query drives entity count), converting each f32
-/// back into its field's real scalar type (REPLACE semantics).
+/// (since v1.3). RE-QUERIES the same entity set in the same order and
+/// applies the f32 stream positionally (`buf` is the pure f32 stream — NO
+/// count header; the host's re-query drives entity count),
+/// READ-MODIFY-WRITE per component: only the scalar fields the stream
+/// carries are overwritten (the mirror of what `_batch_get` emitted —
+/// get/set symmetry, built-ins included), non-scalar fields keep their
+/// existing values.
 ///
-/// POSITIONAL-COUPLING GUARD: `buf_len` must EXACTLY match the re-queried
-/// set's stream size (count × stride × 4); a mismatch means the entity set
-/// changed since the paired `_batch_get` (spawn/destroy between the two
-/// calls — forbidden) and the write is refused with -1. Entities walked
-/// before the mismatch was detected keep their writes: treat -1 as
-/// "re-get and recompute".
+/// POSITIONAL-COUPLING GUARD (PREFLIGHT): the host sizes the re-queried
+/// set BEFORE writing anything and refuses -1 with NO writes unless
+/// `buf_len` matches exactly (count × stride × 4); a mismatch means the
+/// entity set changed since the paired `_batch_get` (spawn/destroy
+/// between the two calls — forbidden). On -1 nothing was applied: re-get
+/// and recompute.
 ///
 /// 0 = ok; -1 = malformed names / entity-count mismatch / not bound;
 /// -2 = int-typed field in a named component (BATCH_INT_REFUSED's i32

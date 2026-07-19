@@ -502,6 +502,17 @@ fn rawComponentSetFrom(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
             const v = c.mrb_funcall_argv(mrb, a.inst, syms.aref, 1, &idx);
             switch (v.tt) {
                 .float => {
+                    // Non-finite PARITY with the JSON route: `encodeValue`
+                    // raises ("json_encode: non-finite number"), so the
+                    // packed fast path must never smuggle a NaN/Inf into
+                    // the host that the JSON encoder would refuse — break
+                    // to the JSON fallback and let encodeValue raise the
+                    // one canonical error for both routes. (A FINITE
+                    // out-of-f32-range f64 is fine either way: @floatCast
+                    // saturates — a defined, non-trapping conversion — and
+                    // the JSON route's f64 text parses to the same
+                    // saturated f32 in the host field.)
+                    if (!std.math.isFinite(v.value.f)) break :pk;
                     rec[w] = 0;
                     w += 1;
                     const f: f32 = @floatCast(v.value.f);

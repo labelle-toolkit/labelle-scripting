@@ -1232,19 +1232,21 @@ test "bulk v1.3: batch_set raises when the entity set changed since batch_get" {
 
 test "bulk v1.3: an unrepresentable packed value falls back to JSON end-to-end" {
     fresh();
-    // seed is a u64 in the mock's Stats schema; a Ruby -1 cannot
-    // represent itself there, so the host REFUSES the packed set (-1,
-    // engine round-1 parity: refuse, never clamp) and the binding falls
-    // back to the JSON path — which stores the value faithfully.
+    // score is an i64 in the mock's Stats schema; a Ruby Float 1.0e30 is
+    // finite but out of i64 range, so the host REFUSES the packed set
+    // (-1, engine parity: refuse, never clamp) and the binding falls
+    // back to the JSON path — which encodes the value faithfully.
+    // (A Ruby -1 into the u64 seed is NOT this case any more: the
+    // 64-bit two's-complement bitcast pair accepts it losslessly.)
     scripting.registerScript("packed_range",
         \\Stats = Labelle::Component.ref("Stats", :power, :score, :alive, :seed)
         \\def init
         \\  e = Labelle::Entity.create
         \\  s = Stats.new
         \\  s.power = 1.5
-        \\  s.score = 5
+        \\  s.score = 1.0e30
         \\  s.alive = true
-        \\  s.seed = -1
+        \\  s.seed = 9
         \\  raise "set failed" unless e.set(s)
         \\  Labelle.log("range done")
         \\end
@@ -1255,6 +1257,130 @@ test "bulk v1.3: an unrepresentable packed value falls back to JSON end-to-end" 
     try expect(mock.logsContain("range done"));
     // SORTED keys = the JSON encoder wrote it (the packed set stores
     // schema order: power,score,alive,seed) — proof the refusal engaged
-    // the fallback, and the out-of-range value survived untouched.
-    try expectComponent(1, "Stats", "{\"alive\":true,\"power\":1.5,\"score\":5,\"seed\":-1}");
+    // the fallback. Order-assert instead of byte-assert: the encoder's
+    // 1.0e30 rendering is not part of this pin.
+    const json = mock.componentJson(1, "Stats") orelse return error.TestExpectedComponent;
+    const ia = std.mem.indexOf(u8, json, "\"alive\"") orelse return error.TestExpectedKey;
+    const ip = std.mem.indexOf(u8, json, "\"power\"") orelse return error.TestExpectedKey;
+    const isc = std.mem.indexOf(u8, json, "\"score\"") orelse return error.TestExpectedKey;
+    const isd = std.mem.indexOf(u8, json, "\"seed\"") orelse return error.TestExpectedKey;
+    try expect(ia < ip and ip < isc and isc < isd);
+}
+
+test "bulk v1.3: the 64-bit bitcast pair round-trips a bit-63 u64 through Ruby" {
+    fresh();
+    // seed (u64 schema kind) holds 0x8000000000000001 — Ruby's only
+    // integer is signed 64-bit, so the value travels as its bitcast
+    // -9223372036854775807 through the whole packed cycle: GET emits tag
+    // 3, decodePackedInto bitcasts to the signed Integer, SET re-emits
+    // tag 1, the host bitcasts back — bit-exact end to end.
+    scripting.registerScript("packed_u64",
+        \\Stats = Labelle::Component.ref("Stats", :power, :score, :alive, :seed)
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  s = Stats.new
+        \\  s.power = 0.0
+        \\  s.score = 0
+        \\  s.alive = false
+        \\  s.seed = -9223372036854775807 # bitcast of 0x8000000000000001
+        \\  raise "set failed" unless e.set(s)
+        \\  s2 = Stats.new
+        \\  raise "get_into failed" if e.get_into(Stats, s2).nil?
+        \\  Labelle.log("u64rt:#{s2.seed == -9223372036854775807}")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("u64rt:true"));
+    // The host stored the UNSIGNED value (the packed set's schema-order
+    // serialization proves the packed path carried it, not JSON).
+    try expectComponent(1, "Stats", "{\"power\":0,\"score\":0,\"alive\":false,\"seed\":9223372036854775809}");
+}
+
+test "bulk v1.3: non-finite floats take the same refusal on the packed and JSON routes" {
+    fresh();
+    // Parity pin: the JSON encoder raises ArgumentError
+    // ("json_encode: non-finite number") on NaN/Inf. The packed fast
+    // path must not smuggle those into the host, so it breaks to the
+    // JSON fallback — which raises the SAME canonical error. Both
+    // routes agree: one refusal, nothing stored.
+    scripting.registerScript("packed_nonfinite",
+        \\Stats = Labelle::Component.ref("Stats", :power, :score, :alive, :seed)
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  s = Stats.new
+        \\  s.power = Float::NAN
+        \\  s.score = 0
+        \\  s.alive = false
+        \\  s.seed = 0
+        \\  begin
+        \\    e.set(s)
+        \\    Labelle.log("nan accepted")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("nan refused: #{ex.message}")
+        \\  end
+        \\  begin
+        \\    e.set("Stats", power: Float::INFINITY)
+        \\    Labelle.log("inf accepted")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("inf refused: #{ex.message}")
+        \\  end
+        \\  Labelle.log("nonfinite done")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("nan accepted"));
+    try expect(!mock.logsContain("inf accepted"));
+    // Same canonical message from both entry points (view fast path and
+    // Hash JSON path).
+    try expect(mock.logsContain("nan refused: labelle: json_encode: non-finite number"));
+    try expect(mock.logsContain("inf refused: labelle: json_encode: non-finite number"));
+    try expect(mock.logsContain("nonfinite done"));
+    // Nothing was stored by either refusal.
+    try expect(mock.componentJson(1, "Stats") == null);
+}
+
+test "bulk v1.3: mock engine-parity — packed trailing bytes refuse, batch_set preflights" {
+    fresh();
+    // Direct mock-export checks (the binding never produces these
+    // shapes): parity pins for the engine host's round-2 semantics.
+    const id = mock.createEntityDirect();
+
+    // Trailing bytes after the declared fields: -1, nothing stored.
+    // Record: count=1, "power", tag 0, f32 1.0 — then one garbage byte.
+    var rec: [64]u8 = undefined;
+    rec[0] = 1;
+    rec[1] = 5;
+    @memcpy(rec[2..7], "power");
+    rec[7] = 0;
+    std.mem.writeInt(u32, rec[8..12], @bitCast(@as(f32, 1.0)), .little);
+    const good_len = 12;
+    rec[good_len] = 0xAB;
+    try expectEqual(
+        @as(i32, -1),
+        mock.setPackedDirect(id, "Stats", rec[0 .. good_len + 1]),
+    );
+    try expect(mock.componentJson(id, "Stats") == null);
+    // The same record without the garbage applies.
+    try expectEqual(
+        @as(i32, 0),
+        mock.setPackedDirect(id, "Stats", rec[0..good_len]),
+    );
+
+    // batch_set PREFLIGHT: a mis-sized stream refuses BEFORE any write.
+    const id2 = mock.createEntityDirect();
+    mock.setComponentDirect(id2, "BatchPos", "{\"x\":1,\"y\":2}");
+    var stream: [12]u8 = undefined; // 3 floats for a stride-2 single entity
+    for (0..3) |i| std.mem.writeInt(u32, stream[i * 4 ..][0..4], @bitCast(@as(f32, 9)), .little);
+    try expectEqual(
+        @as(i32, -1),
+        mock.batchSetDirect("[\"BatchPos\"]", &stream),
+    );
+    // Preflight means NOTHING was written — x/y keep their values.
+    const bp = mock.componentJson(id2, "BatchPos") orelse return error.TestExpectedComponent;
+    try expect(std.mem.indexOf(u8, bp, "\"x\":1") != null);
+    try expect(std.mem.indexOf(u8, bp, "\"y\":2") != null);
 }

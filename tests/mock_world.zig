@@ -364,17 +364,33 @@ fn scalarToF32(v: ScalarVal) f32 {
 
 fn scalarToI64(v: ScalarVal) i64 {
     return switch (v) {
-        .f => |x| @intFromFloat(x),
+        // Saturating, never trapping: this is the GET/stream side reading
+        // HOST-owned stored text (whatever the JSON leniency let in).
+        .f => |x| if (!std.math.isFinite(x))
+            0
+        else if (x >= 9223372036854775808.0)
+            std.math.maxInt(i64)
+        else if (x < -9223372036854775808.0)
+            std.math.minInt(i64)
+        else
+            @intFromFloat(x),
         .i => |x| x,
-        .u => |x| if (x <= std.math.maxInt(i64)) @intCast(x) else 0,
+        // The documented 64-bit two's-complement pair (see coerceForKind).
+        .u => |x| @bitCast(x),
         .b => |x| @intFromBool(x),
     };
 }
 
 fn scalarToU64(v: ScalarVal) u64 {
     return switch (v) {
-        .f => |x| if (x >= 0) @intFromFloat(x) else 0,
-        .i => |x| if (x >= 0) @intCast(x) else 0,
+        .f => |x| if (!std.math.isFinite(x) or x < 0)
+            0
+        else if (x >= 18446744073709551616.0)
+            std.math.maxInt(u64)
+        else
+            @intFromFloat(x),
+        // The documented 64-bit two's-complement pair (see coerceForKind).
+        .i => |x| @bitCast(x),
         .u => |x| x,
         .b => |x| @intFromBool(x),
     };
@@ -423,13 +439,16 @@ fn coerceForKind(kind: PackedKind, v: ScalarVal) ?ScalarVal {
     switch (kind) {
         .f32, .boolean => return v, // total: float accepts all, bool compares
         .i64 => switch (v) {
-            .u => |x| return if (x > std.math.maxInt(i64)) null else v,
+            // Engine parity: the 64-BIT BITCAST PAIR — the other 64-bit
+            // tag lands via two's-complement bitcast (lossless round trip
+            // for signed-only bindings), never a range refusal.
+            .u => |x| return .{ .i = @bitCast(x) },
             .f => |x| return if (!std.math.isFinite(x) or
                 x < -9223372036854775808.0 or x >= 9223372036854775808.0) null else v,
             else => return v,
         },
         .u64 => switch (v) {
-            .i => |x| return if (x < 0) null else v,
+            .i => |x| return .{ .u = @bitCast(x) },
             .f => |x| return if (!std.math.isFinite(x) or
                 x < 0 or x >= 18446744073709551616.0) null else v,
             else => return v,
@@ -558,6 +577,9 @@ export fn labelle_component_set_packed(
             }
         }
     }
+    // Engine parity: bytes past the declared field records are a
+    // malformed buffer — refuse, don't half-accept.
+    if (pos != buf.len) return -1;
     // Serialize in schema order and store through the shared path.
     var jbuf: [JSON_CAP]u8 = undefined;
     var w = std.Io.Writer.fixed(&jbuf);
@@ -649,6 +671,22 @@ export fn labelle_component_batch_set(
         }
     }
     const buf = if (buf_ptr) |p| p[0..buf_len] else &[_]u8{};
+    // PREFLIGHT (engine parity): size the re-queried set FIRST and refuse
+    // BEFORE any write on mismatch — a refused batch_set performs no
+    // writes, so the documented "re-get and recompute" retry can never
+    // double-apply a prefix.
+    var expected: usize = 0;
+    outer_pre: for (world.entities[0..world.entity_count]) |*e| {
+        if (!e.alive) continue;
+        for (names) |nm| {
+            if (!entityHas(e, nm)) continue :outer_pre;
+        }
+        for (names) |nm| {
+            const t = packedTypeOf(nm) orelse continue;
+            expected += t.fields.len * 4;
+        }
+    }
+    if (expected != buf.len) return -1;
     var pos: usize = 0; // pure f32 stream, no header
     outer: for (world.entities[0..world.entity_count]) |*e| {
         if (!e.alive) continue;
@@ -663,10 +701,7 @@ export fn labelle_component_batch_set(
             var w = std.Io.Writer.fixed(&jbuf);
             w.writeByte('{') catch return -1;
             for (t.fields, 0..) |f, fi| {
-                // Ran out of stream mid-walk: MORE entities than the
-                // buffer was computed for — the coupling guard's spawn
-                // half.
-                if (pos + 4 > buf.len) return -1;
+                if (pos + 4 > buf.len) return -1; // belt: preflight sized this
                 const fv: f32 = @bitCast(std.mem.readInt(u32, buf[pos..][0..4], .little));
                 pos += 4;
                 const v: ScalarVal = switch (f.kind) {
@@ -679,8 +714,7 @@ export fn labelle_component_batch_set(
             setComponent(e.id, nm, w.buffered());
         }
     }
-    // Leftover bytes: FEWER entities than the buffer was computed for —
-    // the coupling guard's destroy half.
+    // Belt on top of the preflight.
     if (pos != buf.len) return -1;
     return 0;
 }
@@ -840,6 +874,24 @@ pub fn hostEmit(name: []const u8, json: []const u8) void {
     w.print("{s} {s}", .{ name, json }) catch return;
     ev.len = w.buffered().len;
     world.inbox_count += 1;
+}
+
+/// Direct-call seams for the engine-parity tests — the `export fn`s are
+/// not `pub`, so the suite reaches the same code through these.
+pub fn createEntityDirect() u64 {
+    return labelle_entity_create();
+}
+
+pub fn setComponentDirect(id: u64, name: []const u8, json: []const u8) void {
+    setComponent(id, name, json);
+}
+
+pub fn setPackedDirect(id: u64, name: []const u8, buf: []const u8) i32 {
+    return labelle_component_set_packed(id, name.ptr, name.len, buf.ptr, buf.len);
+}
+
+pub fn batchSetDirect(names_json: []const u8, buf: []const u8) i32 {
+    return labelle_component_batch_set(names_json.ptr, names_json.len, buf.ptr, buf.len);
 }
 
 /// The stored JSON of a component, or null when entity/component is gone.
