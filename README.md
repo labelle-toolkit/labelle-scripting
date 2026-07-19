@@ -1024,3 +1024,5 @@ The plugin handles the studio Script Console's
   follow-up) — the plugin side is proven by `zig build test`'s csharp suite
   driving the managed assembly through the real hostfxr path against the
   mock host. Timeline: `examples/csharp-game/scripts/Game.cs`.
+
+<!-- ci-probe: baseline mruby-crash reproduction on clean origin/main (labelle-scripting#51 investigation) -->
