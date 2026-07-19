@@ -1368,3 +1368,92 @@ test "bulk stage 3: batch_set refuses numeric strings and non-finite elements be
     try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
     try expectComponent(1, "BatchVel", "{\"vx\":3,\"vy\":4}");
 }
+
+test "bulk v1.3 (#45): a finite float beyond ±f32 max refuses loudly on the packed path" {
+    fresh();
+    // 1e100 is FINITE at f64 — it passes the f64-level isFinite guard —
+    // but the f32 narrow turns it into inf: the exact smuggle the
+    // documented non-finite rejection exists to stop. The JSON fallback
+    // would smuggle it identically (the host narrows the parsed f64
+    // into its f32 field), so the refusal is LOUD and binding-level,
+    // naming the field.
+    scripting.registerScript("packed_overflow",
+        \\function init()
+        \\  local e = Entity.new()
+        \\  local ok, err = pcall(function()
+        \\    e:set("Stats", { power = 1e100, score = 0, alive = false, seed = 0 })
+        \\  end)
+        \\  if ok then labelle.log("huge accepted") else labelle.log("huge refused: " .. err) end
+        \\  local ok2, err2 = pcall(function()
+        \\    e:set("BatchPos", { x = -1e300, y = 0 })
+        \\  end)
+        \\  if ok2 then labelle.log("neg accepted") else labelle.log("neg refused: " .. err2) end
+        \\  labelle.log("overflow done")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("huge accepted"));
+    try expect(mock.logsContain("huge refused: labelle: set: field 'power' overflows f32 range"));
+    try expect(!mock.logsContain("neg accepted"));
+    try expect(mock.logsContain("neg refused: labelle: set: field 'x' overflows f32 range"));
+    try expect(mock.logsContain("overflow done"));
+    // Nothing was stored by either refusal.
+    try expect(mock.componentJson(1, "Stats") == null);
+    try expect(mock.componentJson(1, "BatchPos") == null);
+}
+
+test "bulk stage 3 (#45): batch_set refuses finite elements beyond ±f32 max before any write" {
+    fresh();
+    // The batch twin of the packed-path guard above: finiteness is
+    // asserted AFTER the f32 narrow, so 1e100 refuses with the same
+    // loudness as NaN/Inf — nothing handed to the host.
+    scripting.registerScript("batch_overflow",
+        \\local NAMES = { "BatchPos", "BatchVel" }
+        \\function init()
+        \\  local e = Entity.new()
+        \\  e:set("BatchPos", { x = 1, y = 2 })
+        \\  e:set("BatchVel", { vx = 3, vy = 4 })
+        \\  local buf = {}
+        \\  local count = labelle.batch_get(NAMES, buf)
+        \\  buf[2] = 1e100 -- finite at f64, inf after the f32 narrow
+        \\  local ok, err = pcall(function() labelle.batch_set(NAMES, buf, count) end)
+        \\  if ok then labelle.log("huge accepted") else labelle.log("huge refused: " .. err) end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("huge accepted"));
+    try expect(mock.logsContain("huge refused: labelle: batch_set: element 2 overflows f32 range"));
+    // The refusal fired BEFORE any host write — both components keep
+    // their original values.
+    try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
+    try expectComponent(1, "BatchVel", "{\"vx\":3,\"vy\":4}");
+}
+
+test "bulk v1.3 (#45): a float past f32 precision reaches int fields exactly (SET tag 4)" {
+    fresh();
+    // 16777217.0 (2^24 + 1) is the first integer f32 cannot hold: the
+    // old f32 tagging rounded it to 16777216 BEFORE the host saw it — a
+    // silent off-by-one into the i64 field where the JSON path is
+    // exact. The SET-side f64 tag (4) carries full precision: the host
+    // coerces float→int exactly under its range refusal, and an
+    // in-range non-integral float (0.1) rides the same tag to the f32
+    // field with identical results.
+    scripting.registerScript("packed_precision",
+        \\function init()
+        \\  local e = Entity.new()
+        \\  e:set("Stats", { power = 0.1, score = 16777217.0, alive = true, seed = 1 })
+        \\  labelle.log("precision done")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("precision done"));
+    // SCHEMA order proves the packed path carried it (the JSON fallback
+    // sorts keys); the score is EXACT.
+    try expectComponent(1, "Stats", "{\"power\":0.1,\"score\":16777217,\"alive\":true,\"seed\":1}");
+}

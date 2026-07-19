@@ -1431,3 +1431,138 @@ test "bulk stage 3: a single component ref (and refs in lists) drive labelle.bat
     try expect(mock.logsContain("mix n:1"));
     try expectComponent(1, "BatchPos", "{\"x\":2,\"y\":2}");
 }
+
+test "bulk v1.3 (#45): a finite float beyond ±f32 max refuses loudly on the packed path" {
+    fresh();
+    // 1e100 is FINITE at f64 — it passes the f64-level isFinite guard —
+    // but the f32 narrow turns it into inf: the exact smuggle the
+    // documented non-finite rejection exists to stop. The JSON fallback
+    // would smuggle it identically (the host narrows the parsed f64 into
+    // its f32 field), so the refusal is LOUD and binding-level, naming
+    // the field.
+    scripting.registerScript("packed_overflow",
+        \\export function init() {
+        \\  const e = Entity.create();
+        \\  try {
+        \\    e.set("Stats", { power: 1e100, score: 0, alive: false, seed: 0 });
+        \\    labelle.log("huge accepted");
+        \\  } catch (err) {
+        \\    labelle.log(`huge refused: ${err.message}`);
+        \\  }
+        \\  try {
+        \\    e.set("BatchPos", { x: -1e300, y: 0 });
+        \\    labelle.log("neg accepted");
+        \\  } catch (err) {
+        \\    labelle.log(`neg refused: ${err.message}`);
+        \\  }
+        \\  labelle.log("overflow done");
+        \\}
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("huge accepted"));
+    try expect(mock.logsContain("huge refused: labelle: set: field 'power' overflows f32 range"));
+    try expect(!mock.logsContain("neg accepted"));
+    try expect(mock.logsContain("neg refused: labelle: set: field 'x' overflows f32 range"));
+    try expect(mock.logsContain("overflow done"));
+    try expect(mock.componentJson(1, "Stats") == null);
+    try expect(mock.componentJson(1, "BatchPos") == null);
+}
+
+test "bulk stage 3 (#45): batch_set refuses finite elements beyond ±f32 max before any write" {
+    fresh();
+    // The batch twin of the packed-path guard above: finiteness is
+    // asserted AFTER the f32 narrow, so 1e100 refuses with the same
+    // loudness as NaN/Inf — nothing handed to the host.
+    scripting.registerScript("batch_overflow",
+        \\const NAMES = ["BatchPos", "BatchVel"];
+        \\export function init() {
+        \\  const e = Entity.create();
+        \\  e.set("BatchPos", { x: 1, y: 2 });
+        \\  e.set("BatchVel", { vx: 3, vy: 4 });
+        \\  const buf = [];
+        \\  const count = labelle.batch_get(NAMES, buf);
+        \\  buf[1] = 1e100; // finite at f64, inf after the f32 narrow
+        \\  try {
+        \\    labelle.batch_set(NAMES, buf, count);
+        \\    labelle.log("huge accepted");
+        \\  } catch (err) {
+        \\    labelle.log(`huge refused: ${err.message}`);
+        \\  }
+        \\}
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("huge accepted"));
+    try expect(mock.logsContain("huge refused: labelle: batch_set: element 1 overflows f32 range"));
+    try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
+    try expectComponent(1, "BatchVel", "{\"vx\":3,\"vy\":4}");
+}
+
+test "bulk v1.3 (#45): a float past f32 precision reaches int fields exactly (SET tag 4)" {
+    fresh();
+    // 16777217 (2^24 + 1) is the first integer f32 cannot hold, but in
+    // JS it is a Number ≤ 2^53 so it already tags as i64 (exact). The
+    // f64 SET tag (4) matters for a NON-integral Number destined for a
+    // FLOAT field beyond f32 precision: it carries full f64 precision to
+    // the host, which narrows into the f32 field — identical to the JSON
+    // route. Here 0.1 (which f32 cannot hold exactly) rides tag 4.
+    scripting.registerScript("packed_precision",
+        \\export function init() {
+        \\  const e = Entity.create();
+        \\  e.set("Stats", { power: 0.1, score: 16777217, alive: true, seed: 1 });
+        \\  labelle.log("precision done");
+        \\}
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("precision done"));
+    // SCHEMA order proves the packed path carried it (the JSON fallback
+    // sorts keys); the score is EXACT.
+    try expectComponent(1, "Stats", "{\"power\":0.1,\"score\":16777217,\"alive\":true,\"seed\":1}");
+}
+
+test "bulk stage 3 (#50): a typo'd batch-view field write throws instead of silently vanishing" {
+    fresh();
+    // The reused batch view is sealed behind a Proxy: writing a field
+    // the view does NOT have (`e.xx`, a typo) throws a TypeError naming
+    // the field and the known fields — a bare object would grow an
+    // ordinary `xx` property, the backing buffer untouched, and the
+    // subsequent batch_set would commit with the intended write silently
+    // absent. Known-field writes are unaffected.
+    scripting.registerScript("view_seal",
+        \\const NAMES = ["BatchPos", "BatchVel"];
+        \\export function init() {
+        \\  const e = Entity.create();
+        \\  e.set("BatchPos", { x: 1, y: 2 });
+        \\  e.set("BatchVel", { vx: 3, vy: 4 });
+        \\  try {
+        \\    labelle.batch(NAMES, (v) => {
+        \\      v.xx = v.x + 1; // typo — not a view field
+        \\    });
+        \\    labelle.log("typo accepted");
+        \\  } catch (err) {
+        \\    labelle.log(`typo refused (${err.constructor.name}): ${err.message}`);
+        \\  }
+        \\  // A KNOWN-field write still lands: the seal only rejects
+        \\  // unknown props.
+        \\  const n = labelle.batch(NAMES, (v) => {
+        \\    v.x = v.x + 10;
+        \\  });
+        \\  labelle.log(`known n:${n}`);
+        \\}
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("typo accepted"));
+    try expect(mock.logsContain("typo refused (TypeError): labelle.batch view: unknown field 'xx'"));
+    // The typo'd batch committed NOTHING through its silent property:
+    // x is unchanged by that call (still 1). The known-field write then
+    // moved it to 11.
+    try expect(mock.logsContain("known n:1"));
+    try expectComponent(1, "BatchPos", "{\"x\":11,\"y\":2}");
+}

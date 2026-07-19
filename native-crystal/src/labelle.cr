@@ -393,7 +393,11 @@ module Labelle
   # hand-built `{"power":NaN}` is refused by the host parser (-1 →
   # false). The packed fast path must not smuggle values the JSON route
   # cannot carry, so `set_from` refuses a non-finite Float32 field up
-  # front (false, nothing written).
+  # front (false, nothing written) and `batch_set` refuses a non-finite
+  # stream element the same way (ArgumentError, nothing written — #45).
+  # The dynamic families guard "finite f64 that narrows to inf" after
+  # the f32 narrow; here the view fields ARE Float32, so such a value
+  # arrives already as INFINITY and the same refusals catch it.
 
   # `labelle_component_batch_get`'s int-field refusal sentinel — the
   # header's LABELLE_BATCH_INT_REFUSED, C's `(size_t)-2`. Checked
@@ -489,6 +493,19 @@ module Labelle
   # or on a pre-v1.3 host.
   def self.batch_set(names_json : String, arr : Array(Float32), count : Int32, scratch : Buffer) : Nil
     raise_batch_unsupported unless bulk_access?
+    # Non-finite refusal at the BINDING (#45) — one branch-predictable
+    # pass, cheap next to the FFI crossing: NaN/Inf must never ride into
+    # component fields, and the refusal happens BEFORE anything is
+    # handed to the host (all-or-nothing). A finite-but-f32-overflowing
+    # value cannot arise here: the elements ARE Float32, so an overflow
+    # is born as INFINITY and lands on this same refusal.
+    arr.each_with_index do |f, i|
+      unless f.finite?
+        raise ArgumentError.new(
+          "labelle: batch_set: non-finite number at element #{i} — the f32 stream " \
+          "refuses NaN/Inf, the json-route non-finite policy (nothing was written)")
+      end
+    end
     bytes = arr.size * 4
     scratch.ensure_capacity(Math.max(bytes, 1))
     p = scratch.to_unsafe

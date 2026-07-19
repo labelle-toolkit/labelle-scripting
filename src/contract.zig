@@ -137,16 +137,20 @@ pub extern fn labelle_component_get_packed(
 ) usize;
 
 /// PACKED (binary) fast-path twin of `labelle_component_set` (since
-/// v1.3). Applies a packed record (the `_get_packed` format) to the named
-/// component, coercing each field into its real scalar type — including
-/// the 64-BIT BITCAST PAIR (an i64 tag lands in a u64 field, and vice
-/// versa, via two's-complement bitcast), which is what makes GET(tag 3 →
-/// signed Integer bitcast) → SET(tag 1 → host bitcasts back) LOSSLESS
-/// for u64 fields with bit 63 set in a signed-only binding like mruby.
-/// REPLACE semantics. 0 = ok; -1 = unknown/dead/refused (non-scalar or
-/// f64 target, out-of-range value into a narrower int field, trailing
-/// bytes — fall back to `labelle_component_set`) / malformed / not
-/// bound.
+/// v1.3). Applies a packed record (the `_get_packed` format, plus the
+/// SET-ONLY value tag 4 = f64(8B) — full-precision floats so a
+/// float→int coercion is exact past f32's 24-bit mantissa; GET stays
+/// f32-only) to the named component, coercing each field into its real
+/// scalar type — including the 64-BIT BITCAST PAIR (an i64 tag lands in
+/// a u64 field, and vice versa, via two's-complement bitcast), which is
+/// what makes GET(tag 3 → signed Integer bitcast) → SET(tag 1 → host
+/// bitcasts back) LOSSLESS for u64 fields with bit 63 set in a
+/// signed-only binding like mruby. REPLACE semantics. 0 = ok; -1 =
+/// unknown/dead/refused (non-scalar or f64 target, out-of-range value
+/// into a narrower int field, an unknown tag — a pre-tag-4 host handed
+/// tag 4 refuses here and the binding's JSON fallback carries the f64
+/// faithfully — trailing bytes; fall back to `labelle_component_set`) /
+/// malformed / not bound.
 pub extern fn labelle_component_set_packed(
     id: u64,
     name: [*]const u8,

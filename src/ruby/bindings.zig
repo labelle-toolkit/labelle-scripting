@@ -463,7 +463,9 @@ fn rawComponentSetFrom(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
 
     // ── PACKED fast path (v1.3 hosts only — comptime-gated) ───────────
     // Build the binary record from the view's fields — tag each by its
-    // RUBY value type (Float→f32, Integer→i64, true/false→bool). The host
+    // RUBY value type (Float→f32 when the value survives the narrow
+    // exactly, else the SET-side f64 tag 4 — full precision for
+    // float→int targets; Integer→i64, true/false→bool). The host
     // coerces each into the target struct field's real type. A field whose
     // ruby value isn't a scalar (nil/String/Array/…), an over-long name, or
     // a record that would overflow the local buffer aborts the fast path
@@ -507,17 +509,46 @@ fn rawComponentSetFrom(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
                     // packed fast path must never smuggle a NaN/Inf into
                     // the host that the JSON encoder would refuse — break
                     // to the JSON fallback and let encodeValue raise the
-                    // one canonical error for both routes. (A FINITE
-                    // out-of-f32-range f64 is fine either way: @floatCast
-                    // saturates — a defined, non-trapping conversion — and
-                    // the JSON route's f64 text parses to the same
-                    // saturated f32 in the host field.)
+                    // one canonical error for both routes.
                     if (!std.math.isFinite(v.value.f)) break :pk;
-                    rec[w] = 0;
-                    w += 1;
                     const f: f32 = @floatCast(v.value.f);
-                    std.mem.writeInt(u32, rec[w..][0..4], @bitCast(f), .little);
-                    w += 4;
+                    // FINITE-BUT-OVERFLOWING (#45): a finite f64 beyond
+                    // ±f32 max narrows to inf in the cast above, smuggling
+                    // a non-finite value past the documented rejection —
+                    // and the JSON fallback would smuggle it just the same
+                    // (the host narrows the parsed f64 into its f32
+                    // field). So the guard asserts finiteness AFTER the
+                    // narrow and refuses LOUDLY, at the binding. The field
+                    // name was just copied into the record — np may
+                    // already be stale (mrb_sym_name_len's shared buffer).
+                    if (!std.math.isFinite(f)) raiseFmt(
+                        mrb,
+                        "ArgumentError",
+                        "labelle: set: field '{s}' overflows f32 range (a finite " ++
+                            "value narrowed to inf) — component floats are f32 " ++
+                            "(nothing was written)",
+                        .{rec[w - nlen ..][0..nlen]},
+                    );
+                    if (@as(f64, f) == v.value.f) {
+                        rec[w] = 0;
+                        w += 1;
+                        std.mem.writeInt(u32, rec[w..][0..4], @bitCast(f), .little);
+                        w += 4;
+                    } else {
+                        // PRECISION (#45): the ruby Float does not survive
+                        // the f32 narrow (e.g. 16777217.0 destined for an
+                        // int field would silently round through f32's
+                        // 24-bit mantissa) — ride the SET-side f64 tag (4,
+                        // since v1.3): the host coerces with full precision
+                        // (exact float→int under its range refusal). A
+                        // host without tag 4 refuses (-1) and the JSON
+                        // fallback below carries the f64 faithfully — same
+                        // result, one FFI round-trip slower.
+                        rec[w] = 4;
+                        w += 1;
+                        std.mem.writeInt(u64, rec[w..][0..8], @bitCast(v.value.f), .little);
+                        w += 8;
+                    }
                 },
                 .integer => {
                     rec[w] = 1;
@@ -733,6 +764,10 @@ fn rawBatchGet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
 ///       exact-size positional-coupling guard; also malformed names / host
 ///       not bound) → RuntimeError. The floats were computed against a
 ///       STALE entity set — re-run batch_get and recompute.
+/// The binding refuses BEFORE the host too (#45, the json_encode
+/// non-finite policy applied to the stream, matching lua/ts): a
+/// non-finite element AND a finite element that narrows to inf past ±f32
+/// max both raise ArgumentError naming the element — nothing written.
 fn rawBatchSet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
     _ = self;
     // Same comptime if/else gate as rawBatchGet — see the note there.
@@ -755,7 +790,34 @@ fn rawBatchSet(mrb: ?*c.State, self: c.Value) callconv(.c) c.Value {
         var i: usize = 0;
         while (i < nfloats) : (i += 1) {
             const v = c.mrb_ary_entry(arr, @intCast(i));
-            const f: f32 = @floatCast(c.mrb_ensure_float_type(mrb, v).value.f);
+            const fv = c.mrb_ensure_float_type(mrb, v).value.f;
+            // Non-finite refusal at the BINDING (#45) — the json_encode
+            // "non-finite number" policy applied to the stream, the
+            // retrofit of lua/ts's day-one check: NaN/Inf must never
+            // ride into component fields. The raise names the (0-based)
+            // element; nothing was handed to the host — the contract
+            // call below only happens after the whole copy loop.
+            if (!std.math.isFinite(fv)) raiseFmt(
+                mrb,
+                "ArgumentError",
+                "labelle: batch_set: non-finite number at element {d} — the " ++
+                    "f32 stream refuses NaN/Inf, the json_encode non-finite " ++
+                    "policy (nothing was written)",
+                .{i},
+            );
+            const f: f32 = @floatCast(fv);
+            // FINITE-BUT-OVERFLOWING (#45): a finite f64 beyond ±f32 max
+            // narrows to inf in the cast above — assert finiteness AFTER
+            // the narrow, or the stream smuggles the very values the
+            // check above documents as refused.
+            if (!std.math.isFinite(f)) raiseFmt(
+                mrb,
+                "ArgumentError",
+                "labelle: batch_set: element {d} overflows f32 range (a " ++
+                    "finite value narrowed to inf) — the f32 stream refuses " ++
+                    "values beyond ±f32 max (nothing was written)",
+                .{i},
+            );
             std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f), .little);
         }
         const rc = contract.labelle_component_batch_set(names.ptr, names.len, buf, bytes);

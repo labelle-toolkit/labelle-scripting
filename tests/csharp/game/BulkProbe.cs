@@ -173,6 +173,15 @@ public sealed class BulkProbe : Script
         try { Labelle.BatchSet("[\"Stats\"]", new float[4], 4); }
         catch (System.ArgumentException) { Labelle.Log("CS_BULK_SET_INT_REFUSED"); }
 
+        // Non-finite refusal at the BINDING (#45): a NaN/Inf stream
+        // element refuses BEFORE any host write. A finite float overflow
+        // (MAX doubled → Infinity) is the "1e100 narrows to inf" smuggle
+        // in a float-native binding, and lands on the same refusal.
+        try { Labelle.BatchSet("[\"BatchPos\"]", new[] { 1.0f, float.NaN }, 2); }
+        catch (System.ArgumentException) { Labelle.Log("CS_BULK_SET_NAN_REFUSED"); }
+        try { Labelle.BatchSet("[\"BatchPos\"]", new[] { 1.0f, float.MaxValue * 2.0f }, 2); }
+        catch (System.ArgumentException) { Labelle.Log("CS_BULK_SET_OVERFLOW_REFUSED"); }
+
         // ── exit-semantics matrix on THROWAWAY entities ────────────────
         var t1 = Labelle.CreateEntity();
         var t2 = Labelle.CreateEntity();

@@ -622,7 +622,11 @@ public static unsafe class Labelle
     // hand-built {"power":NaN} is refused by the host parser (-1 →
     // false). The packed fast path must not smuggle values the JSON
     // route cannot carry, so SetFrom refuses a non-finite float field up
-    // front (false, nothing written).
+    // front (false, nothing written) and BatchSet refuses a non-finite
+    // stream element the same way (ArgumentException, nothing written —
+    // #45). The dynamic families guard "finite f64 that narrows to inf"
+    // after the f32 narrow; here the view fields ARE float, so such a
+    // value arrives already as Infinity and the same refusals catch it.
 
     /// <summary>labelle_component_batch_get's int-field refusal sentinel —
     /// the header's LABELLE_BATCH_INT_REFUSED, C's (size_t)-2. Checked
@@ -1058,6 +1062,20 @@ public static unsafe class Labelle
         ArgumentNullException.ThrowIfNull(namesJson);
         ArgumentNullException.ThrowIfNull(buf);
         if (!BulkAccess) ThrowBatchUnsupported();
+        // Non-finite refusal at the BINDING (#45) — one branch-predictable
+        // pass, cheap next to the FFI crossing: NaN/Inf must never ride
+        // into component fields, and the refusal happens BEFORE anything
+        // is handed to the host (all-or-nothing). A finite-but-
+        // f32-overflowing value cannot arise here: the elements ARE
+        // float, so an overflow is born as Infinity and lands on this
+        // same refusal.
+        for (var i = 0; i < floatCount; i++)
+        {
+            if (!float.IsFinite(buf[i]))
+                throw new ArgumentException(
+                    $"labelle: batch_set: non-finite number at element {i} — the f32 stream " +
+                    "refuses NaN/Inf, the json-route non-finite policy (nothing was written)");
+        }
         var scratch = _packedScratch ??= new byte[4096];
         if (scratch.Length < floatCount * 4) scratch = _packedScratch = new byte[floatCount * 4];
         for (var i = 0; i < floatCount; i++)

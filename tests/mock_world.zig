@@ -437,7 +437,17 @@ fn defaultScalar(kind: PackedKind) ScalarVal {
 /// (host-owned data).
 fn coerceForKind(kind: PackedKind, v: ScalarVal) ?ScalarVal {
     switch (kind) {
-        .f32, .boolean => return v, // total: float accepts all, bool compares
+        .f32 => switch (v) {
+            // Engine parity (#45): a FINITE f64 (the SET-side tag 4)
+            // whose f32 narrow is non-finite refuses — never smuggle an
+            // inf the wire's documented non-finite rejection would stop.
+            // (Bindings guard this before emitting; belt on script-
+            // supplied bytes.)
+            .f => |x| return if (std.math.isFinite(x) and
+                !std.math.isFinite(@as(f32, @floatCast(x)))) null else v,
+            else => return v,
+        },
+        .boolean => return v, // total: bool compares against zero
         .i64 => switch (v) {
             // Engine parity: the 64-BIT BITCAST PAIR — the other 64-bit
             // tag lands via two's-complement bitcast (lossless round trip
@@ -565,6 +575,13 @@ export fn labelle_component_set_packed(
             3 => {
                 if (pos + 8 > buf.len) return -1;
                 v = .{ .u = std.mem.readInt(u64, buf[pos..][0..8], .little) };
+                pos += 8;
+            },
+            4 => { // f64 — SET-side only (since v1.3, #45): full-precision
+                // floats so float→int coercion is exact past f32's
+                // 24-bit mantissa. GET stays f32-only.
+                if (pos + 8 > buf.len) return -1;
+                v = .{ .f = @bitCast(std.mem.readInt(u64, buf[pos..][0..8], .little)) };
                 pos += 8;
             },
             else => return -1,

@@ -171,6 +171,10 @@ test "csharp bulk v1.3: batch refusals are loud — int fields, stale set, nesti
     // (ArgumentException, caught in-script).
     try expect(mock.logsContain("CS_BULK_GET_INT_REFUSED"));
     try expect(mock.logsContain("CS_BULK_SET_INT_REFUSED"));
+    // Non-finite refusal at the binding (#45): NaN and a finite-origin
+    // float overflow (→ Infinity) both refuse before any host write.
+    try expect(mock.logsContain("CS_BULK_SET_NAN_REFUSED"));
+    try expect(mock.logsContain("CS_BULK_SET_OVERFLOW_REFUSED"));
     // The exact-size positional-coupling guard fired; nothing applied.
     try expect(!mock.logsContain("CS_BULK_STALE_ACCEPTED"));
     try expect(mock.logsContain("CS_BULK_STALE_REFUSED"));
