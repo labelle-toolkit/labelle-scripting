@@ -47,6 +47,7 @@
 const std = @import("std");
 const contract = @import("../contract.zig");
 const eval_mod = @import("../eval.zig");
+const sandbox = @import("../sandbox.zig");
 
 /// Hand-declared Lua 5.4 C API — just the slice this plugin uses.
 /// Signatures mirror lua.h/lauxlib.h; `lua_State` stays opaque.
@@ -78,6 +79,22 @@ pub const c = struct {
     pub extern fn luaL_newstate() ?*State;
     pub extern fn luaL_openlibs(L: ?*State) void;
     pub extern fn lua_close(L: ?*State) void;
+
+    // Selective library opening — the sandbox profile's mechanism
+    // (labelle-engine#740): luaL_requiref runs one luaopen_* under
+    // package-registry bookkeeping (linit.c's own loop does exactly
+    // this) and, with glb set, publishes the module global. Only the
+    // SAFE subset is declared; io/os/package/debug are never opened in
+    // the sandbox, which leaves their C entry points unreachable from
+    // lua (no value anywhere references them — as strong as not
+    // compiling them, without a per-profile source list).
+    pub extern fn luaL_requiref(L: ?*State, modname: [*:0]const u8, openf: CFn, glb: c_int) void;
+    pub extern fn luaopen_base(L: ?*State) c_int;
+    pub extern fn luaopen_coroutine(L: ?*State) c_int;
+    pub extern fn luaopen_table(L: ?*State) c_int;
+    pub extern fn luaopen_string(L: ?*State) c_int;
+    pub extern fn luaopen_math(L: ?*State) c_int;
+    pub extern fn luaopen_utf8(L: ?*State) c_int;
 
     // Loading and calling.
     pub extern fn luaL_loadbufferx(L: ?*State, buff: [*]const u8, sz: usize, name: [*:0]const u8, mode: ?[*:0]const u8) c_int;
@@ -247,6 +264,30 @@ fn renderConsoleResults(L: ?*c.State) callconv(.c) c_int {
     return 0;
 }
 
+/// `debug.traceback`-shaped C closure published as the global
+/// `__labelle_traceback` at VM init: `(msg, level?) → trace string` via
+/// luaL_traceback — the same C entry db_traceback wraps, so the text is
+/// identical. The prelude's handler-dispatch msgh captures THIS instead
+/// of `debug.traceback`, which keeps handler tracebacks working in the
+/// sandbox profile (labelle-engine#740), where the debug library is
+/// never opened.
+fn rawTraceback(L: ?*c.State) callconv(.c) c_int {
+    var len: usize = 0;
+    const msg = c.lua_tolstring(L, 1, &len);
+    var isnum: c_int = 0;
+    const requested = c.lua_tointegerx(L, 2, &isnum);
+    // Checked cast: any lua integer can arrive here, and an out-of-range
+    // @intCast is a safety panic. A level outside c_int (or a
+    // non-integer) falls back to 1 — db_traceback's own default; absurd
+    // levels just mean an empty trace either way.
+    const level: c_int = if (isnum != 0)
+        std.math.cast(c_int, requested) orelse 1
+    else
+        1;
+    c.luaL_traceback(L, L, msg, level);
+    return 1;
+}
+
 /// Message handler installed by `protectedCall`: turns the error value into
 /// "<message>\nstack traceback:\n..." BEFORE the stack unwinds (afterwards
 /// the frames are gone — this is why pcall alone isn't enough).
@@ -337,11 +378,72 @@ pub const Vm = struct {
 
     pub fn init() error{LuaStateInit}!Vm {
         const L = c.luaL_newstate() orelse return error.LuaStateInit;
-        // Full stdlib: game scripts are first-party content (they ship with
-        // the game), so sandboxing io/os away buys nothing and costs script
-        // authors the tools they expect.
-        c.luaL_openlibs(L);
+        if (comptime sandbox.enabled) {
+            // Mod sandbox profile (labelle-engine#740): open only the
+            // pure-computation libraries. What's ABSENT: io (all of it),
+            // os (execute/remove/rename/getenv/exit — the whole table;
+            // scripts get time through labelle.time_dt), package/require
+            // (filesystem module search), debug (debug.getregistry would
+            // reach package.loaded and beyond). The base library's two
+            // filesystem loaders are removed right after opening, and
+            // `load` is rebound TEXT-ONLY (a bytecode string through the
+            // default "bt" mode would bypass the text-level sandbox —
+            // crafted binary chunks can corrupt the VM).
+            openSandboxedLibs(L);
+        } else {
+            // Full stdlib: game scripts are first-party content (they ship
+            // with the game), so sandboxing io/os away buys nothing and
+            // costs script authors the tools they expect.
+            c.luaL_openlibs(L);
+        }
+        // The debug-library-free traceback shim the prelude captures for
+        // handler dispatch (see rawTraceback) — published in BOTH
+        // profiles so there is exactly one code path.
+        c.lua_pushcclosure(L, rawTraceback, 0);
+        c.lua_setglobal(L, "__labelle_traceback");
         return .{ .L = L };
+    }
+
+    fn openSandboxedLibs(L: ?*c.State) void {
+        // The same (name, openf, global) protocol linit.c's loadedlibs
+        // loop runs — minus the unsafe entries. Each requiref leaves the
+        // module on the stack; drop them in one settop.
+        const base = c.lua_gettop(L);
+        c.luaL_requiref(L, "_G", c.luaopen_base, 1);
+        c.luaL_requiref(L, "coroutine", c.luaopen_coroutine, 1);
+        c.luaL_requiref(L, "table", c.luaopen_table, 1);
+        c.luaL_requiref(L, "string", c.luaopen_string, 1);
+        c.luaL_requiref(L, "math", c.luaopen_math, 1);
+        c.luaL_requiref(L, "utf8", c.luaopen_utf8, 1);
+        c.lua_settop(L, base);
+        // lbaselib.c registers dofile/loadfile — the base library's own
+        // filesystem reach. Remove them from the globals.
+        c.lua_pushnil(L);
+        c.lua_setglobal(L, "dofile");
+        c.lua_pushnil(L);
+        c.lua_setglobal(L, "loadfile");
+        // Rebind `load` text-only: the real load's default mode is "bt",
+        // and a binary chunk (precompiled bytecode, buildable with
+        // string.char alone) is NOT safe to run from untrusted input —
+        // the undump path trusts its bytes. The wrapper pins mode to
+        // "t" whatever the caller asked (a caller-requested "b" then
+        // fails inside rawload with the standard "attempt to load a
+        // binary chunk" error return, load's nil-plus-message protocol).
+        // The env argument forwards only when actually PASSED —
+        // luaB_load treats an explicit nil env as "set _ENV to nil",
+        // which is not the same as omitting it. `rawload` lives in a
+        // local upvalue scripts cannot reach. loadstring needs no
+        // treatment: 5.4 only defines it under LUA_COMPAT_LOADSTRING,
+        // which this build does not set.
+        _ = (Vm{ .L = L.? }).runChunk("@labelle/sandbox",
+            \\local rawload = load
+            \\load = function(chunk, chunkname, mode, ...)
+            \\  if select("#", ...) == 0 then
+            \\    return rawload(chunk, chunkname, "t")
+            \\  end
+            \\  return rawload(chunk, chunkname, "t", (select(1, ...)))
+            \\end
+        );
     }
 
     /// Close the VM. Lua's GC releases every script, env and binding —
@@ -466,6 +568,26 @@ pub const Vm = struct {
             // failing line already landed in the prelude's table).
             self.removeScriptEnv(name);
             self.purgeScriptHandlers(name);
+            return false;
+        }
+        return true;
+    }
+
+    /// Hot reload (labelle-engine#740): re-run a changed script's chunk in
+    /// the RUNNING VM. The old incarnation's `labelle.on` handlers are
+    /// purged first (the new body re-registers its own — without the purge
+    /// every save would stack another copy), then `loadScript` replaces
+    /// the script's env in the registry with a FRESH one: top-level
+    /// locals/globals reset (the RFC's "ivars are caches" reload
+    /// semantics), shared globals and prelude state survive, and the old
+    /// env is left to the GC. On failure the script's env is removed
+    /// outright (a failed BODY already self-evicted; a failed COMPILE
+    /// would otherwise leave the old code running with its handlers
+    /// purged) — the script goes silent until the next save fixes it.
+    pub fn reloadScript(self: Vm, name: []const u8, source: [:0]const u8) bool {
+        self.purgeScriptHandlers(name);
+        if (!self.loadScript(name, source)) {
+            self.removeScriptEnv(name);
             return false;
         }
         return true;

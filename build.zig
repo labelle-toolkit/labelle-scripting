@@ -214,6 +214,18 @@ pub fn build(b: *std.Build) void {
         "Scripting language sub-module to embed (default: lua)",
     ) orelse .lua;
 
+    // Dev-mode gate (labelle-engine#740): compiles the script hot-reload
+    // watcher + its Controller.tick pump in. Default OFF — release games
+    // carry zero watcher code; the assembler's dev builds pass it the way
+    // they pass `.language`. (The `reloadScript` SEAM is always compiled —
+    // it is tiny and the studio hot-push entry point; only the disk
+    // watching is gated.)
+    const hot_reload = b.option(
+        bool,
+        "hot_reload",
+        "Compile the dev-mode script hot-reload disk watcher in (default: off)",
+    ) orelse false;
+
     // The vendored Lua 5.4 sources serve TWO consumers: the lua language
     // sub-module (when selected) and the declare-mode extractor below
     // (ALWAYS — it IS the lua declare runner, whatever language the game
@@ -242,7 +254,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    configureLanguage(b, scripting_mod, language, lua_dep_opt, quickjs_dep_opt);
+    configureLanguage(b, scripting_mod, language, hot_reload, lua_dep_opt, quickjs_dep_opt);
+
+    // The default (empty) `plugin_params` module (labelle-engine#740, mod
+    // sandbox profile): src/sandbox.zig reads the project's resolved
+    // params through this fixed import name. In a generated game the
+    // assembler's `overrideImport(plugin_scripting_mod, "plugin_params",
+    // …)` REPLACES this stub with the staged params module (getOrPut —
+    // replace-or-add), so the stub only ever answers for in-repo builds,
+    // manual consumers and pre-#591 assemblers: no decls → every
+    // `@hasDecl` probe false → schema defaults (sandbox off).
+    const plugin_params_default_mod = b.createModule(.{
+        .root_source_file = b.path("src/plugin_params_default.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scripting_mod.addImport("plugin_params", plugin_params_default_mod);
 
     // The engine STUB behind src/contract.zig's `host_has_bulk_access`
     // comptime probe (contract v1.3, #41). Generated games get the REAL
@@ -458,9 +485,15 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .link_libc = true,
             });
-            configureLanguage(b, lang_mod, lang, lua_dep_opt, quickjs_dep_opt);
+            // hot_reload = true in every test module: the devx suite
+            // (labelle-engine#740) exercises the watcher + tick pump; the
+            // exported module above keeps the -Dhot_reload default (off).
+            configureLanguage(b, lang_mod, lang, true, lua_dep_opt, quickjs_dep_opt);
             // The v1.3 probe's engine stand-in — see engine_stub_mod above.
             lang_mod.addImport("labelle-engine", engine_stub_mod);
+            // Default params (sandbox off) — the lua SANDBOX binary below is
+            // the one test module that swaps in a sandbox=true params module.
+            lang_mod.addImport("plugin_params", plugin_params_default_mod);
             const tests_root_mod = b.createModule(.{
                 .root_source_file = b.path("tests/root.zig"),
                 .target = target,
@@ -805,6 +838,43 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // ── lua sandbox-profile binary (labelle-engine#740) ─────────────────
+    // The mod sandbox profile is a comptime module configuration (the
+    // `plugin_params` module's `sandbox` decl — see src/sandbox.zig), so
+    // testing it needs its own module instance: the exact mechanism a
+    // generated game gets (an overridden params module), pointed at a
+    // dedicated suite (tests/sandbox_root.zig). Lua-only: lua is the one
+    // language whose sandbox is a profile switch — ruby/typescript are
+    // sandboxed by construction and pin that in their NORMAL suites.
+    if (lua_dep_opt != null) {
+        const sandbox_lang_mod = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        configureLanguage(b, sandbox_lang_mod, .lua, true, lua_dep_opt, quickjs_dep_opt);
+        sandbox_lang_mod.addImport("labelle-engine", engine_stub_mod);
+        // What the assembler stages for `.params = .{ .sandbox = true }`:
+        // a module whose `sandbox` decl is true, under the fixed name.
+        const sandbox_params = b.addOptions();
+        sandbox_params.addOption(bool, "sandbox", true);
+        sandbox_lang_mod.addImport("plugin_params", sandbox_params.createModule());
+        const sandbox_root_mod = b.createModule(.{
+            .root_source_file = b.path("tests/sandbox_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "labelle_scripting", .module = sandbox_lang_mod },
+            },
+        });
+        const sandbox_tests = b.addTest(.{
+            .root_module = sandbox_root_mod,
+        });
+        test_step.dependOn(&b.addRunArtifact(sandbox_tests).step);
+    }
+
     // ── labelle-declare: the declare-mode schema extractor ──────────────
     // (RFC-LANGUAGE-PLUGINS revs 6-7, labelle-engine#237.) A tiny host exe
     // the assembler builds + runs at GENERATE time (`zig build
@@ -920,19 +990,22 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Wire `mod` for one language: the `scripting_options` module feeding
-/// src/root.zig's comptime backend switch, plus the language's vendored
-/// runtime sources. Unselected runtimes are not compiled into the module
+/// src/root.zig's comptime backend switch (+ the dev-mode `hot_reload`
+/// gate, labelle-engine#740), plus the language's vendored runtime
+/// sources. Unselected runtimes are not compiled into the module
 /// (the lua FETCH is unconditional — see build(), the declare extractor
 /// needs it — but its objects only enter the module here).
 fn configureLanguage(
     b: *std.Build,
     mod: *std.Build.Module,
     language: Language,
+    hot_reload: bool,
     lua_dep_opt: ?*std.Build.Dependency,
     quickjs_dep_opt: ?*std.Build.Dependency,
 ) void {
     const opts = b.addOptions();
     opts.addOption(Language, "language", language);
+    opts.addOption(bool, "hot_reload", hot_reload);
     mod.addOptions("scripting_options", opts);
 
     switch (language) {

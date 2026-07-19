@@ -837,6 +837,47 @@ The plugin handles the studio Script Console's
   script log. Compiled only inside generated games — this repo's tests
   parse + AstGen-check it and pin its convention-facing names.
 
+## Dev experience: hot reload, error throttle, sandbox (labelle-engine#740)
+
+- **Hot reload (VM family, dev builds)** — build the plugin with
+  `-Dhot_reload=true` and point `scripting.hot_reload.watchDir(io,
+  allocator, "scripts")` at the game's script dir: the Controller tick
+  then polls (mtime+size, ~4 Hz, tick-counted) and re-loads changed
+  files into the RUNNING VM. `scripting.reloadScript(name, source)` is
+  the underlying seam — also the entry point a studio hot-push export
+  will call. State semantics: component/ECS data survives by
+  construction; script-LOCAL state resets (lua: fresh per-script `_ENV`;
+  ruby: fresh receiver — @ivars reset — with the new body's controllers
+  set up AFTER init, the boot order; typescript: fresh ES-module
+  instance). A successful reload REPLAYS the whole load lifecycle: old
+  handlers purged, new body run, **`init()` re-run** (init-registered
+  subscriptions come back). Caveat, by design: non-idempotent init side
+  effects (an unconditional spawn) re-apply on every save — write
+  idempotent init or accept re-runs under hot reload. A save with an
+  error halts that script until the next good save replays the
+  lifecycle. Native family (rust/crystal/csharp):
+  explicitly refused — compiled code cannot re-eval (a dylib-swap dev
+  mode is future work).
+- **Error UX** — every script invocation boundary is protected and a
+  raising script logs a language-level stack trace while THE TICK
+  SURVIVES (lua: pcall + luaL_traceback msgh; ruby: top-level-entry
+  exception parking + `#backtrace`; typescript: pending-exception fetch
+  + `.stack`). Repeat offenders throttle: after 3 CONSECUTIVE `update()`
+  failures the script is attempted (and logged) only once every 60
+  ticks until an attempt succeeds — one line a second instead of sixty.
+  Load/init failures evict instead (unchanged); handler/controller
+  errors are event-cadence and stay unthrottled.
+- **Mod sandbox profile** — `.params = .{ .sandbox = true }` in the
+  project's plugin entry (assembler ≥ 0.83) removes filesystem/OS access
+  from scripts; default OFF (games keep today's full stdlib). Lua opens
+  a safe-lib subset instead of `luaL_openlibs`: no `io`, no `os`, no
+  `package`/`require`, no `debug`, no `dofile`/`loadfile`, and `load`
+  is text-only (binary chunks refused) — tracebacks
+  still work (the C shim needs no debug library). Ruby and typescript
+  are sandboxed by construction (no fs gems vendored; no quickjs-libc),
+  pinned by their suites. The profile is the base for the future mods
+  tier.
+
 ## Examples
 
 - **`examples/ruby-game/`** — a headless (null-backend) game whose

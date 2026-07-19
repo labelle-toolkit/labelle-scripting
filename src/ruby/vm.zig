@@ -382,6 +382,40 @@ pub const Vm = struct {
         logError(name, "init failed — script evicted; update/deinit will not run");
     }
 
+    /// Hot reload (labelle-engine#740): re-run a changed script's body in
+    /// the RUNNING VM. The previous incarnation is evicted first —
+    /// harvested hooks, event handlers, controller classes AND live
+    /// instances, and with them the @ivar receiver (script-local state
+    /// RESETS on reload; the RFC's "ivars are caches" rule) — via the
+    /// prelude's `__evict_script`, quietly (no "init failed" line: this
+    /// is a reload, not a failure). Then the new body loads + harvests as
+    /// usual. The controller half of the lifecycle happens in
+    /// `finishReload` below, which the shared Controller calls only
+    /// AFTER the script's re-run `init()` — the boot order (init seeds
+    /// entities/state, controllers set up on top).
+    pub fn reloadScript(self: Vm, name: []const u8, source: [:0]const u8) bool {
+        {
+            const arena = c.labelle_mrb_gc_arena_save(self.mrb);
+            defer c.labelle_mrb_gc_arena_restore(self.mrb, arena);
+            const name_sym = c.mrb_intern(self.mrb, name.ptr, name.len);
+            _ = self.callLabelleSym(self.sym_evict_script, &.{c.Value.symbol(name_sym)}, name);
+        }
+        return self.loadScript(name, source);
+    }
+
+    /// Post-init reload step (see `reloadScript`): instantiate + set up
+    /// the controller classes the reloaded body registered
+    /// (`__setup_controllers_for` — the boot sweep only runs at
+    /// Controller.setup). Reloaded controllers move to the END of tick
+    /// order; acceptable for a dev loop.
+    pub fn finishReload(self: Vm, name: []const u8) void {
+        const arena = c.labelle_mrb_gc_arena_save(self.mrb);
+        defer c.labelle_mrb_gc_arena_restore(self.mrb, arena);
+        const name_sym = c.mrb_intern(self.mrb, name.ptr, name.len);
+        const setup_sym = c.mrb_intern(self.mrb, "__setup_controllers_for", "__setup_controllers_for".len);
+        _ = self.callLabelleSym(setup_sym, &.{c.Value.symbol(name_sym)}, name);
+    }
+
     /// Call `hook` ("init"/"update"/"deinit") of the script registered as
     /// `script_name`, passing `dt` when given. Dispatch rides the
     /// prelude's `Labelle.__call_hook(name_sym, hook_sym, dt)`, which

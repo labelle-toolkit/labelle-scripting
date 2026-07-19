@@ -1057,10 +1057,12 @@ end
 -- again (__labelle_purge_handlers below).
 local handlers = {}
 
--- Captured at install time so a script replacing the `debug` global can't
--- break handler error reporting — the same paranoia vm.zig applies by
--- calling luaL_traceback instead of debug.traceback.
-local debug_traceback = debug.traceback
+-- Captured at install time so a script replacing the global can't break
+-- handler error reporting — the same paranoia vm.zig applies by calling
+-- luaL_traceback instead of debug.traceback. __labelle_traceback IS
+-- luaL_traceback (vm.zig publishes it at init), which also keeps this
+-- working in the sandbox profile, where the debug library never opens.
+local debug_traceback = __labelle_traceback
 
 -- xpcall message handler for handler dispatch: capture the traceback
 -- BEFORE the stack unwinds (the vm.zig msghTraceback pattern — after the
