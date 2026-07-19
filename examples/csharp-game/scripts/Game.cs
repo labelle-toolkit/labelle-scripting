@@ -47,6 +47,10 @@
 //   tick 4  CS_LEVEL_0.375
 //   tick 5  CS_LEVEL_0.125
 //           CS_STARVING           0.125 <= 0.25 crossed the threshold
+//           CS_BATCH_OK_3_13.5     the batched swarm (scripts/Swarm.cs):
+//                                  3 boids × 5 ticks of x += 0.5 through
+//                                  ONE BatchGet + ONE BatchSet per tick
+//                                  (contract v1.3 — needs engine ≥ 2.6.0)
 //   deinit  CS_CTRL_DONE          hunger system (reverse registration)
 //           CS_DEINIT             spawner
 //
@@ -60,5 +64,9 @@ public static class Game
         scripts.Add("spawner", new Spawner());
         scripts.Add("hunger", new HungerSystem());
         scripts.Add("watcher", new FeedWatcher());
+        // The bulk-access swarm (contract v1.3, labelle-scripting#44) —
+        // registers LAST so its per-tick token lands after the others';
+        // see scripts/Swarm.cs for the batch-iterator story.
+        scripts.Add("swarm", new Swarm());
     }
 }
