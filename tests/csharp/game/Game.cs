@@ -16,5 +16,9 @@ public static class Game
     {
         scripts.Add("spawner", new Spawner());
         scripts.Add("hunger", new HungerSystem());
+        // Bulk component access (contract v1.3, #44): registers LAST so
+        // its entities never shift the spawner's (entity 1); see
+        // BulkProbe.cs for the token matrix tests/csharp_suite.zig pins.
+        scripts.Add("bulk", new BulkProbe());
     }
 }

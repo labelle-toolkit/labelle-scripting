@@ -132,3 +132,89 @@ test "csharp: console eval is refused for the compiled family" {
     try expect(!res.ok);
     try expect(std.mem.indexOf(u8, res.text, "compiled languages (csharp)") != null);
 }
+
+test "csharp bulk v1.3: packed codec round-trips typed views, JSON stays the fallback" {
+    fresh();
+    defer scripting.Controller.deinit();
+    try setup();
+
+    // Every field kind survived the binary round-trip (f32/i64/bool/u64).
+    try expect(mock.logsContain("CS_BULK_PACKED_1.5_-42_True_123"));
+    // The stored JSON is in the mock's SCHEMA order (power,score,alive,
+    // seed) — the packed set wrote it. The JSON fallback sorts keys, so
+    // key order proves the path taken. (Entity 2: spawner made 1.)
+    try expectComponent(2, "Stats", "{\"power\":1.5,\"score\":-42,\"alive\":true,\"seed\":123}");
+    // The schema-less component round-trips through JSON.
+    try expect(mock.logsContain("CS_BULK_PLAIN_2.5"));
+    try expectComponent(2, "Plain", "{\"a\":2.5}");
+    // A bit-63 u64 rides tag 3 bit-exact (C# has a real ulong).
+    try expect(mock.logsContain("CS_BULK_U64_OK"));
+    try expectComponent(3, "Stats", "{\"power\":0,\"score\":0,\"alive\":false,\"seed\":9223372036854775809}");
+    // Non-finite policy: NaN refused up front — nothing stored.
+    try expect(mock.logsContain("CS_BULK_NAN_REFUSED"));
+    try expect(mock.componentJson(4, "Stats") == null);
+    // Absent components answer false through both routes.
+    try expect(mock.logsContain("CS_BULK_ABSENT_OK"));
+}
+
+test "csharp bulk v1.3: batch refusals are loud — int fields, stale set, nesting, mismatch" {
+    fresh();
+    defer scripting.Controller.deinit();
+    try setup();
+
+    // Int-carrying components refused on both directions
+    // (ArgumentException, caught in-script).
+    try expect(mock.logsContain("CS_BULK_GET_INT_REFUSED"));
+    try expect(mock.logsContain("CS_BULK_SET_INT_REFUSED"));
+    // The exact-size positional-coupling guard fired; nothing applied.
+    try expect(!mock.logsContain("CS_BULK_STALE_ACCEPTED"));
+    try expect(mock.logsContain("CS_BULK_STALE_REFUSED"));
+    // Nested Batch calls refused.
+    try expect(!mock.logsContain("CS_BULK_NESTED_ACCEPTED"));
+    try expect(mock.logsContain("CS_BULK_NESTED_REFUSED"));
+    // Layout mismatch (zero-stream-float component vs one-field view)
+    // refused before any delegate call.
+    try expect(!mock.logsContain("CS_BULK_MISMATCH_ACCEPTED"));
+    try expect(!mock.logsContain("CS_BULK_MISMATCH_RAN"));
+    try expect(mock.logsContain("CS_BULK_MISMATCH_REFUSED"));
+}
+
+test "csharp bulk stage 3: iterator exit semantics — early exit commits, throw aborts" {
+    fresh();
+    defer scripting.Controller.deinit();
+    try setup();
+
+    // Empty query: 0, the delegate never ran.
+    try expect(mock.logsContain("CS_BULK_EMPTY_0"));
+    try expect(!mock.logsContain("CS_BULK_EMPTY_RAN"));
+    // BatchWhile stopped after the first row and COMMITTED its write
+    // (the script re-read x==11 / 2 / 3 through the contract itself).
+    try expect(mock.logsContain("CS_BULK_WHILE_COMMIT_OK"));
+    // The throwing delegate aborted the whole write (x stayed 11).
+    try expect(!mock.logsContain("CS_BULK_THROW_SWALLOWED"));
+    try expect(mock.logsContain("CS_BULK_THROW_ABORTED"));
+}
+
+test "csharp bulk stage 3: the ref-struct iterator round-trips the steady state" {
+    fresh();
+    defer scripting.Controller.deinit();
+    try setup();
+
+    // The raw tier saw exactly 3 entities × stride 4 on the fresh set.
+    try expect(mock.logsContain("CS_BULK_RAW_3_12"));
+
+    tick(0.016);
+    try expect(mock.logsContain("CS_BULK_ITER_3"));
+    // Entities 8..10 are the iterator's set (see BulkProbe.cs's id
+    // ledger); write-through refs mapped [X, Y | Vx, Vy] as the stream
+    // lays out, and the bounce flipped entity 10's Vx.
+    try expectComponent(8, "BatchPos", "{\"x\":11,\"y\":-10}");
+    try expectComponent(9, "BatchPos", "{\"x\":12,\"y\":-10}");
+    try expectComponent(10, "BatchPos", "{\"x\":13,\"y\":-10}");
+    try expectComponent(10, "BatchVel", "{\"vx\":-10,\"vy\":-10}");
+    try expectComponent(8, "BatchVel", "{\"vx\":10,\"vy\":-10}");
+    // Second tick is steady state (entity 10 moves backward, bounced).
+    tick(0.016);
+    try expectComponent(8, "BatchPos", "{\"x\":21,\"y\":-20}");
+    try expectComponent(10, "BatchPos", "{\"x\":3,\"y\":-20}");
+}
