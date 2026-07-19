@@ -59,6 +59,23 @@ Then re-copy into this directory:
 Update `mruby_sources` in build.zig if the file set changed, and re-run
 `zig build test`.
 
+## Local patches (RE-APPLY after regenerating)
+
+A regeneration overwrites the files below with pristine upstream, dropping
+these fixes — re-apply each one:
+
+- **`src/vm.c`, `stack_init()`** (labelle-scripting#56): add
+  `stack_clear(c->stbase, STACK_INIT_SIZE);` right after `c->stbase` is
+  `mrb_malloc`'d. Upstream (through 3.4.0) never nil-initializes the
+  INITIAL VM stack, unlike `stack_extend_alloc()` which clears the grown
+  region. `mark_context_stack()` (gc.c) then reads those slots during GC;
+  on a heap left dirty by a prior `mrb_open`/`mrb_close` cycle a leftover
+  word is marked as a bogus object pointer and the VM crashes. Fresh
+  zero-filled pages hid it on a first boot, so it only bit multiple VM
+  lifecycles per process — the declare tool and any multi-VM test binary,
+  on Linux (glibc/musl recycle dirty memory; macOS libmalloc masked it).
+  Worth upstreaming.
+
 ## TODO — packaging refinement
 
 Vendoring in-repo trades fetch-laziness for build-laziness (lua keeps

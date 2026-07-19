@@ -118,6 +118,14 @@ stack_init(mrb_state *mrb)
   /* mrb_assert(mrb->stack == NULL); */
   c->stbase = (mrb_value*)mrb_malloc(mrb, STACK_INIT_SIZE * sizeof(mrb_value));
   c->stend = c->stbase + STACK_INIT_SIZE;
+  /* labelle patch (labelle-scripting#56): nil-init the initial stack, as
+     stack_extend_alloc() already does for the grown region. Without it the
+     initial STACK_INIT_SIZE slots hold whatever malloc handed back; the GC's
+     mark_context_stack() reads [stbase, ci->stack+nregs) and, on a heap
+     dirtied by a prior mrb_open/close cycle, marks a leftover word as a bogus
+     object pointer and crashes. Zero-filled fresh pages hid this on a first
+     VM boot, so it only bit multi-VM-per-process runs on Linux. */
+  stack_clear(c->stbase, STACK_INIT_SIZE);
 
   /* mrb_assert(ci == NULL); */
   static const mrb_callinfo ci_zero = { 0 };
