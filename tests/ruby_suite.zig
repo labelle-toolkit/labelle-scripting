@@ -1397,6 +1397,106 @@ test "bulk stage 2: Labelle.batch surfaces batch_get's raise and a raising block
     try expect(mock.logsContain("old host refused: labelle: batch_get — the host engine lacks batch support"));
 }
 
+test "bulk stage 2: break and return from the block COMMIT the writes made so far" {
+    fresh();
+    // Nonlocal-exit semantics (PR #46 round 1): break/return are the
+    // NORMAL iterator early-exit — everything written up to that point
+    // flushes through the one batch_set (entities not yet yielded write
+    // back unchanged); only a RAISE aborts (previous test).
+    scripting.registerScript("batch_block_break",
+        \\NAMES = ["BatchPos", "BatchVel"].freeze
+        \\def early(limit)
+        \\  Labelle.batch(NAMES) do |e|
+        \\    e.x += 100.0
+        \\    return :stopped if e.x > limit
+        \\  end
+        \\end
+        \\def init
+        \\  3.times do |i|
+        \\    e = Labelle::Entity.create
+        \\    e.set("BatchPos", x: i + 1, y: 0)
+        \\    e.set("BatchVel", vx: 0, vy: 0)
+        \\  end
+        \\  r = Labelle.batch(NAMES) do |e|
+        \\    e.x += 10.0
+        \\    break :halted
+        \\  end
+        \\  Labelle.log("break r:#{r.inspect}")
+        \\  Labelle.log("early r:#{early(50).inspect}")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // `break value` is Labelle.batch's return value; the return-wrapper
+    // came back through the method return.
+    try expect(mock.logsContain("break r::halted"));
+    try expect(mock.logsContain("early r::stopped"));
+    // break after mutating entity 1 only: its write COMMITTED, the
+    // not-yet-yielded entities round-tripped unchanged (x stays 2 / 3)...
+    // then early(50) mutated entity 1 again (11 + 100) and returned.
+    try expectComponent(1, "BatchPos", "{\"x\":111,\"y\":0}");
+    try expectComponent(2, "BatchPos", "{\"x\":2,\"y\":0}");
+    try expectComponent(3, "BatchPos", "{\"x\":3,\"y\":0}");
+}
+
+test "bulk stage 2: reserved field names, the discovery race, and single-name coercion" {
+    fresh();
+    scripting.registerScript("batch_block_round1",
+        \\def init
+        \\  e = Labelle::Entity.create
+        \\  e.set("BatchPos", x: 1, y: 2)
+        \\  # Single non-array name is coerced ([names]); empty names refuse.
+        \\  n = Labelle.batch("BatchPos") { |v| v.x += 1.0 }
+        \\  Labelle.log("single n:#{n}")
+        \\  begin
+        \\    Labelle.batch([]) { |v| }
+        \\    Labelle.log("empty names accepted")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("empty names refused: #{ex.message}")
+        \\  end
+        \\  # A field named `initialize` would replace the view class's
+        \\  # constructor before klass.new — reserved, clear raise naming
+        \\  # the component and field, not a broken construction.
+        \\  e.set("Init", initialize: 1.5)
+        \\  begin
+        \\    Labelle.batch(["BatchPos", "Init"]) { |v| }
+        \\    Labelle.log("init field accepted")
+        \\  rescue ArgumentError => ex
+        \\    Labelle.log("init field refused: #{ex.message}")
+        \\  end
+        \\  # Discovery race: batch_get saw entities but the layout probe's
+        \\  # re-query comes back empty (entity destroyed mid-tick) — a
+        \\  # clear raise, not a low-level TypeError from a nil id. Stub
+        \\  # the re-query leg to force the race deterministically (an
+        \\  # UNCACHED names-set, so first-use discovery actually runs).
+        \\  e.set("BatchVel", vx: 1, vy: 1)
+        \\  def Labelle.raw_query(_names_json)
+        \\    []
+        \\  end
+        \\  begin
+        \\    Labelle.batch(["BatchVel"]) { |v| }
+        \\    Labelle.log("race accepted")
+        \\  rescue RuntimeError => ex
+        \\    Labelle.log("race refused: #{ex.message}")
+        \\  end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("single n:1"));
+    try expectComponent(1, "BatchPos", "{\"x\":2,\"y\":2}");
+    try expect(!mock.logsContain("empty names accepted"));
+    try expect(mock.logsContain("empty names refused: Labelle.batch: expected at least one component name"));
+    try expect(!mock.logsContain("init field accepted"));
+    try expect(mock.logsContain("init field refused:"));
+    try expect(mock.logsContain("component 'Init' field 'initialize' collides with the view machinery"));
+    try expect(!mock.logsContain("race accepted"));
+    try expect(mock.logsContain("race refused:"));
+    try expect(mock.logsContain("vanished between batch_get and layout discovery"));
+}
+
 test "bulk v1.3: an unrepresentable packed value falls back to JSON end-to-end" {
     fresh();
     // score is an i64 in the mock's Stats schema; a Ruby Float 1.0e30 is

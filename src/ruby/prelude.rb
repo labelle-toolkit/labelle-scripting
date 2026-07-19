@@ -254,14 +254,29 @@ module Labelle
   #
   # Accessors are the components' FIELD NAMES in stream order (components
   # in `names` order, fields in declaration order — the same walk
-  # batch_get lays the stream out with). Reads return Floats (bools ride
-  # as 0.0/1.0, like the raw stream); writes take numbers. Returns the
-  # entity count. An empty query returns 0 without touching the block. A
-  # RAISING block abandons the whole write — batch_set never runs, no
-  # entity is touched (all-or-nothing, safe to rescue and retry). The raw
-  # pairing rules apply to the block form too: no spawn/destroy inside
-  # the block, and no nested Labelle.batch over the same names (it would
-  # refill the shared buffer mid-iteration).
+  # batch_get lays the stream out with). Field accessors deliberately
+  # shadow inherited Object methods inside the view's scope (a `size` or
+  # `hash` field reads the stream, not Object) — only names the view
+  # machinery itself needs are reserved (see Refusals). Reads return
+  # Floats (bools ride as 0.0/1.0, like the raw stream); writes take
+  # numbers. `names` may be a single name instead of an array
+  # (`Labelle.batch("Position")`); an empty names array is an
+  # ArgumentError. Returns the entity count. An empty query returns 0
+  # without touching the block.
+  #
+  # Exit semantics — BREAK/RETURN COMMIT, RAISE ABORTS:
+  #   - a RAISING block abandons the whole write — batch_set never runs,
+  #     no entity is touched (all-or-nothing, safe to rescue and retry);
+  #   - `break` (or `return` from the enclosing method) inside the block
+  #     is the normal iterator early-exit and COMMITS: every write made
+  #     up to that point is flushed through the one batch_set ("stop
+  #     iterating, keep my edits"); entities not yet yielded write back
+  #     unchanged (the stream is a read-modify-write round-trip).
+  #     `break value` makes Labelle.batch return that value.
+  #
+  # The raw pairing rules apply to the block form too: no spawn/destroy
+  # inside the block, and no nested Labelle.batch over the same names
+  # (it would refill the shared buffer mid-iteration).
   #
   # How the view learns the layout (stage-2 design decision): the field
   # list is derived ON FIRST USE per names-set, in pure ruby, from a JSON
@@ -280,8 +295,15 @@ module Labelle
   # unchanged — int-typed fields, entity-set drift, pre-v1.3 hosts):
   #   - a field name duplicated across the named components raises
   #     ArgumentError (the accessors could not disambiguate);
+  #   - a field named `initialize` (or `__labelle_*`) raises
+  #     ArgumentError — those are the only names the view machinery
+  #     itself needs (the constructor and the base-offset writer);
+  #     every other field name is fair game, shadowing included;
   #   - a derived layout that does not match the stream's stride raises
-  #     RuntimeError (use the raw batch_get/batch_set flat loop there).
+  #     RuntimeError (use the raw batch_get/batch_set flat loop there);
+  #   - the entity set vanishing between batch_get and first-use layout
+  #     discovery (a mid-tick destroy race) raises RuntimeError — the
+  #     world moved under the paired calls; re-running next tick is fine.
   #
   # WHEN TO USE (measured, 2000-entity integrate+bounce, ReleaseFast,
   # engine 2.6.0): the block form costs ~1.9× the raw flat loop
@@ -298,6 +320,8 @@ module Labelle
   # closure to inline and approach flat-loop speed.
   def self.batch(names)
     raise ArgumentError, "Labelle.batch requires a block" unless block_given?
+    names = [names] unless names.is_a?(Array)
+    raise ArgumentError, "Labelle.batch: expected at least one component name" if names.empty?
     st = ((@batch_iters ||= {})[names.join("\x00")] ||= [[], nil, 0])
     buf = st[0]
     count = batch_get(names, buf)
@@ -315,15 +339,32 @@ module Labelle
                           "skips (non-scalar) confused the layout probe; use " \
                           "batch_get/batch_set with explicit offsets for these components"
     end
-    b = 0
-    i = 0
-    while i < count
-      view.__labelle_base = b
-      yield view
-      b += stride
-      i += 1
+    # Exit semantics (see the doc note): the yield loop runs inside
+    # begin/rescue/ensure so a `break` or `return` in the block — a
+    # NORMAL nonlocal exit that unwinds straight out of this method,
+    # bypassing rescue but running ensure — still COMMITS the writes
+    # made so far, while an exception keeps the all-or-nothing abort.
+    # The rescue clause only MARKS the abort and re-raises; it can't
+    # commit/skip itself because break/return never enter a rescue.
+    # (Deliberately not a `$!.nil?` check in the ensure: this vendored
+    # mruby does not populate `$!`, and the marker pattern is exact in
+    # both rubies anyway.)
+    aborted = false
+    begin
+      b = 0
+      i = 0
+      while i < count
+        view.__labelle_base = b
+        yield view
+        b += stride
+        i += 1
+      end
+    rescue Exception => e
+      aborted = true
+      raise e
+    ensure
+      batch_set(names, buf, count) unless aborted
     end
-    batch_set(names, buf, count)
     count
   end
 
@@ -335,6 +376,15 @@ module Labelle
   def self.__batch_view(names, buf, count)
     ids = raw_query(json_encode(names))
     first = ids[0]
+    if first.nil?
+      # batch_get saw entities but the discovery re-query sees none: an
+      # entity was destroyed between the paired calls (a mid-tick
+      # mutation race — the same drift batch_set's preflight guards).
+      # Nothing was written; calling again next tick is fine.
+      raise RuntimeError, "labelle: Labelle.batch(#{names.inspect}): the entity set " \
+                          "vanished between batch_get and layout discovery (an entity " \
+                          "was destroyed mid-tick) — nothing was written; re-run next tick"
+    end
     fields = []
     i = 0
     while i < names.size
@@ -344,10 +394,16 @@ module Labelle
       next if s.nil? # cross-check below catches any inconsistency
       json_decode(s).each do |k, v|
         next unless v.is_a?(Float) || v.is_a?(Integer) || true == v || false == v
-        if k.to_s.start_with?("__labelle")
-          raise ArgumentError, "labelle: Labelle.batch(#{names.inspect}): field name " \
-                               "'#{k}' collides with the view's internals — use " \
-                               "batch_get/batch_set with explicit offsets"
+        # The ONLY reserved names: the view's constructor and its
+        # base-offset writer. (A field accessor named `initialize`
+        # would replace the initializer before klass.new runs.) All
+        # other field names are allowed and intentionally shadow
+        # inherited Object methods within the view's scope.
+        if :initialize == k || k.to_s.start_with?("__labelle")
+          raise ArgumentError, "labelle: Labelle.batch(#{names.inspect}): component " \
+                               "'#{nm}' field '#{k}' collides with the view machinery " \
+                               "(reserved: initialize, __labelle_*) — rename the field " \
+                               "or use batch_get/batch_set with explicit offsets"
         end
         if fields.include?(k)
           raise ArgumentError, "labelle: Labelle.batch(#{names.inspect}): field name " \
