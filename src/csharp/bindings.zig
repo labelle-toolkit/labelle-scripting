@@ -11,6 +11,19 @@
 
 const vm_mod = @import("vm.zig");
 
+// Bulk-access shims (labelle-scripting#44): the managed assembly's
+// `[LibraryImport]`s bind the ALWAYS-PRESENT `labelle_scripting_bulk_*`
+// exports instead of the v1.3 contract symbols directly, so the
+// resolver never faults against a pre-2.6.0 engine host (the comptime
+// probe gates the forwards Zig-side — see src/bulk_shims.zig).
+// Referencing the file from this comptime block is what emits the
+// exports into every `-Dlanguage=csharp` binary (they reach the
+// managed side through the same rdynamic/GetMainProgramHandle route as
+// the contract symbols).
+comptime {
+    _ = @import("../bulk_shims.zig");
+}
+
 /// Shape parity with the embedded backends' grow-only scratch counters
 /// (`scripting.scratchGrowthCount()`): the Zig side of the csharp arm owns
 /// no scratch at all — buffers live in the managed assembly (each script's

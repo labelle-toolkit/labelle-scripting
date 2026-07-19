@@ -11,6 +11,17 @@
 
 const vm_mod = @import("vm.zig");
 
+// Bulk-access shims (labelle-scripting#44): the crystal object's
+// LibLabelle bindings reference the ALWAYS-PRESENT
+// `labelle_scripting_bulk_*` exports instead of the v1.3 contract
+// externs directly, so a game built against a pre-2.6.0 engine still
+// links (the comptime probe gates the forwards Zig-side — see
+// src/bulk_shims.zig). Referencing the file from this comptime block
+// is what emits the exports into every `-Dlanguage=crystal` binary.
+comptime {
+    _ = @import("../bulk_shims.zig");
+}
+
 /// Shape parity with the embedded backends' grow-only scratch counters
 /// (`scripting.scratchGrowthCount()`): the Zig side of the crystal arm
 /// owns no scratch at all — buffers live in the object (each script's

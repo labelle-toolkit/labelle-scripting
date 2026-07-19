@@ -10,6 +10,17 @@
 
 const vm_mod = @import("vm.zig");
 
+// Bulk-access shims (labelle-scripting#44): the crate's labelle module
+// references the ALWAYS-PRESENT `labelle_scripting_bulk_*` exports
+// instead of the v1.3 contract externs directly, so a game built
+// against a pre-2.6.0 engine still links (the comptime probe gates the
+// forwards Zig-side — see src/bulk_shims.zig). Referencing the file
+// from this comptime block is what emits the exports into every
+// `-Dlanguage=rust` binary.
+comptime {
+    _ = @import("../bulk_shims.zig");
+}
+
 /// Shape parity with the embedded backends' grow-only scratch counters
 /// (`scripting.scratchGrowthCount()`): the Zig side of the rust arm owns
 /// no scratch at all — buffers live in the crate (each script's own
