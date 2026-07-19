@@ -309,9 +309,24 @@ pub const hot_reload = struct {
     /// wiring degrades rather than truncate a namespace into a mismatch.
     pub const max_name_prefix = 64;
 
-    /// Longest reload key (`<prefix><stem>`): the watcher's per-root
-    /// registered-stem plus a root's namespace prefix.
-    pub const max_reload_name = watch.filename_cap + max_name_prefix;
+    /// Stack scratch cap for BUILDING a reload key (`<prefix><stem>`)
+    /// before it is looked up. Sized for the widest possible prefix +
+    /// stem; a key that overflows the STORED cap below is dropped by
+    /// `ownedSlot`, never truncated. This is a stack buffer only — it is
+    /// deliberately NOT the `Owned.name_buf` size, so the reload-owned
+    /// registry keeps its pre-#51 static footprint (a bigger static
+    /// `owned` array shifts BSS layout, which surfaced a latent
+    /// mruby-on-Linux alignment crash in the declare-tool suite that
+    /// shares this binary — the watcher itself is heap-clean under Guard
+    /// Malloc).
+    pub const reload_name_build_cap = watch.filename_cap + max_name_prefix;
+
+    /// Longest STORED/looked-up reload key. Kept at the pre-#51
+    /// `filename_cap` so `Owned.name_buf` (× `MAX_REGISTERED_SCRIPTS`)
+    /// does not grow: a `<prefix><stem>` longer than this is dropped
+    /// (logged), never stored. A `sky__`-class prefix + any real stem
+    /// fits comfortably.
+    pub const max_reload_name = watch.filename_cap;
 
     /// One watched root: the poller, the CANONICAL path identity (realpath
     /// of the opened dir — empty for `watchOpenedDir` roots, which carry no
@@ -353,7 +368,7 @@ pub const hot_reload = struct {
     /// with the SAME allocator that read them (roots may use different
     /// allocators, #51 round-2), so each slot remembers its own.
     const Owned = struct {
-        name_buf: [max_reload_name]u8 = undefined,
+        name_buf: [watch.filename_cap]u8 = undefined,
         name_len: usize = 0,
         source: ?[:0]u8 = null,
         source_allocator: std.mem.Allocator = undefined,
@@ -544,16 +559,23 @@ pub const hot_reload = struct {
                     continue;
                 };
                 // Reload key = the root's namespace prefix + the reported
-                // stem. Empty prefix (game root) → the bare stem, exactly
-                // as before; a pack root's `<pack>__` prefix keys its
-                // reload onto the namespaced registration and never aliases
-                // the game's same-stem scripts (#51 round-2).
-                var name_buf: [max_reload_name]u8 = undefined;
-                const name = if (r.prefix_len + ch.name.len <= name_buf.len) blk: {
-                    @memcpy(name_buf[0..r.prefix_len], r.prefix());
-                    @memcpy(name_buf[r.prefix_len..][0..ch.name.len], ch.name);
-                    break :blk name_buf[0 .. r.prefix_len + ch.name.len];
-                } else ch.name; // pathological: over-long — reload bare (still frees the source)
+                // stem, built in a stack scratch buffer. Empty prefix (game
+                // root) → the bare stem, exactly as before; a pack root's
+                // `<pack>__` prefix keys its reload onto the namespaced
+                // registration and never aliases the game's same-stem
+                // scripts (#51 round-2). An over-long key (a pathological
+                // prefix+stem past the build cap) drops rather than reload
+                // under a wrong (bare) name — `reloadOwned` is skipped and
+                // the source freed here.
+                var name_buf: [reload_name_build_cap]u8 = undefined;
+                if (r.prefix_len + ch.name.len > name_buf.len) {
+                    r.allocator.free(source);
+                    logHost("hot reload: reload name too long — skipped");
+                    continue;
+                }
+                @memcpy(name_buf[0..r.prefix_len], r.prefix());
+                @memcpy(name_buf[r.prefix_len..][0..ch.name.len], ch.name);
+                const name = name_buf[0 .. r.prefix_len + ch.name.len];
                 if (reloadOwned(r.allocator, name, source)) reloaded += 1;
             }
             // A dirty-marked file would re-report IMMEDIATELY on the
