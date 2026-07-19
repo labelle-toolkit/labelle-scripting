@@ -1,0 +1,7 @@
+{
+    // Minimal scene — no entities, no assets. The lua script creates its
+    // own entities through the Script Runtime Contract; the scene exists
+    // so `g.setScene("main")` has a name to bind to during setup.
+    "name": "main",
+    "children": []
+}

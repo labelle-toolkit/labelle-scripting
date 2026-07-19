@@ -112,10 +112,14 @@ const shims = [_]Shim{
     .{ .name = "raw_entity_destroy", .func = rawEntityDestroy },
     .{ .name = "raw_prefab_spawn", .func = rawPrefabSpawn },
     .{ .name = "raw_component_set", .func = rawComponentSet },
+    .{ .name = "raw_component_set_packed", .func = rawComponentSetPacked },
     .{ .name = "raw_component_get", .func = rawComponentGet },
+    .{ .name = "raw_component_get_packed_into", .func = rawComponentGetPackedInto },
     .{ .name = "raw_component_has", .func = rawComponentHas },
     .{ .name = "raw_component_remove", .func = rawComponentRemove },
     .{ .name = "raw_query", .func = rawQuery },
+    .{ .name = "raw_batch_get", .func = rawBatchGet },
+    .{ .name = "raw_batch_set", .func = rawBatchSet },
     .{ .name = "raw_event_emit", .func = rawEventEmit },
     .{ .name = "raw_event_subscribe", .func = rawEventSubscribe },
     .{ .name = "raw_event_poll", .func = rawEventPoll },
@@ -235,6 +239,369 @@ fn rawComponentRemove(L: ?*c.State) callconv(.c) c_int {
     const name = checkString(L, 2, "component name");
     c.lua_pushinteger(L, contract.labelle_component_remove(id, name.ptr, name.len));
     return 1;
+}
+
+// ── bulk component access (contract v1.3, labelle-scripting#44) ──────────
+// The packed per-component codec and the batched whole-query f32 stream.
+// Every fast-path extern reference is gated on the COMPTIME
+// `contract.host_has_bulk_access` probe: on a pre-v1.3 engine the packed
+// shims degrade to their "use the JSON path" sentinel (silent — the
+// prelude's JSON leg is the semantic twin) while the batch shims RAISE
+// (there is no batch fallback; degrading a whole-query read to nothing
+// would be silent data loss).
+
+/// Raise with a runtime-formatted message — `argError`'s formatted twin.
+/// An over-long formatted message degrades to a generic refusal rather
+/// than failing to raise.
+fn raiseFmt(L: ?*c.State, comptime fmt: []const u8, args: anytype) noreturn {
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch
+        "labelle: batch refused (message too long to format)";
+    _ = c.lua_pushlstring(L, msg.ptr, msg.len);
+    _ = c.lua_error(L);
+    unreachable;
+}
+
+/// The batch f32 stream cannot carry int-typed fields — i64/u64 silently
+/// corrupt past f32's 24-bit mantissa, so the host refuses the whole batch
+/// (contract v1.3: `(size_t)-2` from batch_get, -2 from batch_set) and the
+/// binding surfaces it LOUDLY. Never a silent JSON fallback.
+fn raiseBatchIntRefused(L: ?*c.State, names_json: []const u8) noreturn {
+    raiseFmt(L, "labelle: batch refused for {s}: a named component has an " ++
+        "int-typed field (i64/u64 cannot ride the f32 batch stream) — keep " ++
+        "that component on per-entity get/set (the packed codec carries " ++
+        "ints losslessly)", .{names_json});
+}
+
+const NO_BATCH_HOST_MSG = " — the host engine lacks batch support (script " ++
+    "contract v1.3 needs labelle-engine >= 2.6.0); use per-entity get/set " ++
+    "on this engine";
+
+/// Clear every existing key of the table at (absolute) index `idx` by
+/// assigning nil during a lua_next walk — the documented-safe mutation
+/// (existing fields may be set to nil mid-traversal), and the shim twin of
+/// json.decode_into's clear-all-then-fill: refilling the SAME keys right
+/// after revives their hash slots without a rehash, so a steady-state
+/// refill allocates nothing.
+fn clearTable(L: ?*c.State, idx: c_int) void {
+    c.lua_pushnil(L);
+    while (c.lua_next(L, idx) != 0) {
+        c.lua_settop(L, -2); // pop the value, keep the key for the walk
+        c.lua_pushvalue(L, -1); // duplicate the key for the assignment
+        c.lua_pushnil(L);
+        c.lua_settable(L, idx); // t[key] = nil (pops the copy + nil)
+    }
+}
+
+/// `raw_component_get_packed_into(id, name, tbl)` — the packed twin of the
+/// prelude's `json.decode_into` leg: decode the host's binary record
+/// straight into the caller's REUSED table (stale keys cleared first, the
+/// decode_into contract). Returns an integer verdict the prelude branches
+/// on:  1 = decoded (component present, packable);  0 = absent (tbl
+/// untouched — the JSON get would also report absent);  -1 = take the JSON
+/// path (0xFF non-scalar sentinel, or a pre-v1.3 engine — where this
+/// comptime-degrades without ever referencing the extern).
+///
+/// Value parity with the JSON leg: integral f32s land as lua INTEGERS
+/// (exactly what the host's "{d}" JSON text decodes to), non-integral as
+/// floats; i64/u64 as integers (u64 via the signed 64-bit bitcast, the
+/// entity-id rule); bools as booleans.
+fn rawComponentGetPackedInto(L: ?*c.State) callconv(.c) c_int {
+    if (comptime !contract.host_has_bulk_access) {
+        c.lua_pushinteger(L, -1);
+        return 1;
+    } else {
+        const id = checkId(L, 1);
+        const name = checkString(L, 2, "component name");
+        if (c.lua_type(L, 3) != c.LUA_TTABLE)
+            argError(L, "labelle: get(name, into) requires a table to refill");
+        var buf = ensureScratch(L, SCRATCH_INITIAL_CAP);
+        var n = contract.labelle_component_get_packed(id, name.ptr, name.len, buf, scratch.cap);
+        if (n > scratch.cap) {
+            buf = ensureScratch(L, n);
+            n = contract.labelle_component_get_packed(id, name.ptr, name.len, buf, scratch.cap);
+        }
+        if (n == 0) {
+            c.lua_pushinteger(L, 0); // absent
+            return 1;
+        }
+        if (n > scratch.cap or buf[0] == 0xFF) {
+            c.lua_pushinteger(L, -1); // non-scalar component → JSON path
+            return 1;
+        }
+        clearTable(L, 3);
+        decodePackedIntoTable(L, 3, buf[0..n]);
+        c.lua_pushinteger(L, 1);
+        return 1;
+    }
+}
+
+/// Decode a packed record's fields into the table at `idx`. A malformed
+/// record stops early (fields decoded so far stay applied) — the host
+/// builds it, so this is belt-and-suspenders.
+fn decodePackedIntoTable(L: ?*c.State, idx: c_int, rec: []const u8) void {
+    const field_count = rec[0];
+    var pos: usize = 1;
+    var i: usize = 0;
+    while (i < field_count) : (i += 1) {
+        if (pos >= rec.len) return;
+        const name_len = rec[pos];
+        pos += 1;
+        if (pos + name_len > rec.len) return;
+        const fname = rec[pos..][0..name_len];
+        pos += name_len;
+        if (pos >= rec.len) return;
+        const tag = rec[pos];
+        pos += 1;
+        _ = c.lua_pushlstring(L, fname.ptr, fname.len);
+        switch (tag) {
+            0 => { // f32 — integral values land as integers (JSON parity)
+                if (pos + 4 > rec.len) {
+                    c.lua_settop(L, -2);
+                    return;
+                }
+                const f: f64 = @as(f32, @bitCast(std.mem.readInt(u32, rec[pos..][0..4], .little)));
+                pos += 4;
+                const max_exact: f64 = 9007199254740992.0; // 2^53 — any integral f32 is far below
+                if (@floor(f) == f and @abs(f) <= max_exact) {
+                    c.lua_pushinteger(L, @intFromFloat(f));
+                } else {
+                    c.lua_pushnumber(L, f);
+                }
+            },
+            1 => { // i64
+                if (pos + 8 > rec.len) {
+                    c.lua_settop(L, -2);
+                    return;
+                }
+                c.lua_pushinteger(L, std.mem.readInt(i64, rec[pos..][0..8], .little));
+                pos += 8;
+            },
+            2 => { // bool
+                if (pos + 1 > rec.len) {
+                    c.lua_settop(L, -2);
+                    return;
+                }
+                c.lua_pushboolean(L, @intFromBool(rec[pos] != 0));
+                pos += 1;
+            },
+            3 => { // u64 — the signed 64-bit bitcast (the entity-id rule)
+                if (pos + 8 > rec.len) {
+                    c.lua_settop(L, -2);
+                    return;
+                }
+                c.lua_pushinteger(L, @bitCast(std.mem.readInt(u64, rec[pos..][0..8], .little)));
+                pos += 8;
+            },
+            else => {
+                c.lua_settop(L, -2);
+                return;
+            },
+        }
+        c.lua_settable(L, idx); // tbl[fname] = value
+    }
+}
+
+/// `raw_component_set_packed(id, name, tbl)` — the packed write twin: tag
+/// each string-keyed field by its LUA runtime type (integer → i64, finite
+/// float → f32, boolean) and hand the host the binary record; the host
+/// coerces each into the target field's real type (64-bit ints ride the
+/// two's-complement bitcast pair). Returns 0 = applied, -1 = "encode JSON
+/// and use raw_component_set instead" — on ANY bailout: a non-string key,
+/// a non-scalar or non-finite value (the JSON encoder then raises the one
+/// canonical error for both routes), an over-wide record, a host refusal
+/// (non-scalar/f64 target, unrepresentable value), or a pre-v1.3 engine
+/// (where this comptime-degrades without referencing the extern).
+fn rawComponentSetPacked(L: ?*c.State) callconv(.c) c_int {
+    if (comptime !contract.host_has_bulk_access) {
+        c.lua_pushinteger(L, -1);
+        return 1;
+    } else {
+        const id = checkId(L, 1);
+        const name = checkString(L, 2, "component name");
+        if (c.lua_type(L, 3) != c.LUA_TTABLE)
+            argError(L, "labelle: set_packed requires a component table");
+        // Generous stack record: real components sit far under this; a
+        // pathological wide table just takes the JSON path. (A `return`
+        // mid-walk leaves lua_next's key/value on the stack — fine: a C
+        // function's results are the TOP values, the rest is discarded.)
+        var rec: [2048]u8 = undefined;
+        var w: usize = 1;
+        var nfields: usize = 0;
+        c.lua_pushnil(L);
+        while (c.lua_next(L, 3) != 0) {
+            // stack: … key value
+            if (c.lua_type(L, -2) != c.LUA_TSTRING) {
+                c.lua_pushinteger(L, -1); // non-string key → JSON path raises
+                return 1;
+            }
+            var klen: usize = 0;
+            // Safe on the KEY: it is already a string (no in-place
+            // number→string conversion that would confuse lua_next).
+            const kp = c.lua_tolstring(L, -2, &klen) orelse {
+                c.lua_pushinteger(L, -1);
+                return 1;
+            };
+            if (klen > 255 or w + 1 + klen + 9 > rec.len or nfields >= 255) {
+                c.lua_pushinteger(L, -1);
+                return 1;
+            }
+            rec[w] = @intCast(klen);
+            w += 1;
+            @memcpy(rec[w..][0..klen], kp[0..klen]);
+            w += klen;
+            switch (c.lua_type(L, -1)) {
+                c.LUA_TNUMBER => {
+                    if (c.lua_isinteger(L, -1) != 0) {
+                        rec[w] = 1;
+                        w += 1;
+                        std.mem.writeInt(i64, rec[w..][0..8], c.lua_tointegerx(L, -1, null), .little);
+                        w += 8;
+                    } else {
+                        const f = c.lua_tonumberx(L, -1, null);
+                        // Non-finite PARITY with the JSON route: the
+                        // encoder errors ("json.encode: non-finite
+                        // number") — never smuggle a NaN/Inf past it.
+                        if (!std.math.isFinite(f)) {
+                            c.lua_pushinteger(L, -1);
+                            return 1;
+                        }
+                        rec[w] = 0;
+                        w += 1;
+                        const f32v: f32 = @floatCast(f);
+                        std.mem.writeInt(u32, rec[w..][0..4], @bitCast(f32v), .little);
+                        w += 4;
+                    }
+                },
+                c.LUA_TBOOLEAN => {
+                    rec[w] = 2;
+                    w += 1;
+                    rec[w] = @intFromBool(c.lua_toboolean(L, -1) != 0);
+                    w += 1;
+                },
+                else => { // string/table/… → JSON path
+                    c.lua_pushinteger(L, -1);
+                    return 1;
+                },
+            }
+            nfields += 1;
+            c.lua_settop(L, -2); // pop the value, keep the key for lua_next
+        }
+        rec[0] = @intCast(nfields);
+        const rc = contract.labelle_component_set_packed(id, name.ptr, name.len, &rec, w);
+        // rc != 0: host refused (non-scalar target / unrepresentable
+        // value / unknown) — the prelude falls back to the JSON encoder.
+        c.lua_pushinteger(L, if (rc == 0) 0 else -1);
+        return 1;
+    }
+}
+
+/// `raw_batch_get(names_json, tbl)` — ONE contract call fills `tbl` with
+/// every matching entity's scalar component data as a flat f32 array
+/// (1-based), returning the entity COUNT. The host writes
+/// `[u32 count][f32 stream]` into the scratch (grow-and-retry on the
+/// required-size return); we decode the (n-4)/4 floats into the reused
+/// table and TRIM it to exactly that float count — trailing floats of a
+/// bigger past tick would otherwise ride into `raw_batch_set` and trip
+/// the host's exact-size coupling guard. An int-carrying named component
+/// RAISES (host refusal `(size_t)-2`); on a pre-v1.3 engine the call
+/// raises "lacks batch support" — there is no batch fallback.
+fn rawBatchGet(L: ?*c.State) callconv(.c) c_int {
+    // Comptime if/ELSE — not an early raise: only the taken branch is
+    // analyzed, so on a pre-v1.3 engine the externs below are never
+    // referenced (no link error) and the call raises instead.
+    if (comptime !contract.host_has_bulk_access) {
+        argError(L, "labelle: batch_get" ++ NO_BATCH_HOST_MSG);
+    } else {
+        const names = checkString(L, 1, "component-names json array");
+        if (c.lua_type(L, 2) != c.LUA_TTABLE)
+            argError(L, "labelle: batch_get requires a table to fill");
+        var buf = ensureScratch(L, SCRATCH_INITIAL_CAP);
+        var n = contract.labelle_component_batch_get(names.ptr, names.len, buf, scratch.cap);
+        // The refusal sentinel must be checked BEFORE the grow-retry: it
+        // is (size_t)-2, which would otherwise read as a required size.
+        if (n == contract.BATCH_INT_REFUSED) raiseBatchIntRefused(L, names);
+        if (n == 0) {
+            c.lua_pushinteger(L, 0); // not bound / malformed
+            return 1;
+        }
+        if (n > scratch.cap) {
+            buf = ensureScratch(L, n);
+            n = contract.labelle_component_batch_get(names.ptr, names.len, buf, scratch.cap);
+            if (n == 0 or n > scratch.cap) { // belt
+                c.lua_pushinteger(L, 0);
+                return 1;
+            }
+        }
+        if (n < 4) {
+            c.lua_pushinteger(L, 0);
+            return 1;
+        }
+        const count = std.mem.readInt(u32, buf[0..4], .little);
+        const nfloats = (n - 4) / 4;
+        var i: usize = 0;
+        while (i < nfloats) : (i += 1) {
+            const bits = std.mem.readInt(u32, buf[4 + i * 4 ..][0..4], .little);
+            c.lua_pushnumber(L, @as(f32, @bitCast(bits)));
+            c.lua_rawseti(L, 2, @intCast(i + 1));
+        }
+        // Trim to exactly the stream's float count (capacity survives).
+        var j: u64 = @intCast(nfloats + 1);
+        const old_len = c.lua_rawlen(L, 2);
+        while (j <= old_len) : (j += 1) {
+            c.lua_pushnil(L);
+            c.lua_rawseti(L, 2, @intCast(j));
+        }
+        c.lua_pushinteger(L, count);
+        return 1;
+    }
+}
+
+/// `raw_batch_set(names_json, tbl, count)` — ONE contract call writes the
+/// whole swarm back: packs every element of `tbl` (exactly what batch_get
+/// filled and trimmed) as raw f32 and hands the pure stream (no header) to
+/// the host, which re-queries the same entities and applies positionally.
+/// `count` is the caller's entity count (API symmetry); the table length
+/// is the authoritative float count. Host refusals RAISE — both mean the
+/// write would corrupt data: -2 int-typed field; -1 entity-set drift (the
+/// exact-size preflight; nothing was applied — re-run batch_get and
+/// recompute). A non-number element raises too (loud, never a silent 0).
+fn rawBatchSet(L: ?*c.State) callconv(.c) c_int {
+    // Same comptime if/else gate as rawBatchGet — see the note there.
+    if (comptime !contract.host_has_bulk_access) {
+        argError(L, "labelle: batch_set" ++ NO_BATCH_HOST_MSG);
+    } else {
+        const names = checkString(L, 1, "component-names json array");
+        if (c.lua_type(L, 2) != c.LUA_TTABLE)
+            argError(L, "labelle: batch_set requires the batch_get table");
+        // arg 3 (`count`) is accepted for API symmetry; unused here.
+        const nfloats: usize = @intCast(c.lua_rawlen(L, 2));
+        const bytes = nfloats * 4;
+        const buf = ensureScratch(L, @max(bytes, 1));
+        var i: usize = 0;
+        while (i < nfloats) : (i += 1) {
+            _ = c.lua_rawgeti(L, 2, @intCast(i + 1));
+            var isnum: c_int = 0;
+            const f = c.lua_tonumberx(L, -1, &isnum);
+            if (isnum == 0)
+                argError(L, "labelle: batch_set: array elements must be numbers");
+            c.lua_settop(L, -2);
+            const f32v: f32 = @floatCast(f);
+            std.mem.writeInt(u32, buf[i * 4 ..][0..4], @bitCast(f32v), .little);
+        }
+        const rc = contract.labelle_component_batch_set(names.ptr, names.len, buf, bytes);
+        if (rc == -2) raiseBatchIntRefused(L, names);
+        if (rc != 0) raiseFmt(
+            L,
+            "labelle: batch_set refused for {s}: the entity set changed between " ++
+                "batch_get and batch_set (spawn/destroy between the paired calls " ++
+                "— the buffer was computed against a stale set; re-run batch_get " ++
+                "and recompute), or the names were malformed / the host not bound",
+            .{names},
+        );
+        c.lua_pushinteger(L, 0);
+        return 1;
+    }
 }
 
 // ── queries ──────────────────────────────────────────────────────────────

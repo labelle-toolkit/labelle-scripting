@@ -792,3 +792,510 @@ test "console eval: invalid UTF-8 result bytes become replacement chars in valid
     try expect(p2.value.ok);
     try expectEqualStrings("é" ++ scripting.eval.replacement_char ++ "z", p2.value.value);
 }
+
+// ── bulk component access (contract v1.3, labelle-scripting#44) ──────────
+// The lua port of the ruby suite's bulk coverage: packed codec fast path
+// (+ JSON fallbacks), batch_get/batch_set round-trip + refusals, and the
+// for-in block iterator (break/return commit, error aborts).
+
+test "bulk v1.3: packed codec rides the get-into/set fast path, JSON stays the fallback" {
+    fresh();
+    // "Stats" is in the mock's packed schema table (one field per scalar
+    // kind); "Plain" is NOT — its set/get must degrade to the JSON path
+    // (set_packed -1 / get_packed 0xFF), invisibly to the script.
+    scripting.registerScript("packed_rt",
+        \\function init()
+        \\  local e = Entity.new()
+        \\  if not e:set("Stats", { power = 1.5, score = -42, alive = true, seed = 123 }) then
+        \\    error("packed set refused")
+        \\  end
+        \\  local s = {}
+        \\  if e:get("Stats", s) == nil then error("packed get_into failed") end
+        \\  labelle.log("packed:" .. s.power .. ":" .. s.score .. ":" .. tostring(s.alive) .. ":" .. s.seed)
+        \\  if not e:set("Plain", { a = 2.5 }) then error("plain set refused") end
+        \\  local p = { stale = 9 }
+        \\  if e:get("Plain", p) == nil then error("plain get_into failed") end
+        \\  labelle.log("plain:" .. p.a .. ":" .. tostring(p.stale))
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // Every field kind survived the binary round-trip (f32/i64/bool/u64).
+    try expect(mock.logsContain("packed:1.5:-42:true:123"));
+    // The stored JSON is in the mock's SCHEMA order (power,score,alive,
+    // seed) — the packed set wrote it. The JSON encoder would have sorted
+    // the keys (alive,power,score,seed), so key order proves the path.
+    try expectComponent(1, "Stats", "{\"power\":1.5,\"score\":-42,\"alive\":true,\"seed\":123}");
+    // The schema-less component still round-trips — through JSON — and
+    // the refill cleared the stale key (decode_into's contract, kept by
+    // both paths).
+    try expect(mock.logsContain("plain:2.5:nil"));
+    try expectComponent(1, "Plain", "{\"a\":2.5}");
+}
+
+test "bulk v1.3: packed get-into clears stale keys like decode_into" {
+    fresh();
+    scripting.registerScript("packed_clear",
+        \\function init()
+        \\  local e = Entity.new()
+        \\  e:set("Stats", { power = 2.5, score = 1, alive = false, seed = 0 })
+        \\  local s = { leftover = "x" }
+        \\  e:get("Stats", s)
+        \\  labelle.log("clear:" .. tostring(s.leftover) .. ":" .. s.power)
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("clear:nil:2.5"));
+}
+
+test "bulk v1.3: batch_get/batch_set round-trip the whole query as one f32 stream" {
+    fresh();
+    scripting.registerScript("batch_rt",
+        \\local NAMES = { "BatchPos", "BatchVel" }
+        \\local buf = {}
+        \\function init()
+        \\  for i = 1, 3 do
+        \\    local e = Entity.new()
+        \\    e:set("BatchPos", { x = i, y = 0 })
+        \\    e:set("BatchVel", { vx = 10, vy = -10 })
+        \\  end
+        \\  local lone = Entity.new()
+        \\  lone:set("BatchPos", { x = 7, y = 8 })
+        \\end
+        \\function update(dt)
+        \\  local count = labelle.batch_get(NAMES, buf)
+        \\  labelle.log("batch count:" .. count .. " floats:" .. #buf)
+        \\  for i = 0, count - 1 do
+        \\    local b = i * 4
+        \\    buf[b + 1] = buf[b + 1] + buf[b + 3] -- x += vx
+        \\    buf[b + 2] = buf[b + 2] + buf[b + 4] -- y += vy
+        \\  end
+        \\  labelle.batch_set(NAMES, buf, count)
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+    // 3 matching entities (the lone BatchPos-only one is filtered out),
+    // stride 4 → the reused table holds exactly 12 floats.
+    try expect(mock.logsContain("batch count:3 floats:12"));
+    try expectComponent(1, "BatchPos", "{\"x\":11,\"y\":-10}");
+    try expectComponent(2, "BatchPos", "{\"x\":12,\"y\":-10}");
+    try expectComponent(3, "BatchPos", "{\"x\":13,\"y\":-10}");
+    // A second tick reuses the same table and advances again — the
+    // steady-state shape.
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "BatchPos", "{\"x\":21,\"y\":-20}");
+    try expectComponent(3, "BatchPos", "{\"x\":23,\"y\":-20}");
+    // The filtered-out entity was never rewritten.
+    try expectComponent(4, "BatchPos", "{\"x\":7,\"y\":8}");
+}
+
+test "bulk v1.3: batch refuses int-carrying components loudly (never a silent coercion)" {
+    fresh();
+    // "Stats" carries i64/u64 fields → the host refuses the whole batch
+    // ((size_t)-2 from batch_get, -2 from batch_set) and the binding
+    // raises — int corruption through f32 must be loud, never a silent
+    // fallback.
+    scripting.registerScript("batch_refuse",
+        \\function init()
+        \\  local e = Entity.new()
+        \\  e:set("Stats", { power = 1, score = 5, alive = true, seed = 9 })
+        \\  e:set("BatchPos", { x = 1, y = 2 })
+        \\  local ok, err = pcall(function() labelle.batch_get({ "BatchPos", "Stats" }, {}) end)
+        \\  if ok then labelle.log("get refusal missed") else labelle.log("get refused: " .. err) end
+        \\  local ok2, err2 = pcall(function() labelle.batch_set({ "Stats" }, { 1.0, 2.0, 3.0, 4.0 }, 1) end)
+        \\  if ok2 then labelle.log("set refusal missed") else labelle.log("set refused: " .. err2) end
+        \\  labelle.log("still alive")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("get refusal missed"));
+    try expect(!mock.logsContain("set refusal missed"));
+    // The raise names the refused component list and the reason.
+    try expect(mock.logsContain("get refused: labelle: batch refused for [\"BatchPos\",\"Stats\"]"));
+    try expect(mock.logsContain("int-typed"));
+    try expect(mock.logsContain("set refused: labelle: batch refused for [\"Stats\"]"));
+    // The raise is catchable — the script kept running.
+    try expect(mock.logsContain("still alive"));
+    // And nothing was written through the refused paths.
+    try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
+}
+
+test "bulk v1.3: batch_set raises when the entity set changed since batch_get" {
+    fresh();
+    scripting.registerScript("batch_stale",
+        \\local NAMES = { "BatchPos", "BatchVel" }
+        \\local es = {}
+        \\local buf = {}
+        \\function init()
+        \\  for i = 1, 2 do
+        \\    local e = Entity.new()
+        \\    e:set("BatchPos", { x = i, y = 0 })
+        \\    e:set("BatchVel", { vx = 1, vy = 1 })
+        \\    es[i] = e
+        \\  end
+        \\end
+        \\function update(dt)
+        \\  local count = labelle.batch_get(NAMES, buf)
+        \\  es[2]:destroy() -- the forbidden move: destroy between get and set
+        \\  local ok, err = pcall(function() labelle.batch_set(NAMES, buf, count) end)
+        \\  if ok then labelle.log("stale write accepted") else labelle.log("stale refused: " .. err) end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+    // The exact-size positional-coupling guard fired and surfaced as a
+    // catchable error telling the script to re-get.
+    try expect(!mock.logsContain("stale write accepted"));
+    try expect(mock.logsContain("stale refused:"));
+    try expect(mock.logsContain("entity set changed"));
+}
+
+test "bulk stage 3: the labelle.batch for-in iterator round-trips through ONE reused view" {
+    fresh();
+    scripting.registerScript("batch_block",
+        \\local NAMES = { "BatchPos", "BatchVel" }
+        \\function init()
+        \\  for i = 1, 3 do
+        \\    local e = Entity.new()
+        \\    e:set("BatchPos", { x = i, y = 0 })
+        \\    e:set("BatchVel", { vx = 10, vy = -10 })
+        \\  end
+        \\end
+        \\function update(dt)
+        \\  local same = 0
+        \\  local seen = nil
+        \\  local n = 0
+        \\  for e in labelle.batch(NAMES) do
+        \\    n = n + 1
+        \\    if seen == nil then seen = e end
+        \\    if seen == e then same = same + 1 end -- view REUSE: one table
+        \\    e.x = e.x + e.vx
+        \\    e.y = e.y + e.vy
+        \\    if e.x > 12.0 then e.vx = -e.vx end -- bounce entity 3 (x reaches 13)
+        \\  end
+        \\  labelle.log("block n:" .. n .. " same_view:" .. same)
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    scripting.Controller.tick(.{}, 0.016);
+    // 3 entities, every iteration saw the SAME view table, and normal
+    // loop exhaustion COMMITTED through the one batch_set: accessors
+    // mapped [x, y, vx, vy] exactly as the stream is laid out.
+    try expect(mock.logsContain("block n:3 same_view:3"));
+    try expectComponent(1, "BatchPos", "{\"x\":11,\"y\":-10}");
+    try expectComponent(2, "BatchPos", "{\"x\":12,\"y\":-10}");
+    try expectComponent(3, "BatchPos", "{\"x\":13,\"y\":-10}");
+    try expectComponent(3, "BatchVel", "{\"vx\":-10,\"vy\":-10}");
+    try expectComponent(1, "BatchVel", "{\"vx\":10,\"vy\":-10}");
+    // Second tick rides the CACHED view — steady state advances again
+    // (entity 3 now moves backward with its flipped vx).
+    scripting.Controller.tick(.{}, 0.016);
+    try expectComponent(1, "BatchPos", "{\"x\":21,\"y\":-20}");
+    try expectComponent(3, "BatchPos", "{\"x\":3,\"y\":-20}");
+}
+
+test "bulk stage 3: labelle.batch on an empty result iterates zero times; empty names refuse" {
+    fresh();
+    scripting.registerScript("batch_block_empty",
+        \\function init()
+        \\  local n = 0
+        \\  for e in labelle.batch({ "BatchPos", "BatchVel" }) do n = n + 1 end
+        \\  labelle.log("empty n:" .. n)
+        \\  local ok, err = pcall(function()
+        \\    for e in labelle.batch({}) do end
+        \\  end)
+        \\  if ok then labelle.log("empty names accepted") else labelle.log("empty names refused: " .. err) end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // No matching entities: zero iterations, no error, nothing written.
+    try expect(mock.logsContain("empty n:0"));
+    try expect(!mock.logsContain("empty names accepted"));
+    try expect(mock.logsContain("labelle.batch: expected at least one component name"));
+}
+
+test "bulk stage 3: labelle.batch refuses ambiguous and probe-defeating layouts loudly" {
+    fresh();
+    scripting.registerScript("batch_block_refuse",
+        \\function init()
+        \\  local e = Entity.new()
+        \\  e:set("BatchPos", { x = 1, y = 2 })
+        \\  e:set("Plain", { a = 2.5 })
+        \\  -- The same component named twice: every field name collides —
+        \\  -- the view could not disambiguate e.x, so it must not exist.
+        \\  local ok, err = pcall(function()
+        \\    for v in labelle.batch({ "BatchPos", "BatchPos" }) do end
+        \\  end)
+        \\  if ok then labelle.log("dup accepted") else labelle.log("dup refused: " .. err) end
+        \\  -- "Plain" has no schema — it contributes ZERO stream floats
+        \\  -- (the mock's stand-in for a non-scalar component) while its
+        \\  -- JSON shows a number, so the derived layout cannot match the
+        \\  -- stream stride. The cross-check must refuse, never mis-map.
+        \\  local ok2, err2 = pcall(function()
+        \\    for v in labelle.batch({ "BatchPos", "Plain" }) do end
+        \\  end)
+        \\  if ok2 then labelle.log("mismatch accepted") else labelle.log("mismatch refused: " .. err2) end
+        \\  labelle.log("still alive")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("dup accepted"));
+    try expect(mock.logsContain("dup refused:"));
+    try expect(mock.logsContain("appears in more than one named component"));
+    try expect(!mock.logsContain("mismatch accepted"));
+    try expect(mock.logsContain("mismatch refused:"));
+    try expect(mock.logsContain("does not match the host stream"));
+    // Both raises are catchable; nothing was written through either.
+    try expect(mock.logsContain("still alive"));
+    try expectComponent(1, "BatchPos", "{\"x\":1,\"y\":2}");
+}
+
+test "bulk stage 3: labelle.batch surfaces batch_get's raise and an erroring body writes NOTHING" {
+    fresh();
+    scripting.registerScript("batch_block_errors",
+        \\local NAMES = { "BatchPos", "BatchVel" }
+        \\function init()
+        \\  local e = Entity.new()
+        \\  e:set("BatchPos", { x = 5, y = 6 })
+        \\  e:set("BatchVel", { vx = 1, vy = 1 })
+        \\  -- An ERRORING loop body abandons the WHOLE batch: the closer
+        \\  -- sees the error, batch_set never runs, so the mutation before
+        \\  -- the error is not applied.
+        \\  local ok, err = pcall(function()
+        \\    for v in labelle.batch(NAMES) do
+        \\      v.x = 999.0
+        \\      error("boom", 0)
+        \\    end
+        \\  end)
+        \\  if ok then labelle.log("error swallowed") else labelle.log("body errored: " .. err) end
+        \\  -- Unsupported-host parity: labelle.batch's first act IS
+        \\  -- raw_batch_get, so a host without batch support surfaces the
+        \\  -- exact same raise. Prove the pass-through (and that batch_set
+        \\  -- is never reached) by stubbing raw_batch_get to raise the
+        \\  -- pre-v1.3 message verbatim.
+        \\  labelle.raw_batch_get = function(_names, _arr)
+        \\    error("labelle: batch_get — the host engine lacks batch support " ..
+        \\      "(script contract v1.3 needs labelle-engine >= 2.6.0); " ..
+        \\      "use per-entity get/set on this engine", 0)
+        \\  end
+        \\  labelle.raw_batch_set = function(_names, _arr, _n)
+        \\    labelle.log("batch_set reached")
+        \\  end
+        \\  local ok2, err2 = pcall(function()
+        \\    for v in labelle.batch(NAMES) do labelle.log("body ran on old host") end
+        \\  end)
+        \\  if ok2 then labelle.log("old host accepted") else labelle.log("old host refused: " .. err2) end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    // The body's error propagated and nothing was written.
+    try expect(!mock.logsContain("error swallowed"));
+    try expect(mock.logsContain("body errored: boom"));
+    try expectComponent(1, "BatchPos", "{\"x\":5,\"y\":6}");
+    // The unsupported-host raise passed through IDENTICALLY; the body
+    // never ran and batch_set was never reached.
+    try expect(!mock.logsContain("old host accepted"));
+    try expect(!mock.logsContain("body ran on old host"));
+    try expect(!mock.logsContain("batch_set reached"));
+    try expect(mock.logsContain("old host refused: labelle: batch_get — the host engine lacks batch support"));
+}
+
+test "bulk stage 3: break and return from the loop body COMMIT the writes made so far" {
+    fresh();
+    // Nonlocal-exit semantics, carried by the generic-for CLOSING value:
+    // break/return are the NORMAL iterator early-exit — everything
+    // written up to that point flushes through the one batch_set
+    // (entities not yet visited write back unchanged); only an ERROR
+    // aborts (previous test).
+    scripting.registerScript("batch_block_break",
+        \\local NAMES = { "BatchPos", "BatchVel" }
+        \\local function early(limit)
+        \\  for e in labelle.batch(NAMES) do
+        \\    e.x = e.x + 100.0
+        \\    if e.x > limit then return "stopped" end
+        \\  end
+        \\  return "ran out"
+        \\end
+        \\function init()
+        \\  for i = 1, 3 do
+        \\    local e = Entity.new()
+        \\    e:set("BatchPos", { x = i, y = 0 })
+        \\    e:set("BatchVel", { vx = 0, vy = 0 })
+        \\  end
+        \\  for e in labelle.batch(NAMES) do
+        \\    e.x = e.x + 10.0
+        \\    break
+        \\  end
+        \\  labelle.log("break done")
+        \\  labelle.log("early r:" .. early(50))
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("break done"));
+    // `return` out of the enclosing function commits the same way.
+    try expect(mock.logsContain("early r:stopped"));
+    // break after mutating entity 1 only: its write COMMITTED, the
+    // not-yet-visited entities round-tripped unchanged (x stays 2 / 3)...
+    // then early(50) mutated entity 1 again (11 + 100) and returned.
+    try expectComponent(1, "BatchPos", "{\"x\":111,\"y\":0}");
+    try expectComponent(2, "BatchPos", "{\"x\":2,\"y\":0}");
+    try expectComponent(3, "BatchPos", "{\"x\":3,\"y\":0}");
+}
+
+test "bulk stage 3: single-name coercion, unknown-field raise, and the discovery race" {
+    fresh();
+    scripting.registerScript("batch_block_round1",
+        \\function init()
+        \\  local e = Entity.new()
+        \\  e:set("BatchPos", { x = 1, y = 2 })
+        \\  -- Single non-array name is coerced ({ name }).
+        \\  local n = 0
+        \\  for v in labelle.batch("BatchPos") do
+        \\    v.x = v.x + 1.0
+        \\    n = n + 1
+        \\  end
+        \\  labelle.log("single n:" .. n)
+        \\  -- A typo'd field name raises instead of silently reading nil
+        \\  -- (no names are reserved — the view's base offset lives in an
+        \\  -- upvalue, not on the table).
+        \\  local ok, err = pcall(function()
+        \\    for v in labelle.batch("BatchPos") do local _ = v.z end
+        \\  end)
+        \\  if ok then labelle.log("typo accepted") else labelle.log("typo refused: " .. err) end
+        \\  -- Discovery race: batch_get saw entities but the layout probe's
+        \\  -- re-query comes back empty (entity destroyed mid-tick) — a
+        \\  -- clear raise, not a low-level nil error. Stub the re-query leg
+        \\  -- to force the race deterministically (an UNCACHED names-set,
+        \\  -- so first-use discovery actually runs).
+        \\  e:set("BatchVel", { vx = 1, vy = 1 })
+        \\  labelle.raw_query = function(_names_json) return "" end
+        \\  local ok2, err2 = pcall(function()
+        \\    for v in labelle.batch({ "BatchVel" }) do end
+        \\  end)
+        \\  if ok2 then labelle.log("race accepted") else labelle.log("race refused: " .. err2) end
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("single n:1"));
+    try expectComponent(1, "BatchPos", "{\"x\":2,\"y\":2}");
+    try expect(!mock.logsContain("typo accepted"));
+    try expect(mock.logsContain("typo refused:"));
+    try expect(mock.logsContain("unknown field 'z'"));
+    try expect(!mock.logsContain("race accepted"));
+    try expect(mock.logsContain("race refused:"));
+    try expect(mock.logsContain("vanished between batch_get and layout discovery"));
+}
+
+test "bulk v1.3: an unrepresentable packed value falls back to JSON end-to-end" {
+    fresh();
+    // score is an i64 in the mock's Stats schema; a lua float 1.0e30 is
+    // finite but out of i64 range, so the host REFUSES the packed set
+    // (-1, engine parity: refuse, never clamp) and the prelude falls
+    // back to the JSON path — which encodes the value faithfully.
+    scripting.registerScript("packed_range",
+        \\function init()
+        \\  local e = Entity.new()
+        \\  if not e:set("Stats", { power = 1.5, score = 1.0e30, alive = true, seed = 9 }) then
+        \\    error("set failed")
+        \\  end
+        \\  labelle.log("range done")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("range done"));
+    // SORTED keys = the JSON encoder wrote it (the packed set stores
+    // schema order: power,score,alive,seed) — proof the refusal engaged
+    // the fallback. Order-assert instead of byte-assert: the encoder's
+    // 1e30 rendering is not part of this pin.
+    const json = mock.componentJson(1, "Stats") orelse return error.TestExpectedComponent;
+    const ia = std.mem.indexOf(u8, json, "\"alive\"") orelse return error.TestExpectedKey;
+    const ip = std.mem.indexOf(u8, json, "\"power\"") orelse return error.TestExpectedKey;
+    const isc = std.mem.indexOf(u8, json, "\"score\"") orelse return error.TestExpectedKey;
+    const isd = std.mem.indexOf(u8, json, "\"seed\"") orelse return error.TestExpectedKey;
+    try expect(ia < ip and ip < isc and isc < isd);
+}
+
+test "bulk v1.3: the 64-bit bitcast pair round-trips a bit-63 u64 through lua" {
+    fresh();
+    // seed (u64 schema kind) holds 0x8000000000000001 — lua integers are
+    // signed 64-bit, so the value travels as its bitcast
+    // -9223372036854775807 through the whole packed cycle: GET emits tag
+    // 3, the shim bitcasts to the signed integer (the entity-id rule),
+    // SET re-emits tag 1, the host bitcasts back — bit-exact end to end.
+    scripting.registerScript("packed_u64",
+        \\function init()
+        \\  local e = Entity.new()
+        \\  if not e:set("Stats", { power = 0.0, score = 0, alive = false, seed = -9223372036854775807 }) then
+        \\    error("set failed")
+        \\  end
+        \\  local s = {}
+        \\  if e:get("Stats", s) == nil then error("get_into failed") end
+        \\  labelle.log("u64rt:" .. tostring(s.seed == -9223372036854775807))
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(mock.logsContain("u64rt:true"));
+    // The host stored the UNSIGNED value (the packed set's schema-order
+    // serialization proves the packed path carried it, not JSON).
+    try expectComponent(1, "Stats", "{\"power\":0,\"score\":0,\"alive\":false,\"seed\":9223372036854775809}");
+}
+
+test "bulk v1.3: non-finite floats take the same refusal on the packed and JSON routes" {
+    fresh();
+    // Parity pin: json.encode errors ("json.encode: non-finite number")
+    // on NaN/Inf. The packed fast path must not smuggle those into the
+    // host, so it bails to the JSON fallback — which raises the SAME
+    // canonical error. Both routes agree: one refusal, nothing stored.
+    scripting.registerScript("packed_nonfinite",
+        \\function init()
+        \\  local e = Entity.new()
+        \\  local ok, err = pcall(function()
+        \\    e:set("Stats", { power = 0 / 0, score = 0, alive = false, seed = 0 })
+        \\  end)
+        \\  if ok then labelle.log("nan accepted") else labelle.log("nan refused: " .. err) end
+        \\  local ok2, err2 = pcall(function()
+        \\    e:set("Stats", { power = math.huge })
+        \\  end)
+        \\  if ok2 then labelle.log("inf accepted") else labelle.log("inf refused: " .. err2) end
+        \\  labelle.log("nonfinite done")
+        \\end
+    );
+    try scripting.Controller.setup(.{});
+    defer scripting.Controller.deinit();
+
+    try expect(!mock.logsContain("nan accepted"));
+    try expect(!mock.logsContain("inf accepted"));
+    // Same canonical message from both entry points.
+    try expect(mock.logsContain("nan refused:"));
+    try expect(mock.logsContain("inf refused:"));
+    try expectEqual(@as(usize, 2), mock.logCount("json.encode: non-finite number"));
+    try expect(mock.logsContain("nonfinite done"));
+    // Nothing was stored by either refusal.
+    try expect(mock.componentJson(1, "Stats") == null);
+}

@@ -201,6 +201,50 @@ declare const labelle: {
   /** Per-frame scratch list (see the class doc). */
   FrameArray: typeof LabelleFrameArray;
 
+  // ── batched component access (contract v1.3; labelle-engine >= 2.6.0) ─
+
+  /**
+   * Fill `arr` with every matching entity's scalar component data as one
+   * flat f32 stream (components in `names` order, fields in declaration
+   * order) and return the entity count; `arr` is trimmed to exactly
+   * count×stride. ONE host crossing for the whole query — reuse the same
+   * `arr` across ticks. Throws TypeError when a named component carries an
+   * int-typed field (i64/u64 cannot ride the f32 stream), and Error on a
+   * pre-v1.3 host (no silent fallback).
+   */
+  batch_get(names: ComponentName[], arr: number[]): number;
+
+  /**
+   * Write the mutated `arr` back in one crossing (the host re-queries the
+   * same entities in the same order — no spawn/destroy between the paired
+   * calls). `n` is the entity count batch_get returned. Throws Error when
+   * the entity set changed since batch_get (nothing was applied — re-get
+   * and recompute), TypeError on int-typed fields, Error on a pre-v1.3
+   * host.
+   */
+  batch_set(names: ComponentName[], arr: number[], n: number): number;
+
+  /**
+   * The ergonomic layer over batch_get/batch_set: ONE batch_get, `fn`
+   * runs once per matching entity against a single REUSED view object
+   * whose accessors are the components' field names (never stash the view
+   * itself), then ONE batch_set writes everything back. Returns the
+   * entity count (0 on an empty query, without calling `fn`).
+   *
+   * Exit semantics — EARLY-RETURN COMMITS, THROW ABORTS: a throwing
+   * callback unwinds out before the write (batch_set never runs — the
+   * all-or-nothing abort); `return false` (strictly) stops the iteration
+   * early and COMMITS the writes made so far (not-yet-visited entities
+   * round-trip unchanged). Refusals are loud: duplicate field names
+   * across the named components, a layout that does not match the stream
+   * stride, int-typed fields, entity-set drift, and pre-v1.3 hosts all
+   * throw.
+   */
+  batch(
+    names: ComponentName | ComponentName[],
+    fn: (e: Record<string, number>) => boolean | void,
+  ): number;
+
   // ── events drained by the plugin each tick (called by the host) ─────
 
   /** Drain + dispatch the event inbox. The Controller calls this. */
@@ -220,11 +264,15 @@ declare const labelle: {
   raw_entity_destroy(id: EntityIdLike): void;
   raw_prefab_spawn(name: string, paramsJson: string): EntityId;
   raw_component_set(id: EntityIdLike, name: string, json: string): number;
+  /** Packed-fast-path set from an object (internal JSON fallback). */
+  raw_component_set_from(id: EntityIdLike, name: string, obj: object): number;
   raw_component_get(id: EntityIdLike, name: string): string | null;
   raw_component_get_into(id: EntityIdLike, name: string, into: object): boolean;
   raw_component_has(id: EntityIdLike, name: string): boolean;
   raw_component_remove(id: EntityIdLike, name: string): number;
   raw_query(namesJson: string): EntityId[];
+  raw_batch_get(namesJson: string, arr: number[]): number;
+  raw_batch_set(namesJson: string, arr: number[], n: number): number;
   raw_event_emit(name: string, json: string): number;
   raw_event_subscribe(name: string): void;
   raw_event_poll(): [name: string, payload: Payload] | null;

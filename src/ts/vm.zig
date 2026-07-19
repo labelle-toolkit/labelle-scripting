@@ -222,10 +222,16 @@ pub const c = struct {
     pub extern fn JS_GetException(ctx: ?*Context) Value;
     pub extern fn JS_HasException(ctx: ?*Context) bool;
     pub extern fn JS_Throw(ctx: ?*Context, obj: Value) Value;
-    /// Variadic printf-style — call with a constant, %-free message only.
+    /// Variadic printf-style — call with a constant, %-free message only
+    /// (runtime-formatted messages go through `"%s"` + a NUL-terminated
+    /// buffer, the bindings' raiseFmt pattern).
     pub extern fn JS_ThrowTypeError(ctx: ?*Context, fmt: [*:0]const u8, ...) Value;
     pub extern fn JS_ThrowSyntaxError(ctx: ?*Context, fmt: [*:0]const u8, ...) Value;
     pub extern fn JS_ThrowRangeError(ctx: ?*Context, fmt: [*:0]const u8, ...) Value;
+    /// Plain `Error` (no subclass) — quickjs-ng's rename of JS_ThrowError.
+    /// The bulk-access shims use it for environment/state refusals (stale
+    /// entity set, pre-v1.3 host) where no Type/Range class fits.
+    pub extern fn JS_ThrowPlainError(ctx: ?*Context, fmt: [*:0]const u8, ...) Value;
 
     // Reference counting (real exports in quickjs-ng 0.15).
     pub extern fn JS_FreeValue(ctx: ?*Context, v: Value) void;
