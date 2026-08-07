@@ -9,7 +9,14 @@
         // language: the declare-mode extractor (tools/declare) is
         // lua-based and ships with every install (see build.zig).
         .lua = .{
-            .url = "https://www.lua.org/ftp/lua-5.4.8.tar.gz",
+            // Mirror of the upstream release tarball, originally
+            // https://www.lua.org/ftp/lua-5.4.8.tar.gz — the hash below is
+            // content-pinned, so the URL choice cannot change what is built
+            // (a non-identical tarball fails the fetch). Mirrored 2026-08-07
+            // because a lua.org outage timed out labelle-assembler's
+            // "Examples integration test" CI job four runs straight, making
+            // lua.org a single point of failure for every consumer's CI.
+            .url = "https://github.com/labelle-toolkit/labelle-scripting/releases/download/deps-mirror/lua-5.4.8.tar.gz",
             .hash = "N-V-__8AAKEzFAAA695b9LXBhUSVK5MAV_VKSm1mEj3Acbze",
             .lazy = true,
         },
