@@ -109,8 +109,33 @@ local function id_sentinel()
 end
 
 local unknown_global_mt = {}
+local unknown_global_names = setmetatable({}, { __mode = "k" })
+local unknown_global_seen = nil
+
 local function unknown_global(name)
-  return setmetatable({ name = name }, unknown_global_mt)
+  local value = setmetatable({}, unknown_global_mt)
+  unknown_global_names[value] = name
+  if unknown_global_seen == nil then unknown_global_seen = name end
+  return value
+end
+
+local function unknown_global_name(value)
+  return unknown_global_names[value] or "?"
+end
+
+local function is_unknown_global(value)
+  return type(value) == "table" and getmetatable(value) == unknown_global_mt
+end
+
+local function reject_unknown(value, where)
+  if is_unknown_global(value) then
+    error(where .. ": unknown global '" .. unknown_global_name(value) ..
+      "' used as a declaration value (use a local binding or explicit nil)", 3)
+  end
+  if unknown_global_seen ~= nil then
+    error(where .. ": unknown global '" .. unknown_global_seen ..
+      "' was read while evaluating this declaration value (use a local binding or explicit nil)", 3)
+  end
 end
 
 -- Classify one spec value into { type = <schema type>, json = <default as
@@ -119,10 +144,7 @@ end
 -- SCRIPT's labelle.component/event(...) line (3), so the position prefix
 -- points at the declaration site.
 local function classify(where, v)
-  if type(v) == "table" and getmetatable(v) == unknown_global_mt then
-    error(where .. ": unknown global '" .. tostring(rawget(v, "name")) ..
-      "' used as a declaration value (use a local binding or explicit nil)", 3)
-  end
+  reject_unknown(v, where)
   if rawequal(v, id_sentinel) then
     return { type = "u64", json = "0" }
   end
@@ -200,6 +222,9 @@ end
 -- sees one consistent value in both modes.
 local function declare_component(name, spec, opts)
   local file = __DECLARE_FILE or "?"
+  reject_unknown(name, "labelle.component")
+  reject_unknown(spec, "labelle.component")
+  reject_unknown(opts, "labelle.component")
   if type(name) ~= "string" or name == "" then
     error("labelle.component: expected a non-empty component name string", 2)
   end
@@ -274,6 +299,8 @@ local MAX_EVENT_FIELDS = 32
 -- one consistent value in both modes.
 local function declare_event(name, spec, ...)
   local file = __DECLARE_FILE or "?"
+  reject_unknown(name, "labelle.event")
+  reject_unknown(spec, "labelle.event")
   if type(name) ~= "string" or name == "" then
     error("labelle.event: expected a non-empty event name string", 2)
   end
@@ -347,8 +374,8 @@ local function check_event_name(callee, name)
   local t = type(name)
   if t == "string" or t == "number" then return end
   local got = t
-  if t == "table" and getmetatable(name) == unknown_global_mt then
-    got = "nil"
+  if is_unknown_global(name) then
+    got = "unknown global '" .. unknown_global_name(name) .. "'"
   elseif rawequal(name, noop_result) then
     got = "a labelle.* helper result"
   elseif t == "table" and rawget(name, "__labelle_component") ~= nil then
@@ -411,6 +438,7 @@ local env_mt = {
 }
 
 function _G.__declare_env()
+  unknown_global_seen = nil
   return setmetatable({ labelle = _G.__declare_stub() }, env_mt)
 end
 

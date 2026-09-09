@@ -224,6 +224,55 @@ test "unknown globals in declaration arguments fail with file and line diagnosti
     );
 }
 
+test "unknown globals cannot be laundered through boolean expressions" {
+    try expectFailure(
+        &.{.{ .path = "scripts/guards.lua", .source =
+        \\local Controls = labelle.component("Controls", {
+        \\  level = MISSING_LEVEL and 3,
+        \\})
+    }},
+        &.{ "scripts/guards.lua:1", "unknown global 'MISSING_LEVEL'" },
+    );
+    try expectFailure(
+        &.{.{ .path = "scripts/guards.lua", .source =
+        \\local Controls = labelle.component("Controls", {
+        \\  level = MISSING_LEVEL or 3,
+        \\})
+    }},
+        &.{ "scripts/guards.lua:1", "unknown global 'MISSING_LEVEL'" },
+    );
+}
+
+test "unknown globals cannot be laundered through member access or table guards" {
+    try expectFailure(
+        &.{.{ .path = "scripts/guards.lua", .source =
+        \\local Controls = labelle.component("Controls", {
+        \\  level = DEFAULTS.LEVEL,
+        \\})
+    }},
+        &.{ "scripts/guards.lua:1", "unknown global 'DEFAULTS'" },
+    );
+    try expectFailure(
+        &.{.{ .path = "scripts/spec.lua", .source =
+        \\labelle.component("Controls", UNKNOWN_SPEC)
+    }},
+        &.{ "scripts/spec.lua:1", "unknown global 'UNKNOWN_SPEC'" },
+    );
+}
+
+test "runtime guards remain outside declare execution" {
+    // Function bodies are defined but never run by the extractor. A runtime
+    // guard that would touch `game` therefore remains valid in declare mode.
+    try expectSchema(&.{.{ .path = "scripts/runtime.lua", .source =
+        \\function update()
+        \\  if game then game.query("Controls") end
+        \\end
+        \\labelle.component("Controls", { level = 3 })
+    }},
+        \\{"components":[{"name":"Controls","persist":"persistent","fields":[{"name":"level","type":"i32","default":3}]}]}
+    );
+}
+
 test "local bindings and explicit nil declaration semantics remain valid" {
     // Local values are legal declaration inputs, while an explicit local nil
     // keeps Lua's existing table-constructor semantics: that field is absent.
@@ -350,7 +399,7 @@ test "a component ref where an event name belongs fails at generate (the on/emit
     try expectFailure(&.{.{
         .path = "scripts/bad.lua",
         .source = "labelle.on(HungerFed, function(ev) end)",
-    }}, &.{ "scripts/bad.lua:1", "labelle.on: expected an event-name string", "got nil" });
+    }}, &.{ "scripts/bad.lua:1", "labelle.on: expected an event-name string", "unknown global 'HungerFed'" });
     // A helper result names its own source; the runtime would raise on
     // the non-string all the same.
     try expectFailure(&.{.{
