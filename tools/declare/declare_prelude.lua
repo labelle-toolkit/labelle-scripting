@@ -26,6 +26,8 @@
 --   __declare_stub()  global — a FACTORY returning a fresh stub `labelle`
 --                     table; extract.zig calls it once per chunk and
 --                     plants the result into that chunk's private _ENV
+--   __declare_env()   global — returns that stub in a fresh chunk
+--                     environment that preserves unknown reads as sentinels
 --   __declare_emit()  global — returns the accumulated schema as one
 --                     compact JSON line after every chunk ran
 --
@@ -106,12 +108,21 @@ local function id_sentinel()
     "(v1: id fields always default 0) — write entity = labelle.id", 2)
 end
 
+local unknown_global_mt = {}
+local function unknown_global(name)
+  return setmetatable({ name = name }, unknown_global_mt)
+end
+
 -- Classify one spec value into { type = <schema type>, json = <default as
 -- JSON> }, or raise with `where` naming the declaration and field. Error
 -- level 3 = classify(1) → declare_component/declare_event(2) → the
 -- SCRIPT's labelle.component/event(...) line (3), so the position prefix
 -- points at the declaration site.
 local function classify(where, v)
+  if type(v) == "table" and getmetatable(v) == unknown_global_mt then
+    error(where .. ": unknown global '" .. tostring(rawget(v, "name")) ..
+      "' used as a declaration value (use a local binding or explicit nil)", 3)
+  end
   if rawequal(v, id_sentinel) then
     return { type = "u64", json = "0" }
   end
@@ -336,7 +347,9 @@ local function check_event_name(callee, name)
   local t = type(name)
   if t == "string" or t == "number" then return end
   local got = t
-  if rawequal(name, noop_result) then
+  if t == "table" and getmetatable(name) == unknown_global_mt then
+    got = "nil"
+  elseif rawequal(name, noop_result) then
     got = "a labelle.* helper result"
   elseif t == "table" and rawget(name, "__labelle_component") ~= nil then
     got = "the component '" .. tostring(rawget(name, "__labelle_component")) .. "'"
@@ -382,6 +395,23 @@ function _G.__declare_stub()
     },
     stub_mt
   )
+end
+
+-- An absent chunk global is almost always a typo in a declaration spec:
+-- Lua evaluates table constructors before calling labelle.component, so a
+-- typo such as `level = DEAFULT_LEVEL` would otherwise become a missing
+-- field. Preserve the name in a sentinel so the field survives construction
+-- and can fail at the declaration site. Locals (including locals explicitly
+-- bound to nil) still resolve normally. Non-declaration calls keep their
+-- existing no-op/type-check behavior.
+local env_mt = {
+  __index = function(_, name)
+    return unknown_global(name)
+  end,
+}
+
+function _G.__declare_env()
+  return setmetatable({ labelle = _G.__declare_stub() }, env_mt)
 end
 
 -- The schema, as one compact JSON line (the runner↔assembler contract):

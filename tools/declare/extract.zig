@@ -140,19 +140,15 @@ pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
             ) };
         }
 
-        // env = { labelle = __declare_stub() } — the chunk's whole world.
-        // BOTH are fresh per chunk: the env so top-level definitions
-        // (init/update/...) stay isolated, exactly like the runtime VM's
-        // per-script envs — and the stub (__declare_stub is a factory in
-        // the prelude) so a script mutating `labelle` itself, e.g.
-        // `labelle.component = nil`, clobbers its private copy only and
-        // never poisons a later file's extraction. The factory cannot
-        // fail; if it does, that is a prelude bug, not a script error.
-        c.lua_createtable(L, 0, 4); // [chunk, env]
-        _ = c.lua_getglobal(L, "__declare_stub"); // [chunk, env, factory]
+        // __declare_env() returns a fresh per-chunk environment containing
+        // the private labelle stub and an __index sentinel. The sentinel
+        // preserves undeclared globals while Lua evaluates declaration
+        // arguments, so a typo cannot disappear as a nil table field.
+        // Locals, including locals explicitly bound to nil, remain ordinary
+        // Lua, and non-declaration calls retain their existing behavior.
+        _ = c.lua_getglobal(L, "__declare_env"); // [chunk, factory]
         if (c.lua_pcallk(L, 0, 1, 0, 0, null) != c.LUA_OK)
-            return error.DeclarePrelude; // [chunk, env, stub]
-        c.lua_setfield(L, -2, "labelle"); // [chunk, env]
+            return error.DeclarePrelude; // [chunk, env]
         if (c.lua_setupvalue(L, -2, 1) == null) {
             // Unreachable for main chunks (they always have _ENV); drop
             // the unconsumed env rather than corrupting the stack.

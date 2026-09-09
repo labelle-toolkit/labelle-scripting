@@ -209,6 +209,36 @@ test "labelle.* helper results in a spec fail the build instead of silently drop
     );
 }
 
+test "unknown globals in declaration arguments fail with file and line diagnostics" {
+    // The typo is evaluated before labelle.component sees the table, so the
+    // declare-mode sentinel tracking must catch it rather than emitting a
+    // schema with a silently missing field.
+    try expectFailure(
+        &.{.{ .path = "scripts/hunger.lua", .source =
+        \\-- The declaration line is deliberately separate for attribution.
+        \\local Hunger = labelle.component("Hunger", {
+        \\  level = DEAFULT_LEVEL,
+        \\})
+    }},
+        &.{ "scripts/hunger.lua:2", "unknown global 'DEAFULT_LEVEL'", "declaration value" },
+    );
+}
+
+test "local bindings and explicit nil declaration semantics remain valid" {
+    // Local values are legal declaration inputs, while an explicit local nil
+    // keeps Lua's existing table-constructor semantics: that field is absent.
+    try expectSchema(&.{.{ .path = "scripts/controls.lua", .source =
+        \\local DEFAULT_LEVEL = 3
+        \\local OMITTED = nil
+        \\local Controls = labelle.component("Controls", {
+        \\  level = DEFAULT_LEVEL,
+        \\  omitted = OMITTED,
+        \\})
+    }},
+        \\{"components":[{"name":"Controls","persist":"persistent","fields":[{"name":"level","type":"i32","default":3}]}]}
+    );
+}
+
 test "float defaults must fit f32: finite-but-huge fails alongside NaN/inf; the edge passes" {
     // 1e100 / -1e100 are FINITE doubles no f32 can hold — accepting them
     // would emit impossible "f32" defaults for the assembler to codegen.
