@@ -46,6 +46,7 @@ const c = struct {
     pub extern fn lua_settop(L: ?*State, idx: c_int) void;
     pub extern fn lua_createtable(L: ?*State, narr: c_int, nrec: c_int) void;
     pub extern fn lua_pushlstring(L: ?*State, s: [*]const u8, len: usize) [*]const u8;
+    pub extern fn lua_pushboolean(L: ?*State, b: c_int) void;
     pub extern fn lua_getglobal(L: ?*State, name: [*:0]const u8) c_int;
     pub extern fn lua_setglobal(L: ?*State, name: [*:0]const u8) void;
     pub extern fn lua_setfield(L: ?*State, idx: c_int, k: [*:0]const u8) void;
@@ -89,6 +90,15 @@ pub const Error = error{
     OutOfMemory,
 };
 
+pub const Options = struct {
+    /// Reject any unknown global read in the chunk before declaration
+    /// validation. This catches Lua operations such as `not MISSING`, which
+    /// erase the sentinel's identity, but intentionally is not the default:
+    /// Lua evaluation provides no precise taint boundary around call
+    /// arguments, so strict mode also rejects unused runtime bindings.
+    strict_declarations: bool = false,
+};
+
 /// Message + pop for the error value a failed load/pcall left on top.
 fn topError(L: ?*c.State, buf: []u8) []const u8 {
     var len: usize = 0;
@@ -103,6 +113,14 @@ fn topError(L: ?*c.State, buf: []u8) []const u8 {
 /// Run every input's chunk body through the declare stub and return the
 /// schema JSON — or the first failure. See the module doc for semantics.
 pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
+    return runWithOptions(allocator, inputs, .{});
+}
+
+pub fn runWithOptions(
+    allocator: std.mem.Allocator,
+    inputs: []const Input,
+    options: Options,
+) Error!Outcome {
     const L = c.luaL_newstate() orelse return error.LuaStateInit;
     defer c.lua_close(L);
     // Full stdlib for the PRELUDE only — scripts never see it (their
@@ -114,6 +132,8 @@ pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
         return error.DeclarePrelude;
     if (c.lua_pcallk(L, 0, 0, 0, 0, null) != c.LUA_OK)
         return error.DeclarePrelude;
+    _ = c.lua_pushboolean(L, if (options.strict_declarations) 1 else 0);
+    c.lua_setglobal(L, "__DECLARE_STRICT");
 
     var err_buf: [2048]u8 = undefined;
     for (inputs) |input| {

@@ -30,10 +30,14 @@ const MAX_SCRIPT_BYTES = 4 * 1024 * 1024;
 const usage =
     \\labelle-declare — extract script-declared components as schema JSON
     \\
-    \\Usage: labelle-declare [--cache-dir <dir>] <script.lua> [more.lua ...]
+    \\Usage: labelle-declare [--cache-dir <dir>] [--strict-declarations] <script.lua> [more.lua ...]
     \\
     \\--cache-dir is accepted and ignored (the assembler's generic declare
     \\contract hands every runner a workspace; an embedded VM needs none).
+    \\
+    \\--strict-declarations rejects any unknown global read in a chunk. It
+    \\also rejects unused runtime bindings because Lua cannot expose a
+    \\precise taint boundary around declaration call arguments.
     \\
     \\Runs each chunk body against the declare stub (only `labelle` is in
     \\scope; init/update never run) and prints the schema on stdout.
@@ -49,6 +53,7 @@ pub fn main(init: std.process.Init) !void {
     _ = args.skip(); // program name
 
     var inputs: std.ArrayList(extract.Input) = .empty;
+    var options = extract.Options{};
     defer {
         for (inputs.items) |input| {
             allocator.free(input.path);
@@ -61,6 +66,10 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try std.Io.File.stderr().writeStreamingAll(io, usage);
             return;
+        }
+        if (std.mem.eql(u8, arg, "--strict-declarations")) {
+            options.strict_declarations = true;
+            continue;
         }
         // The assembler's generic `.languages` declare invocation contract
         // (RFC-LANGUAGE-PLUGINS rev 17 §7, labelle-engine#619) passes a
@@ -99,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    const outcome = try extract.run(allocator, inputs.items);
+    const outcome = try extract.runWithOptions(allocator, inputs.items, options);
     defer outcome.deinit(allocator);
     switch (outcome) {
         .schema => |json| {

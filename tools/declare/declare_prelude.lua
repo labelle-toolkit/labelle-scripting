@@ -115,7 +115,9 @@ local unknown_global_seen = nil
 local function unknown_global(name)
   local value = setmetatable({}, unknown_global_mt)
   unknown_global_names[value] = name
-  if unknown_global_seen == nil then unknown_global_seen = name end
+  if _G.__DECLARE_STRICT and unknown_global_seen == nil then
+    unknown_global_seen = name
+  end
   return value
 end
 
@@ -127,14 +129,44 @@ local function is_unknown_global(value)
   return type(value) == "table" and getmetatable(value) == unknown_global_mt
 end
 
-local function reject_unknown(value, where)
+local function unknown_operation(value, operation)
+  error("unknown global '" .. unknown_global_name(value) ..
+    "' cannot be used with " .. operation .. " in a declaration value", 3)
+end
+
+unknown_global_mt.__index = function(value, key)
+  unknown_operation(value, "member access '." .. tostring(key) .. "'")
+end
+unknown_global_mt.__call = function(value)
+  unknown_operation(value, "a function call")
+end
+unknown_global_mt.__concat = function(value)
+  unknown_operation(value, "concatenation")
+end
+unknown_global_mt.__eq = function(value)
+  unknown_operation(value, "comparison")
+end
+unknown_global_mt.__lt = function(value)
+  unknown_operation(value, "comparison")
+end
+unknown_global_mt.__le = function(value)
+  unknown_operation(value, "comparison")
+end
+for _, operation in ipairs({ "__add", "__sub", "__mul", "__div", "__idiv", "__mod", "__pow", "__unm" }) do
+  unknown_global_mt[operation] = function(value)
+    unknown_operation(value, operation:sub(3))
+  end
+end
+
+local function reject_unknown(value, where, level)
+  level = level or 3
   if is_unknown_global(value) then
     error(where .. ": unknown global '" .. unknown_global_name(value) ..
-      "' used as a declaration value (use a local binding or explicit nil)", 3)
+      "' used as a declaration value (use a local binding or explicit nil)", level)
   end
   if unknown_global_seen ~= nil then
     error(where .. ": unknown global '" .. unknown_global_seen ..
-      "' was read while evaluating this declaration value (use a local binding or explicit nil)", 3)
+      "' was read while evaluating this declaration value (use a local binding or explicit nil)", level)
   end
 end
 
@@ -144,7 +176,7 @@ end
 -- SCRIPT's labelle.component/event(...) line (3), so the position prefix
 -- points at the declaration site.
 local function classify(where, v)
-  reject_unknown(v, where)
+  reject_unknown(v, where, 4)
   if rawequal(v, id_sentinel) then
     return { type = "u64", json = "0" }
   end

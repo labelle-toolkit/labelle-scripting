@@ -225,22 +225,29 @@ test "unknown globals in declaration arguments fail with file and line diagnosti
 }
 
 test "unknown globals cannot be laundered through boolean expressions" {
-    try expectFailure(
-        &.{.{ .path = "scripts/guards.lua", .source =
-        \\local Controls = labelle.component("Controls", {
-        \\  level = MISSING_LEVEL and 3,
-        \\})
-    }},
-        &.{ "scripts/guards.lua:1", "unknown global 'MISSING_LEVEL'" },
-    );
-    try expectFailure(
-        &.{.{ .path = "scripts/guards.lua", .source =
-        \\local Controls = labelle.component("Controls", {
-        \\  level = MISSING_LEVEL or 3,
-        \\})
-    }},
-        &.{ "scripts/guards.lua:1", "unknown global 'MISSING_LEVEL'" },
-    );
+    // Lua's `and`/`or` operators can erase a table sentinel. Use the
+    // explicitly strict boundary for this case; default extraction remains
+    // compatible with unused runtime bindings.
+    const expressions = [_][]const u8{ "MISSING_LEVEL and 3", "MISSING_LEVEL or 3" };
+    for (expressions) |expression| {
+        const source = try std.fmt.allocPrint(
+            testing.allocator,
+            "local Controls = labelle.component(\"Controls\", {{ level = {s} }})",
+            .{expression},
+        );
+        defer testing.allocator.free(source);
+        const outcome = try extract.runWithOptions(testing.allocator, &.{.{ .path = "scripts/guards.lua", .source =
+            source,
+        }}, .{ .strict_declarations = true });
+        defer outcome.deinit(testing.allocator);
+        switch (outcome) {
+            .schema => |json| {
+                std.debug.print("expected strict mode failure, got schema:\n  {s}\n", .{json});
+                return error.TestExpectedFailure;
+            },
+            .failure => |msg| try expect(std.mem.indexOf(u8, msg, "unknown global 'MISSING_LEVEL'") != null),
+        }
+    }
 }
 
 test "unknown globals cannot be laundered through member access or table guards" {
@@ -250,7 +257,7 @@ test "unknown globals cannot be laundered through member access or table guards"
         \\  level = DEFAULTS.LEVEL,
         \\})
     }},
-        &.{ "scripts/guards.lua:1", "unknown global 'DEFAULTS'" },
+        &.{ "scripts/guards.lua:2", "unknown global 'DEFAULTS'" },
     );
     try expectFailure(
         &.{.{ .path = "scripts/spec.lua", .source =
@@ -271,6 +278,31 @@ test "runtime guards remain outside declare execution" {
     }},
         \\{"components":[{"name":"Controls","persist":"persistent","fields":[{"name":"level","type":"i32","default":3}]}]}
     );
+}
+
+test "unused runtime globals before and after declarations remain valid" {
+    try expectSchema(&.{.{ .path = "scripts/runtime.lua", .source =
+        \\local before = game
+        \\labelle.component("C", {})
+        \\local after = world
+    }},
+        \\{"components":[{"name":"C","persist":"persistent","fields":[]}]}
+    );
+}
+
+test "strict declaration mode is opt-in for lossy boolean taint" {
+    const outcome = try extract.runWithOptions(testing.allocator, &.{.{
+        .path = "scripts/strict.lua",
+        .source = "local value = not MISSING\nlabelle.component(\"C\", { value = value })",
+    }}, .{ .strict_declarations = true });
+    defer outcome.deinit(testing.allocator);
+    switch (outcome) {
+        .schema => |json| {
+            std.debug.print("expected strict mode failure, got schema:\n  {s}\n", .{json});
+            return error.TestExpectedFailure;
+        },
+        .failure => |msg| try expect(std.mem.indexOf(u8, msg, "unknown global 'MISSING'") != null),
+    }
 }
 
 test "local bindings and explicit nil declaration semantics remain valid" {
