@@ -183,6 +183,18 @@ pub fn runWithOptions(
                 .{ input.path, msg },
             ) };
         }
+
+        // Strict mode also rejects unknown reads after the final declaration
+        // (or in a declaration-free chunk), so validate the chunk boundary.
+        _ = c.lua_getglobal(L, "__declare_finish");
+        if (c.lua_pcallk(L, 0, 0, 0, 0, null) != c.LUA_OK) {
+            const msg = topError(L, &err_buf);
+            return .{ .failure = try std.fmt.allocPrint(
+                allocator,
+                "labelle-declare: {s}: {s}",
+                .{ input.path, msg },
+            ) };
+        }
     }
 
     // All chunks ran clean: pull the accumulated schema out.

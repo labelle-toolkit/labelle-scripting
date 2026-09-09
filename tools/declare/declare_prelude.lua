@@ -134,27 +134,42 @@ local function unknown_operation(value, operation)
     "' cannot be used with " .. operation .. " in a declaration value", 3)
 end
 
+local function unknown_binary_operation(left, right, operation)
+  if is_unknown_global(left) then
+    unknown_operation(left, operation)
+  end
+  if is_unknown_global(right) then
+    unknown_operation(right, operation)
+  end
+end
+
 unknown_global_mt.__index = function(value, key)
   unknown_operation(value, "member access '." .. tostring(key) .. "'")
 end
 unknown_global_mt.__call = function(value)
   unknown_operation(value, "a function call")
 end
-unknown_global_mt.__concat = function(value)
-  unknown_operation(value, "concatenation")
+unknown_global_mt.__len = function(value)
+  unknown_operation(value, "length")
 end
-unknown_global_mt.__eq = function(value)
-  unknown_operation(value, "comparison")
+unknown_global_mt.__concat = function(left, right)
+  unknown_binary_operation(left, right, "concatenation")
 end
-unknown_global_mt.__lt = function(value)
-  unknown_operation(value, "comparison")
+unknown_global_mt.__eq = function(left, right)
+  unknown_binary_operation(left, right, "comparison")
 end
-unknown_global_mt.__le = function(value)
-  unknown_operation(value, "comparison")
+unknown_global_mt.__lt = function(left, right)
+  unknown_binary_operation(left, right, "comparison")
+end
+unknown_global_mt.__le = function(left, right)
+  unknown_binary_operation(left, right, "comparison")
 end
 for _, operation in ipairs({ "__add", "__sub", "__mul", "__div", "__idiv", "__mod", "__pow", "__unm" }) do
-  unknown_global_mt[operation] = function(value)
-    unknown_operation(value, operation:sub(3))
+  unknown_global_mt[operation] = function(left, right)
+    if operation == "__unm" then
+      unknown_operation(left, operation:sub(3))
+    end
+    unknown_binary_operation(left, right, operation:sub(3))
   end
 end
 
@@ -472,6 +487,13 @@ local env_mt = {
 function _G.__declare_env()
   unknown_global_seen = nil
   return setmetatable({ labelle = _G.__declare_stub() }, env_mt)
+end
+
+function _G.__declare_finish()
+  if _G.__DECLARE_STRICT and unknown_global_seen ~= nil then
+    error("unknown global '" .. unknown_global_seen ..
+      "' was read while evaluating this chunk (use a local binding or explicit nil)", 2)
+  end
 end
 
 -- The schema, as one compact JSON line (the runner↔assembler contract):

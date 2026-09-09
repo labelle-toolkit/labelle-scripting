@@ -236,8 +236,9 @@ test "unknown globals cannot be laundered through boolean expressions" {
             .{expression},
         );
         defer testing.allocator.free(source);
-        const outcome = try extract.runWithOptions(testing.allocator, &.{.{ .path = "scripts/guards.lua", .source =
-            source,
+        const outcome = try extract.runWithOptions(testing.allocator, &.{.{
+            .path = "scripts/guards.lua",
+            .source = source,
         }}, .{ .strict_declarations = true });
         defer outcome.deinit(testing.allocator);
         switch (outcome) {
@@ -265,6 +266,36 @@ test "unknown globals cannot be laundered through member access or table guards"
     }},
         &.{ "scripts/spec.lua:1", "unknown global 'UNKNOWN_SPEC'" },
     );
+}
+
+test "unknown globals preserve the right-hand operand and length diagnostics" {
+    const expressions = [_][]const u8{
+        "3 + MISSING",
+        "#MISSING",
+    };
+    for (expressions) |expression| {
+        const source = try std.fmt.allocPrint(
+            testing.allocator,
+            "labelle.component(\"Controls\", {{ level = {s} }})",
+            .{expression},
+        );
+        defer testing.allocator.free(source);
+        const outcome = try extract.run(testing.allocator, &.{.{
+            .path = "scripts/operators.lua",
+            .source = source,
+        }});
+        defer outcome.deinit(testing.allocator);
+        switch (outcome) {
+            .schema => |json| {
+                std.debug.print("expected operator failure, got schema:\n  {s}\n", .{json});
+                return error.TestExpectedFailure;
+            },
+            .failure => |msg| {
+                try expect(std.mem.indexOf(u8, msg, "unknown global 'MISSING'") != null);
+                try expect(std.mem.indexOf(u8, msg, "declaration value") != null);
+            },
+        }
+    }
 }
 
 test "runtime guards remain outside declare execution" {
@@ -302,6 +333,34 @@ test "strict declaration mode is opt-in for lossy boolean taint" {
             return error.TestExpectedFailure;
         },
         .failure => |msg| try expect(std.mem.indexOf(u8, msg, "unknown global 'MISSING'") != null),
+    }
+}
+
+test "strict declaration mode rejects final reads and resets per chunk" {
+    const final_read = try extract.runWithOptions(testing.allocator, &.{.{
+        .path = "scripts/final-read.lua",
+        .source = "labelle.component(\"C\", {})\nlocal after = MISSING",
+    }}, .{ .strict_declarations = true });
+    defer final_read.deinit(testing.allocator);
+    switch (final_read) {
+        .schema => |json| {
+            std.debug.print("expected strict final-read failure, got schema:\n  {s}\n", .{json});
+            return error.TestExpectedFailure;
+        },
+        .failure => |msg| try expect(std.mem.indexOf(u8, msg, "unknown global 'MISSING'") != null),
+    }
+
+    const reset = try extract.runWithOptions(testing.allocator, &.{
+        .{ .path = "scripts/first.lua", .source = "local before = FIRST" },
+        .{ .path = "scripts/second.lua", .source = "labelle.component(\"C\", {})" },
+    }, .{ .strict_declarations = true });
+    defer reset.deinit(testing.allocator);
+    switch (reset) {
+        .schema => |json| {
+            std.debug.print("expected per-chunk strict failure, got schema:\n  {s}\n", .{json});
+            return error.TestExpectedFailure;
+        },
+        .failure => |msg| try expect(std.mem.indexOf(u8, msg, "unknown global 'FIRST'") != null),
     }
 }
 
