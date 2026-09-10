@@ -164,6 +164,19 @@ Cross-language, same idioms: ruby spells them `e.get_into(Klass, @h)` +
 `e.get("Hunger", into)` + `labelle.FrameArray` (+ a reused
 `Float64Array` for pure-numeric scratch) over the same contract.
 
+**Strict declaration checks** are opt-in. The standalone Lua declare runner
+accepts `--strict-declarations`; for the normal assembler invocation, which
+passes only declaration files and its cache directory, set the inherited
+environment variable instead:
+
+```sh
+LABELLE_STRICT_DECLARATIONS=1 labelle generate
+```
+
+The environment variable is enabled only by the value `1`; leaving it unset
+preserves Lua's default missing-global-to-`nil` behavior. The direct runner
+equivalent is `labelle-declare --strict-declarations <script.lua>`.
+
 ## Using the ruby sub-module
 
 Build with `-Dlanguage=ruby`. The Zig side is identical to lua — same

@@ -26,14 +26,18 @@ const extract = @import("extract.zig");
 /// means something is wrong, and a bound keeps a stray path from OOMing
 /// the generate step.
 const MAX_SCRIPT_BYTES = 4 * 1024 * 1024;
+const STRICT_DECLARATIONS_ENV = "LABELLE_STRICT_DECLARATIONS";
 
 const usage =
     \\labelle-declare — extract script-declared components as schema JSON
     \\
-    \\Usage: labelle-declare [--cache-dir <dir>] <script.lua> [more.lua ...]
+    \\Usage: labelle-declare [--cache-dir <dir>] [--strict-declarations] <script.lua> [more.lua ...]
     \\
     \\--cache-dir is accepted and ignored (the assembler's generic declare
     \\contract hands every runner a workspace; an embedded VM needs none).
+    \\
+    \\--strict-declarations rejects any unknown global read immediately while
+    \\the chunk executes. Default mode preserves Lua's nil fallback.
     \\
     \\Runs each chunk body against the declare stub (only `labelle` is in
     \\scope; init/update never run) and prints the schema on stdout.
@@ -49,6 +53,15 @@ pub fn main(init: std.process.Init) !void {
     _ = args.skip(); // program name
 
     var inputs: std.ArrayList(extract.Input) = .empty;
+    // The assembler cannot add language-specific flags to its generic
+    // declare invocation, but it inherits the game's environment.
+    var options = extract.Options{
+        .strict_declarations = std.mem.eql(
+            u8,
+            init.environ_map.get(STRICT_DECLARATIONS_ENV) orelse "",
+            "1",
+        ),
+    };
     defer {
         for (inputs.items) |input| {
             allocator.free(input.path);
@@ -61,6 +74,10 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try std.Io.File.stderr().writeStreamingAll(io, usage);
             return;
+        }
+        if (std.mem.eql(u8, arg, "--strict-declarations")) {
+            options.strict_declarations = true;
+            continue;
         }
         // The assembler's generic `.languages` declare invocation contract
         // (RFC-LANGUAGE-PLUGINS rev 17 §7, labelle-engine#619) passes a
@@ -99,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    const outcome = try extract.run(allocator, inputs.items);
+    const outcome = try extract.runWithOptions(allocator, inputs.items, options);
     defer outcome.deinit(allocator);
     switch (outcome) {
         .schema => |json| {

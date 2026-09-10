@@ -26,6 +26,8 @@
 --   __declare_stub()  global — a FACTORY returning a fresh stub `labelle`
 --                     table; extract.zig calls it once per chunk and
 --                     plants the result into that chunk's private _ENV
+--   __declare_env()   global — returns that stub in a fresh chunk
+--                     environment with optional strict unknown-global checking
 --   __declare_emit()  global — returns the accumulated schema as one
 --                     compact JSON line after every chunk ran
 --
@@ -382,6 +384,25 @@ function _G.__declare_stub()
     },
     stub_mt
   )
+end
+
+-- Preserve Lua's normal missing-global semantics by default: an absent global
+-- is nil, so guarded compatibility patterns such as `game and game.getTime()`
+-- remain valid. Strict mode is deliberately immediate rather than taint-based;
+-- there is no precise call window around declaration arguments.
+local default_env_mt = {
+  __index = function() return nil end,
+}
+local strict_env_mt = {
+  __index = function(_, name)
+    error("unknown global '" .. name ..
+      "' read (use a local binding or explicit nil)", 2)
+  end,
+}
+
+function _G.__declare_env()
+  local mt = _G.__DECLARE_STRICT and strict_env_mt or default_env_mt
+  return setmetatable({ labelle = _G.__declare_stub() }, mt)
 end
 
 -- The schema, as one compact JSON line (the runner↔assembler contract):

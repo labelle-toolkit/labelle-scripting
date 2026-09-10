@@ -32,8 +32,12 @@ fn expectSchema(inputs: []const extract.Input, expected: []const u8) !void {
 
 /// Run the extractor over `inputs`, expect a failure, and assert every
 /// `needle` appears in the message (file names, component/field names).
-fn expectFailure(inputs: []const extract.Input, needles: []const []const u8) !void {
-    const outcome = try extract.run(testing.allocator, inputs);
+fn expectFailureWithOptions(
+    inputs: []const extract.Input,
+    needles: []const []const u8,
+    options: extract.Options,
+) !void {
+    const outcome = try extract.runWithOptions(testing.allocator, inputs, options);
     defer outcome.deinit(testing.allocator);
     switch (outcome) {
         .schema => |json| {
@@ -49,6 +53,10 @@ fn expectFailure(inputs: []const extract.Input, needles: []const []const u8) !vo
             }
         },
     }
+}
+
+fn expectFailure(inputs: []const extract.Input, needles: []const []const u8) !void {
+    return expectFailureWithOptions(inputs, needles, .{});
 }
 
 test "golden: every v1-inferable type across two files, declaration order + sorted fields" {
@@ -209,6 +217,178 @@ test "labelle.* helper results in a spec fail the build instead of silently drop
     );
 }
 
+test "strict unknown globals in declaration arguments fail with file and line diagnostics" {
+    try expectFailureWithOptions(
+        &.{.{ .path = "scripts/hunger.lua", .source =
+        \\-- The declaration line is deliberately separate for attribution.
+        \\local Hunger = labelle.component("Hunger", {
+        \\  level = DEAFULT_LEVEL,
+        \\})
+    }},
+        &.{ "scripts/hunger.lua:3", "unknown global 'DEAFULT_LEVEL'" },
+        .{ .strict_declarations = true },
+    );
+}
+
+test "unknown globals cannot be laundered through boolean expressions" {
+    // Lua's `and`/`or` operators can erase a table sentinel. Use the
+    // explicitly strict boundary for this case; default extraction remains
+    // compatible with unused runtime bindings.
+    const expressions = [_][]const u8{ "MISSING_LEVEL and 3", "MISSING_LEVEL or 3" };
+    for (expressions) |expression| {
+        const source = try std.fmt.allocPrint(
+            testing.allocator,
+            "local Controls = labelle.component(\"Controls\", {{ level = {s} }})",
+            .{expression},
+        );
+        defer testing.allocator.free(source);
+        const outcome = try extract.runWithOptions(testing.allocator, &.{.{
+            .path = "scripts/guards.lua",
+            .source = source,
+        }}, .{ .strict_declarations = true });
+        defer outcome.deinit(testing.allocator);
+        switch (outcome) {
+            .schema => |json| {
+                std.debug.print("expected strict mode failure, got schema:\n  {s}\n", .{json});
+                return error.TestExpectedFailure;
+            },
+            .failure => |msg| try expect(std.mem.indexOf(u8, msg, "unknown global 'MISSING_LEVEL'") != null),
+        }
+    }
+}
+
+test "strict unknown globals fail through member access or table guards" {
+    try expectFailureWithOptions(
+        &.{.{ .path = "scripts/guards.lua", .source =
+        \\local Controls = labelle.component("Controls", {
+        \\  level = DEFAULTS.LEVEL,
+        \\})
+    }},
+        &.{ "scripts/guards.lua:2", "unknown global 'DEFAULTS'" },
+        .{ .strict_declarations = true },
+    );
+    try expectFailureWithOptions(
+        &.{.{ .path = "scripts/spec.lua", .source =
+        \\labelle.component("Controls", UNKNOWN_SPEC)
+    }},
+        &.{ "scripts/spec.lua:1", "unknown global 'UNKNOWN_SPEC'" },
+        .{ .strict_declarations = true },
+    );
+}
+
+test "unknown globals preserve the right-hand operand and length diagnostics" {
+    const expressions = [_][]const u8{
+        "3 + MISSING",
+        "#MISSING",
+    };
+    for (expressions) |expression| {
+        const source = try std.fmt.allocPrint(
+            testing.allocator,
+            "labelle.component(\"Controls\", {{ level = {s} }})",
+            .{expression},
+        );
+        defer testing.allocator.free(source);
+        const outcome = try extract.runWithOptions(testing.allocator, &.{.{
+            .path = "scripts/operators.lua",
+            .source = source,
+        }}, .{ .strict_declarations = true });
+        defer outcome.deinit(testing.allocator);
+        switch (outcome) {
+            .schema => |json| {
+                std.debug.print("expected operator failure, got schema:\n  {s}\n", .{json});
+                return error.TestExpectedFailure;
+            },
+            .failure => |msg| {
+                try expect(std.mem.indexOf(u8, msg, "unknown global 'MISSING'") != null);
+                try expect(std.mem.indexOf(u8, msg, "read") != null);
+            },
+        }
+    }
+}
+
+test "runtime guards remain outside declare execution" {
+    // Function bodies are defined but never run by the extractor. A runtime
+    // guard that would touch `game` therefore remains valid in declare mode.
+    try expectSchema(&.{.{ .path = "scripts/runtime.lua", .source =
+        \\function update()
+        \\  if game then game.query("Controls") end
+        \\end
+        \\labelle.component("Controls", { level = 3 })
+    }},
+        \\{"components":[{"name":"Controls","persist":"persistent","fields":[{"name":"level","type":"i32","default":3}]}]}
+    );
+}
+
+test "unused runtime globals before and after declarations remain valid" {
+    try expectSchema(&.{.{ .path = "scripts/runtime.lua", .source =
+        \\local before = game
+        \\labelle.component("C", {})
+        \\local after = world
+    }},
+        \\{"components":[{"name":"C","persist":"persistent","fields":[]}]}
+    );
+}
+
+test "strict declaration mode is opt-in for lossy boolean taint" {
+    const outcome = try extract.runWithOptions(testing.allocator, &.{.{
+        .path = "scripts/strict.lua",
+        .source = "local value = not MISSING\nlabelle.component(\"C\", { value = value })",
+    }}, .{ .strict_declarations = true });
+    defer outcome.deinit(testing.allocator);
+    switch (outcome) {
+        .schema => |json| {
+            std.debug.print("expected strict mode failure, got schema:\n  {s}\n", .{json});
+            return error.TestExpectedFailure;
+        },
+        .failure => |msg| try expect(std.mem.indexOf(u8, msg, "unknown global 'MISSING'") != null),
+    }
+}
+
+test "strict declaration mode rejects reads with file line and name" {
+    const final_read = try extract.runWithOptions(testing.allocator, &.{.{
+        .path = "scripts/final-read.lua",
+        .source = "labelle.component(\"C\", {})\nlocal after = MISSING",
+    }}, .{ .strict_declarations = true });
+    defer final_read.deinit(testing.allocator);
+    switch (final_read) {
+        .schema => |json| {
+            std.debug.print("expected strict final-read failure, got schema:\n  {s}\n", .{json});
+            return error.TestExpectedFailure;
+        },
+        .failure => |msg| try expect(std.mem.indexOf(u8, msg, "unknown global 'MISSING'") != null),
+    }
+
+    try expectFailureWithOptions(
+        &.{.{ .path = "scripts/first.lua", .source = "local before = FIRST" }},
+        &.{ "scripts/first.lua:1", "unknown global 'FIRST'" },
+        .{ .strict_declarations = true },
+    );
+}
+
+test "default missing globals retain nil guarded compatibility semantics" {
+    try expectSchema(&.{.{ .path = "scripts/guarded.lua", .source =
+        \\local x = game and game.getTime()
+        \\labelle.component("Guarded", { value = 1 })
+    }},
+        \\{"components":[{"name":"Guarded","persist":"persistent","fields":[{"name":"value","type":"i32","default":1}]}]}
+    );
+}
+
+test "local bindings and explicit nil declaration semantics remain valid" {
+    // Local values are legal declaration inputs, while an explicit local nil
+    // keeps Lua's existing table-constructor semantics: that field is absent.
+    try expectSchema(&.{.{ .path = "scripts/controls.lua", .source =
+        \\local DEFAULT_LEVEL = 3
+        \\local OMITTED = nil
+        \\local Controls = labelle.component("Controls", {
+        \\  level = DEFAULT_LEVEL,
+        \\  omitted = OMITTED,
+        \\})
+    }},
+        \\{"components":[{"name":"Controls","persist":"persistent","fields":[{"name":"level","type":"i32","default":3}]}]}
+    );
+}
+
 test "float defaults must fit f32: finite-but-huge fails alongside NaN/inf; the edge passes" {
     // 1e100 / -1e100 are FINITE doubles no f32 can hold — accepting them
     // would emit impossible "f32" defaults for the assembler to codegen.
@@ -314,9 +494,8 @@ test "a component ref where an event name belongs fails at generate (the on/emit
         "labelle.emit: expected an event-name string",
         "the component 'Worker'",
     });
-    // nil rides the same rejection: an undefined global (a typo, or a
-    // cross-file global — runtime script envs SHADOW _G, so those never
-    // resolve there either) raises identically at runtime.
+    // An undefined global keeps Lua's default nil semantics in compatibility
+    // mode, so the name-checked shim reports the ordinary nil type.
     try expectFailure(&.{.{
         .path = "scripts/bad.lua",
         .source = "labelle.on(HungerFed, function(ev) end)",

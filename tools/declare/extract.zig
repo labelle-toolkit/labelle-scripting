@@ -46,6 +46,7 @@ const c = struct {
     pub extern fn lua_settop(L: ?*State, idx: c_int) void;
     pub extern fn lua_createtable(L: ?*State, narr: c_int, nrec: c_int) void;
     pub extern fn lua_pushlstring(L: ?*State, s: [*]const u8, len: usize) [*]const u8;
+    pub extern fn lua_pushboolean(L: ?*State, b: c_int) void;
     pub extern fn lua_getglobal(L: ?*State, name: [*:0]const u8) c_int;
     pub extern fn lua_setglobal(L: ?*State, name: [*:0]const u8) void;
     pub extern fn lua_setfield(L: ?*State, idx: c_int, k: [*:0]const u8) void;
@@ -89,6 +90,13 @@ pub const Error = error{
     OutOfMemory,
 };
 
+pub const Options = struct {
+    /// Reject unknown global reads immediately while the chunk executes.
+    /// This is opt-in because default Lua semantics treat missing globals as
+    /// nil, which keeps guarded compatibility patterns working.
+    strict_declarations: bool = false,
+};
+
 /// Message + pop for the error value a failed load/pcall left on top.
 fn topError(L: ?*c.State, buf: []u8) []const u8 {
     var len: usize = 0;
@@ -103,6 +111,14 @@ fn topError(L: ?*c.State, buf: []u8) []const u8 {
 /// Run every input's chunk body through the declare stub and return the
 /// schema JSON — or the first failure. See the module doc for semantics.
 pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
+    return runWithOptions(allocator, inputs, .{});
+}
+
+pub fn runWithOptions(
+    allocator: std.mem.Allocator,
+    inputs: []const Input,
+    options: Options,
+) Error!Outcome {
     const L = c.luaL_newstate() orelse return error.LuaStateInit;
     defer c.lua_close(L);
     // Full stdlib for the PRELUDE only — scripts never see it (their
@@ -114,6 +130,8 @@ pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
         return error.DeclarePrelude;
     if (c.lua_pcallk(L, 0, 0, 0, 0, null) != c.LUA_OK)
         return error.DeclarePrelude;
+    _ = c.lua_pushboolean(L, if (options.strict_declarations) 1 else 0);
+    c.lua_setglobal(L, "__DECLARE_STRICT");
 
     var err_buf: [2048]u8 = undefined;
     for (inputs) |input| {
@@ -140,19 +158,12 @@ pub fn run(allocator: std.mem.Allocator, inputs: []const Input) Error!Outcome {
             ) };
         }
 
-        // env = { labelle = __declare_stub() } — the chunk's whole world.
-        // BOTH are fresh per chunk: the env so top-level definitions
-        // (init/update/...) stay isolated, exactly like the runtime VM's
-        // per-script envs — and the stub (__declare_stub is a factory in
-        // the prelude) so a script mutating `labelle` itself, e.g.
-        // `labelle.component = nil`, clobbers its private copy only and
-        // never poisons a later file's extraction. The factory cannot
-        // fail; if it does, that is a prelude bug, not a script error.
-        c.lua_createtable(L, 0, 4); // [chunk, env]
-        _ = c.lua_getglobal(L, "__declare_stub"); // [chunk, env, factory]
+        // __declare_env() returns a fresh per-chunk environment containing
+        // the private labelle stub. Missing globals preserve Lua's normal nil
+        // fallback unless strict mode was explicitly requested.
+        _ = c.lua_getglobal(L, "__declare_env"); // [chunk, factory]
         if (c.lua_pcallk(L, 0, 1, 0, 0, null) != c.LUA_OK)
-            return error.DeclarePrelude; // [chunk, env, stub]
-        c.lua_setfield(L, -2, "labelle"); // [chunk, env]
+            return error.DeclarePrelude; // [chunk, env]
         if (c.lua_setupvalue(L, -2, 1) == null) {
             // Unreachable for main chunks (they always have _ENV); drop
             // the unconsumed env rather than corrupting the stack.
