@@ -26,6 +26,7 @@ const extract = @import("extract.zig");
 /// means something is wrong, and a bound keeps a stray path from OOMing
 /// the generate step.
 const MAX_SCRIPT_BYTES = 4 * 1024 * 1024;
+const STRICT_DECLARATIONS_ENV = "LABELLE_STRICT_DECLARATIONS";
 
 const usage =
     \\labelle-declare — extract script-declared components as schema JSON
@@ -52,7 +53,15 @@ pub fn main(init: std.process.Init) !void {
     _ = args.skip(); // program name
 
     var inputs: std.ArrayList(extract.Input) = .empty;
-    var options = extract.Options{};
+    // The assembler cannot add language-specific flags to its generic
+    // declare invocation, but it inherits the game's environment.
+    var options = extract.Options{
+        .strict_declarations = std.mem.eql(
+            u8,
+            init.environ_map.get(STRICT_DECLARATIONS_ENV) orelse "",
+            "1",
+        ),
+    };
     defer {
         for (inputs.items) |input| {
             allocator.free(input.path);
