@@ -108,90 +108,12 @@ local function id_sentinel()
     "(v1: id fields always default 0) — write entity = labelle.id", 2)
 end
 
-local unknown_global_mt = {}
-local unknown_global_names = setmetatable({}, { __mode = "k" })
-local unknown_global_seen = nil
-
-local function unknown_global(name)
-  local value = setmetatable({}, unknown_global_mt)
-  unknown_global_names[value] = name
-  if _G.__DECLARE_STRICT and unknown_global_seen == nil then
-    unknown_global_seen = name
-  end
-  return value
-end
-
-local function unknown_global_name(value)
-  return unknown_global_names[value] or "?"
-end
-
-local function is_unknown_global(value)
-  return type(value) == "table" and getmetatable(value) == unknown_global_mt
-end
-
-local function unknown_operation(value, operation)
-  error("unknown global '" .. unknown_global_name(value) ..
-    "' cannot be used with " .. operation .. " in a declaration value", 3)
-end
-
-local function unknown_binary_operation(left, right, operation)
-  if is_unknown_global(left) then
-    unknown_operation(left, operation)
-  end
-  if is_unknown_global(right) then
-    unknown_operation(right, operation)
-  end
-end
-
-unknown_global_mt.__index = function(value, key)
-  unknown_operation(value, "member access '." .. tostring(key) .. "'")
-end
-unknown_global_mt.__call = function(value)
-  unknown_operation(value, "a function call")
-end
-unknown_global_mt.__len = function(value)
-  unknown_operation(value, "length")
-end
-unknown_global_mt.__concat = function(left, right)
-  unknown_binary_operation(left, right, "concatenation")
-end
-unknown_global_mt.__eq = function(left, right)
-  unknown_binary_operation(left, right, "comparison")
-end
-unknown_global_mt.__lt = function(left, right)
-  unknown_binary_operation(left, right, "comparison")
-end
-unknown_global_mt.__le = function(left, right)
-  unknown_binary_operation(left, right, "comparison")
-end
-for _, operation in ipairs({ "__add", "__sub", "__mul", "__div", "__idiv", "__mod", "__pow", "__unm" }) do
-  unknown_global_mt[operation] = function(left, right)
-    if operation == "__unm" then
-      unknown_operation(left, operation:sub(3))
-    end
-    unknown_binary_operation(left, right, operation:sub(3))
-  end
-end
-
-local function reject_unknown(value, where, level)
-  level = level or 3
-  if is_unknown_global(value) then
-    error(where .. ": unknown global '" .. unknown_global_name(value) ..
-      "' used as a declaration value (use a local binding or explicit nil)", level)
-  end
-  if unknown_global_seen ~= nil then
-    error(where .. ": unknown global '" .. unknown_global_seen ..
-      "' was read while evaluating this declaration value (use a local binding or explicit nil)", level)
-  end
-end
-
 -- Classify one spec value into { type = <schema type>, json = <default as
 -- JSON> }, or raise with `where` naming the declaration and field. Error
 -- level 3 = classify(1) → declare_component/declare_event(2) → the
 -- SCRIPT's labelle.component/event(...) line (3), so the position prefix
 -- points at the declaration site.
 local function classify(where, v)
-  reject_unknown(v, where, 4)
   if rawequal(v, id_sentinel) then
     return { type = "u64", json = "0" }
   end
@@ -269,9 +191,6 @@ end
 -- sees one consistent value in both modes.
 local function declare_component(name, spec, opts)
   local file = __DECLARE_FILE or "?"
-  reject_unknown(name, "labelle.component")
-  reject_unknown(spec, "labelle.component")
-  reject_unknown(opts, "labelle.component")
   if type(name) ~= "string" or name == "" then
     error("labelle.component: expected a non-empty component name string", 2)
   end
@@ -346,8 +265,6 @@ local MAX_EVENT_FIELDS = 32
 -- one consistent value in both modes.
 local function declare_event(name, spec, ...)
   local file = __DECLARE_FILE or "?"
-  reject_unknown(name, "labelle.event")
-  reject_unknown(spec, "labelle.event")
   if type(name) ~= "string" or name == "" then
     error("labelle.event: expected a non-empty event name string", 2)
   end
@@ -421,9 +338,7 @@ local function check_event_name(callee, name)
   local t = type(name)
   if t == "string" or t == "number" then return end
   local got = t
-  if is_unknown_global(name) then
-    got = "unknown global '" .. unknown_global_name(name) .. "'"
-  elseif rawequal(name, noop_result) then
+  if rawequal(name, noop_result) then
     got = "a labelle.* helper result"
   elseif t == "table" and rawget(name, "__labelle_component") ~= nil then
     got = "the component '" .. tostring(rawget(name, "__labelle_component")) .. "'"
@@ -471,29 +386,23 @@ function _G.__declare_stub()
   )
 end
 
--- An absent chunk global is almost always a typo in a declaration spec:
--- Lua evaluates table constructors before calling labelle.component, so a
--- typo such as `level = DEAFULT_LEVEL` would otherwise become a missing
--- field. Preserve the name in a sentinel so the field survives construction
--- and can fail at the declaration site. Locals (including locals explicitly
--- bound to nil) still resolve normally. Non-declaration calls keep their
--- existing no-op/type-check behavior.
-local env_mt = {
+-- Preserve Lua's normal missing-global semantics by default: an absent global
+-- is nil, so guarded compatibility patterns such as `game and game.getTime()`
+-- remain valid. Strict mode is deliberately immediate rather than taint-based;
+-- there is no precise call window around declaration arguments.
+local default_env_mt = {
+  __index = function() return nil end,
+}
+local strict_env_mt = {
   __index = function(_, name)
-    return unknown_global(name)
+    error("unknown global '" .. name ..
+      "' read (use a local binding or explicit nil)", 2)
   end,
 }
 
 function _G.__declare_env()
-  unknown_global_seen = nil
-  return setmetatable({ labelle = _G.__declare_stub() }, env_mt)
-end
-
-function _G.__declare_finish()
-  if _G.__DECLARE_STRICT and unknown_global_seen ~= nil then
-    error("unknown global '" .. unknown_global_seen ..
-      "' was read while evaluating this chunk (use a local binding or explicit nil)", 2)
-  end
+  local mt = _G.__DECLARE_STRICT and strict_env_mt or default_env_mt
+  return setmetatable({ labelle = _G.__declare_stub() }, mt)
 end
 
 -- The schema, as one compact JSON line (the runner↔assembler contract):

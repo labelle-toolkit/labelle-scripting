@@ -91,11 +91,9 @@ pub const Error = error{
 };
 
 pub const Options = struct {
-    /// Reject any unknown global read in the chunk before declaration
-    /// validation. This catches Lua operations such as `not MISSING`, which
-    /// erase the sentinel's identity, but intentionally is not the default:
-    /// Lua evaluation provides no precise taint boundary around call
-    /// arguments, so strict mode also rejects unused runtime bindings.
+    /// Reject unknown global reads immediately while the chunk executes.
+    /// This is opt-in because default Lua semantics treat missing globals as
+    /// nil, which keeps guarded compatibility patterns working.
     strict_declarations: bool = false,
 };
 
@@ -161,11 +159,8 @@ pub fn runWithOptions(
         }
 
         // __declare_env() returns a fresh per-chunk environment containing
-        // the private labelle stub and an __index sentinel. The sentinel
-        // preserves undeclared globals while Lua evaluates declaration
-        // arguments, so a typo cannot disappear as a nil table field.
-        // Locals, including locals explicitly bound to nil, remain ordinary
-        // Lua, and non-declaration calls retain their existing behavior.
+        // the private labelle stub. Missing globals preserve Lua's normal nil
+        // fallback unless strict mode was explicitly requested.
         _ = c.lua_getglobal(L, "__declare_env"); // [chunk, factory]
         if (c.lua_pcallk(L, 0, 1, 0, 0, null) != c.LUA_OK)
             return error.DeclarePrelude; // [chunk, env]
@@ -175,18 +170,6 @@ pub fn runWithOptions(
             c.lua_settop(L, -2);
         }
 
-        if (c.lua_pcallk(L, 0, 0, 0, 0, null) != c.LUA_OK) {
-            const msg = topError(L, &err_buf);
-            return .{ .failure = try std.fmt.allocPrint(
-                allocator,
-                "labelle-declare: {s}: {s}",
-                .{ input.path, msg },
-            ) };
-        }
-
-        // Strict mode also rejects unknown reads after the final declaration
-        // (or in a declaration-free chunk), so validate the chunk boundary.
-        _ = c.lua_getglobal(L, "__declare_finish");
         if (c.lua_pcallk(L, 0, 0, 0, 0, null) != c.LUA_OK) {
             const msg = topError(L, &err_buf);
             return .{ .failure = try std.fmt.allocPrint(

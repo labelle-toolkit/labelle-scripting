@@ -35,9 +35,8 @@ const usage =
     \\--cache-dir is accepted and ignored (the assembler's generic declare
     \\contract hands every runner a workspace; an embedded VM needs none).
     \\
-    \\--strict-declarations rejects any unknown global read in a chunk. It
-    \\also rejects unused runtime bindings because Lua cannot expose a
-    \\precise taint boundary around declaration call arguments.
+    \\--strict-declarations rejects any unknown global read immediately while
+    \\the chunk executes. Default mode preserves Lua's nil fallback.
     \\
     \\Runs each chunk body against the declare stub (only `labelle` is in
     \\scope; init/update never run) and prints the schema on stdout.
