@@ -27,7 +27,7 @@
 --                     table; extract.zig calls it once per chunk and
 --                     plants the result into that chunk's private _ENV
 --   __declare_env()   global — returns that stub in a fresh chunk
---                     environment that preserves unknown reads as sentinels
+--                     environment with optional strict unknown-global checking
 --   __declare_emit()  global — returns the accumulated schema as one
 --                     compact JSON line after every chunk ran
 --
